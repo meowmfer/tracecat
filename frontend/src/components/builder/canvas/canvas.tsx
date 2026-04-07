@@ -1,6 +1,4 @@
 import {
-  addEdge,
-  applyNodeChanges,
   Background,
   type Connection,
   ConnectionLineType,
@@ -14,13 +12,12 @@ import {
   type NodeRemoveChange,
   type OnConnectStartParams,
   Panel,
-  Position,
   ReactFlow,
   type ReactFlowInstance,
-  type ReactFlowJsonObject,
   useEdgesState,
   useNodesState,
   useReactFlow,
+  type Viewport,
   type XYPosition,
 } from "@xyflow/react"
 import React, {
@@ -34,12 +31,17 @@ import { v4 as uuid4 } from "uuid"
 
 import "@xyflow/react/dist/style.css"
 
-import Dagre from "@dagrejs/dagre"
 import { MoveHorizontalIcon, MoveVerticalIcon, PlusIcon } from "lucide-react"
+import type {
+  GraphOperation,
+  GraphResponse,
+  RegistryActionReadMinimal,
+} from "@/client"
 import actionNode, {
   type ActionNodeData,
   type ActionNodeType,
 } from "@/components/builder/canvas/action-node"
+import { CanvasToolbar } from "@/components/builder/canvas/canvas-toolbar"
 import { DeleteActionNodeDialog } from "@/components/builder/canvas/delete-node-dialog"
 import selectorNode, {
   type SelectorNodeData,
@@ -54,11 +56,12 @@ import triggerNode, {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { useToast } from "@/components/ui/use-toast"
-import { useDeleteAction } from "@/lib/hooks"
-import { pruneGraphObject, pruneReactFlowInstance } from "@/lib/workflow"
+import { useGraph, useGraphOperations } from "@/lib/hooks"
+import { pruneGraphObject } from "@/lib/workflow"
+import { useWorkflowBuilder } from "@/providers/builder"
 import { useWorkflow } from "@/providers/workflow"
+import { getLayoutedElements, mergeHydratedNodes } from "./graph-layout"
 
-const dagreGraph = new Dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}))
 const defaultNodeWidth = 172
 const defaultNodeHeight = 36
 
@@ -68,59 +71,6 @@ const fitViewOptions: FitViewOptions = {
 }
 
 const getId = () => uuid4()
-
-/**
- * Taken from https://reactflow.dev/examples/layout/dagre
- * @param nodes
- * @param edges
- * @param direction
- * @returns
- */
-function getLayoutedElements(
-  nodes: Node[],
-  edges: Edge[],
-  direction = "TB"
-): {
-  nodes: Node[]
-  edges: Edge[]
-} {
-  const isHorizontal = direction === "LR"
-  dagreGraph.setGraph({ rankdir: direction, nodesep: 250, ranksep: 300 })
-
-  nodes.forEach((node) => {
-    dagreGraph.setNode(node.id, {
-      width: node.width ?? defaultNodeWidth,
-      height: node.height ?? defaultNodeHeight,
-    })
-  })
-
-  edges.forEach((edge) => {
-    dagreGraph.setEdge(edge.source, edge.target)
-  })
-
-  Dagre.layout(dagreGraph)
-
-  const newNodes = nodes.map((node) => {
-    const nodeWithPosition = dagreGraph.node(node.id)
-    const height = node.height ?? defaultNodeHeight
-    const width = node.width ?? defaultNodeWidth
-    const newNode = {
-      ...node,
-      targetPosition: isHorizontal ? Position.Left : Position.Top,
-      sourcePosition: isHorizontal ? Position.Right : Position.Bottom,
-      // We are shifting the dagre node position (anchor=center center) to the top left
-      // so it matches the React Flow node anchor point (top left).
-      position: {
-        x: nodeWithPosition.x - width / 2,
-        y: nodeWithPosition.y - height / 2,
-      },
-    }
-
-    return newNode
-  })
-
-  return { nodes: newNodes, edges }
-}
 
 export type NodeTypename = "udf" | "trigger" | "selector"
 export type NodeType = ActionNodeType | TriggerNodeType | SelectorNodeType
@@ -170,7 +120,17 @@ export const WorkflowCanvas = React.forwardRef<
     useState<ReactFlowInstance | null>(null)
   const { setViewport, getNode, screenToFlowPosition } = useReactFlow()
   const { toast } = useToast()
-  const { workspaceId, workflowId, workflow, updateWorkflow } = useWorkflow()
+  const { workspaceId, workflowId } = useWorkflow()
+  const { selectedNodeId, setSelectedNodeId } = useWorkflowBuilder()
+  const { data: graphData } = useGraph(workspaceId, workflowId ?? "")
+  const { applyGraphOperations, refetchGraph } = useGraphOperations(
+    workspaceId,
+    workflowId ?? ""
+  )
+  const [graphVersion, setGraphVersion] = useState<number>(1)
+  const [hydratedWorkflowId, setHydratedWorkflowId] = useState<string | null>(
+    null
+  )
   const [silhouettePosition, setSilhouettePosition] =
     useState<XYPosition | null>(null)
   const [isConnecting, setIsConnecting] = useState(false)
@@ -178,63 +138,226 @@ export const WorkflowCanvas = React.forwardRef<
     NodeRemoveChange[]
   >([])
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
-  const { deleteAction } = useDeleteAction()
+  const openContextMenuId = useRef<string | null>(null)
+
   /**
-   * Load the saved workflow
+   * Convert graph response to React Flow nodes and edges.
+   */
+  const buildNodesAndEdgesFromGraph = useCallback(
+    (graph: GraphResponse): { nodes: Node[]; edges: Edge[] } => {
+      const rfNodes: Node[] = graph.nodes.map((node) => {
+        const nodeData = node as {
+          id: string
+          type: string
+          position?: { x: number; y: number }
+          data?: Record<string, unknown>
+        }
+        return {
+          id: nodeData.id,
+          type: nodeData.type === "trigger" ? TriggerTypename : "udf",
+          position: nodeData.position ?? { x: 0, y: 0 },
+          data: nodeData.data ?? {},
+        } as Node
+      })
+
+      const rfEdges: Edge[] = graph.edges.map((edge) => {
+        const edgeData = edge as {
+          id?: string
+          source: string
+          target: string
+          sourceHandle?: string
+          label?: string
+        }
+        return {
+          id:
+            edgeData.id ??
+            `reactflow__edge-${edgeData.source}-${edgeData.target}`,
+          source: edgeData.source,
+          target: edgeData.target,
+          sourceHandle: edgeData.sourceHandle ?? undefined,
+          label: edgeData.label === "Trigger" ? undefined : edgeData.label,
+        }
+      })
+
+      return { nodes: rfNodes, edges: rfEdges }
+    },
+    []
+  )
+
+  /**
+   * Update canvas state from graph response (used after graph operations).
+   */
+  const updateStateFromGraph = useCallback(
+    (graph: GraphResponse) => {
+      setGraphVersion(graph.version)
+      const { nodes: rfNodes, edges: rfEdges } =
+        buildNodesAndEdgesFromGraph(graph)
+      setNodes((nodes) => mergeHydratedNodes(nodes, rfNodes))
+      setEdges(rfEdges)
+      setHydratedWorkflowId(workflowId ?? null)
+    },
+    [buildNodesAndEdgesFromGraph, setNodes, setEdges, workflowId]
+  )
+
+  useEffect(() => {
+    setHydratedWorkflowId(null)
+  }, [workflowId])
+
+  /**
+   * Load graph data when it becomes available.
    */
   useEffect(() => {
-    async function initializeReactFlowInstance() {
-      if (!workflow?.id || !reactFlowInstance) {
-        return
-      }
-      try {
-        const graph = workflow.object as ReactFlowJsonObject<NodeType>
-        if (!graph) {
-          throw new Error("No workflow data found")
-        }
-        // Defensive
-        const prunedGraph = pruneGraphObject(graph)
-        setNodes((currNodes) => [...currNodes, ...prunedGraph.nodes])
-        setEdges((currEdges) => [...currEdges, ...prunedGraph.edges])
-        setViewport({
-          x: graph.viewport?.x ?? 0,
-          y: graph.viewport?.y ?? 0,
-          zoom: graph.viewport?.zoom ?? 1,
-        })
-      } catch (error) {
-        console.error("Failed to fetch workflow data:", error)
-      }
+    if (!graphData || !reactFlowInstance) {
+      return
     }
-    initializeReactFlowInstance()
-  }, [workflow?.id, reactFlowInstance]) // eslint-disable-line react-hooks/exhaustive-deps
+
+    try {
+      // Build nodes and edges from graph API response
+      const { nodes: graphNodes, edges: graphEdges } =
+        buildNodesAndEdgesFromGraph(graphData)
+      setNodes((nodes) => mergeHydratedNodes(nodes, graphNodes))
+      setEdges(graphEdges)
+      setGraphVersion(graphData.version)
+
+      // Set viewport from graph if available
+      const viewport = graphData.viewport as
+        | { x?: number; y?: number; zoom?: number }
+        | undefined
+      setViewport({
+        x: viewport?.x ?? 0,
+        y: viewport?.y ?? 0,
+        zoom: viewport?.zoom ?? 1,
+      })
+      setHydratedWorkflowId(workflowId ?? null)
+    } catch (error) {
+      console.error("Failed to initialize workflow graph:", error)
+    }
+  }, [
+    graphData,
+    reactFlowInstance,
+    workflowId,
+    buildNodesAndEdgesFromGraph,
+    setNodes,
+    setEdges,
+    setViewport,
+  ])
+
+  // Keep node selection in sync with builder selection state without
+  // re-running full graph hydration logic.
+  useEffect(() => {
+    // Avoid reconciling selection against stale nodes while switching workflows.
+    if (!workflowId || hydratedWorkflowId !== workflowId) {
+      return
+    }
+
+    if (nodes.length === 0) {
+      return
+    }
+
+    // If a persisted selection points to a missing node, clear it so we
+    // don't keep restoring a stale "not found" state.
+    if (selectedNodeId && !nodes.some((node) => node.id === selectedNodeId)) {
+      setSelectedNodeId(null)
+      return
+    }
+
+    setNodes((currentNodes) => {
+      let changed = false
+      const nextNodes = currentNodes.map((node) => {
+        const shouldBeSelected =
+          selectedNodeId !== null && node.id === selectedNodeId
+        if (node.selected === shouldBeSelected) {
+          return node
+        }
+        changed = true
+        return { ...node, selected: shouldBeSelected }
+      })
+      return changed ? nextNodes : currentNodes
+    })
+  }, [
+    hydratedWorkflowId,
+    nodes,
+    selectedNodeId,
+    setNodes,
+    setSelectedNodeId,
+    workflowId,
+  ])
+
+  const onPaneClick = useCallback(() => {
+    setSelectedNodeId(null)
+  }, [setSelectedNodeId])
 
   // Connections
   const onConnect = useCallback(
     async (params: Edge | Connection) => {
       console.log("Edge connected:", params)
-      if (params.source?.startsWith("trigger")) {
-        params = {
-          ...params,
-          label: "⚡ Trigger",
-        }
-        // 1. Find the trigger node
-        const triggerNode = nodes.find(
-          (node) => node.type === "trigger"
-        ) as TriggerNodeType
-        // 2. Find the entrypoint node
-        const entrypointNode = getNode(
-          params.target! /* Target is non-null as we are in a connect callback */
-        )
-        if (!triggerNode || !entrypointNode) {
-          throw new Error("Could not find trigger or entrypoint node")
+
+      const targetId = params.target
+      const sourceId = params.source
+      if (!targetId || !sourceId) return
+
+      // Use graph operations for all edges (trigger and action)
+      const isTrigger = sourceId.startsWith("trigger")
+      try {
+        const operation: GraphOperation = {
+          type: "add_edge",
+          payload: {
+            source_id: sourceId,
+            source_type: isTrigger ? "trigger" : "udf",
+            target_id: targetId,
+            source_handle: isTrigger
+              ? undefined
+              : ((params.sourceHandle as "success" | "error") ?? "success"),
+          },
         }
 
-        // 3. Set the workflow entrypoint
-        await updateWorkflow({ entrypoint: entrypointNode.id })
+        const result = await applyGraphOperations({
+          baseVersion: graphVersion,
+          operations: [operation],
+        })
+
+        // Update state from the response
+        updateStateFromGraph(result)
+      } catch (error) {
+        // Handle 409 conflict by refetching and retrying
+        const apiError = error as { status?: number }
+        if (apiError.status === 409) {
+          console.log("Version conflict, refetching graph...")
+          const latestGraph = await refetchGraph()
+          setGraphVersion(latestGraph.version)
+          // Retry with the latest version
+          const operation: GraphOperation = {
+            type: "add_edge",
+            payload: {
+              source_id: sourceId,
+              source_type: isTrigger ? "trigger" : "udf",
+              target_id: targetId,
+              source_handle: isTrigger
+                ? undefined
+                : ((params.sourceHandle as "success" | "error") ?? "success"),
+            },
+          }
+          const result = await applyGraphOperations({
+            baseVersion: latestGraph.version,
+            operations: [operation],
+          })
+          updateStateFromGraph(result)
+        } else {
+          console.error("Failed to add edge:", error)
+          toast({
+            title: "Failed to connect nodes",
+            description: "Could not create the connection. Please try again.",
+          })
+        }
       }
-      setEdges((eds) => addEdge(params, eds))
     },
-    [edges, setEdges, getNode, setNodes] // eslint-disable-line react-hooks/exhaustive-deps
+    [
+      graphVersion,
+      applyGraphOperations,
+      updateStateFromGraph,
+      refetchGraph,
+      toast,
+    ]
   )
 
   const onConnectStart = useCallback(
@@ -258,8 +381,11 @@ export const WorkflowCanvas = React.forwardRef<
         data: { type: "selector" },
         origin: [0.5, 0.0],
       }
-
-      setNodes((nds) => nds.concat(newNode))
+      const prevContextMenuId = openContextMenuId.current
+      setNodes((nds) =>
+        nds.concat(newNode).filter((n) => n.id !== prevContextMenuId)
+      )
+      openContextMenuId.current = id
       return newNode
     },
     [screenToFlowPosition]
@@ -325,41 +451,54 @@ export const WorkflowCanvas = React.forwardRef<
 
   // Handle confirmed deletion
   const handleConfirmedDeletion = useCallback(async () => {
-    if (!workflowId || !reactFlowInstance) return
+    if (!workflowId) return
     console.log("HANDLE CONFIRMED DELETION", {
       pendingDeleteNodes,
     })
 
     try {
-      await Promise.all(
-        pendingDeleteNodes.map((node) =>
-          deleteAction({ actionId: node.id, workspaceId })
-        )
+      const deleteOperations: GraphOperation[] = pendingDeleteNodes.map(
+        (node) => ({
+          type: "delete_node",
+          payload: { action_id: node.id },
+        })
       )
 
-      // If the above succeeds, we can remove the nodes from state
-      // For all nodes, we need to remove all their edges
-      // WE need to compute all the edges that need to be removed based on the pending node deletions
-      setNodes((nodes) => applyNodeChanges(pendingDeleteNodes, nodes))
-      const nodeIds = new Set(pendingDeleteNodes.map((n) => n.id))
-      setEdges((edges) =>
-        edges.filter(
-          (edge) => !nodeIds.has(edge.source) && !nodeIds.has(edge.target)
-        )
-      )
-
-      await updateWorkflow({
-        object: pruneReactFlowInstance(reactFlowInstance),
+      const result = await applyGraphOperations({
+        baseVersion: graphVersion,
+        operations: deleteOperations,
       })
 
-      console.log("Workflow updated successfully")
+      updateStateFromGraph(result)
+      console.log("Actions deleted successfully")
     } catch (error) {
-      console.error("An error occurred while deleting Action nodes:", error)
-      toast({
-        title: "Failed to delete nodes",
-        description:
-          "Could not delete nodes. Please check the console logs for more information.",
-      })
+      const apiError = error as { status?: number }
+      if (apiError.status === 409) {
+        console.log("Version conflict on delete, refetching and retrying...")
+        try {
+          const latestGraph = await refetchGraph()
+          const deleteOperations: GraphOperation[] = pendingDeleteNodes.map(
+            (node) => ({
+              type: "delete_node",
+              payload: { action_id: node.id },
+            })
+          )
+          const retryResult = await applyGraphOperations({
+            baseVersion: latestGraph.version,
+            operations: deleteOperations,
+          })
+          updateStateFromGraph(retryResult)
+        } catch (retryError) {
+          console.error("Failed to delete nodes after retry:", retryError)
+        }
+      } else {
+        console.error("An error occurred while deleting Action nodes:", error)
+        toast({
+          title: "Failed to delete nodes",
+          description:
+            "Could not delete nodes. Please check the console logs for more information.",
+        })
+      }
     } finally {
       setShowDeleteDialog(false)
       setPendingDeleteNodes([])
@@ -367,18 +506,19 @@ export const WorkflowCanvas = React.forwardRef<
   }, [
     pendingDeleteNodes,
     workflowId,
-    reactFlowInstance,
     workspaceId,
-    setNodes,
-    updateWorkflow,
     toast,
+    applyGraphOperations,
+    graphVersion,
+    updateStateFromGraph,
+    refetchGraph,
   ])
 
   const handleEdgesChange = useCallback(
-    (changes: EdgeChange[]) => {
+    async (changes: EdgeChange[]) => {
+      const edgesToRemove: Edge[] = []
       const nextChanges = changes.reduce((acc, change) => {
         if (change.type === "remove") {
-          // Add pending deletes
           const edge = reactFlowInstance?.getEdge(change.id)
           if (!edge) {
             console.warn("Couldn't load edge, skipping")
@@ -386,6 +526,7 @@ export const WorkflowCanvas = React.forwardRef<
           }
           // Only delete the edge if it was selected
           if (edge.selected) {
+            edgesToRemove.push(edge)
             return [...acc, change]
           }
           // Intercept the edge removal
@@ -393,9 +534,64 @@ export const WorkflowCanvas = React.forwardRef<
         }
         return [...acc, change]
       }, [] as EdgeChange[])
-      onEdgesChange(nextChanges)
+
+      // Persist edge deletions to backend via graph operations
+      const deleteOperations: GraphOperation[] = edgesToRemove.map((edge) => {
+        const isTrigger = edge.source.startsWith("trigger")
+        return {
+          type: "delete_edge" as const,
+          payload: {
+            source_id: edge.source,
+            source_type: isTrigger ? "trigger" : "udf",
+            target_id: edge.target,
+            source_handle: isTrigger
+              ? undefined
+              : ((edge.sourceHandle as "success" | "error") ?? "success"),
+          },
+        }
+      })
+
+      if (deleteOperations.length > 0) {
+        try {
+          const result = await applyGraphOperations({
+            baseVersion: graphVersion,
+            operations: deleteOperations,
+          })
+          updateStateFromGraph(result)
+        } catch (error) {
+          const apiError = error as { status?: number }
+          if (apiError.status === 409) {
+            console.log(
+              "Version conflict on edge deletion, refetching and retrying..."
+            )
+            try {
+              const latestGraph = await refetchGraph()
+              // Retry with the latest version
+              const retryResult = await applyGraphOperations({
+                baseVersion: latestGraph.version,
+                operations: deleteOperations,
+              })
+              updateStateFromGraph(retryResult)
+            } catch (retryError) {
+              console.error("Failed to delete edges after retry:", retryError)
+            }
+          } else {
+            console.error("Failed to persist edge deletion:", error)
+          }
+        }
+      } else {
+        // Just apply local changes for non-persistent changes
+        onEdgesChange(nextChanges)
+      }
     },
-    [edges, setEdges]
+    [
+      reactFlowInstance,
+      onEdgesChange,
+      graphVersion,
+      applyGraphOperations,
+      updateStateFromGraph,
+      refetchGraph,
+    ]
   )
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -436,6 +632,77 @@ export const WorkflowCanvas = React.forwardRef<
     [nodes, setNodes, pendingDeleteNodes]
   )
 
+  /**
+   * Save node positions using graph operations.
+   */
+  const saveNodePositions = useCallback(
+    async (nodesToSave: Node[]) => {
+      const triggerNode = nodesToSave.find((n) => n.type === "trigger")
+      const actionNodes = nodesToSave.filter(
+        (n) => n.type === "udf" && !isEphemeral(n)
+      )
+
+      const operations: GraphOperation[] = []
+
+      // Add move_nodes operation for action nodes
+      if (actionNodes.length > 0) {
+        operations.push({
+          type: "move_nodes",
+          payload: {
+            positions: actionNodes.map((node) => ({
+              action_id: node.id,
+              x: node.position.x,
+              y: node.position.y,
+            })),
+          },
+        })
+      }
+
+      // Add update_trigger_position operation
+      if (triggerNode) {
+        operations.push({
+          type: "update_trigger_position",
+          payload: {
+            x: triggerNode.position.x,
+            y: triggerNode.position.y,
+          },
+        })
+      }
+
+      if (operations.length === 0) return
+
+      try {
+        const result = await applyGraphOperations({
+          baseVersion: graphVersion,
+          operations,
+        })
+        // Only update version, not the full state (positions are already correct locally)
+        setGraphVersion(result.version)
+      } catch (error) {
+        const apiError = error as { status?: number }
+        if (apiError.status === 409) {
+          console.log(
+            "Version conflict on position save, refetching graph and retrying..."
+          )
+          try {
+            const latestGraph = await refetchGraph()
+            // Retry with the latest version
+            const retryResult = await applyGraphOperations({
+              baseVersion: latestGraph.version,
+              operations,
+            })
+            setGraphVersion(retryResult.version)
+          } catch (retryError) {
+            console.error("Failed to save positions after retry:", retryError)
+          }
+        } else {
+          console.error("Failed to save positions:", error)
+        }
+      }
+    },
+    [graphVersion, applyGraphOperations, refetchGraph]
+  )
+
   const onLayout = useCallback(
     (direction: "TB" | "LR") => {
       const prunedGraph = pruneGraphObject({
@@ -449,22 +716,68 @@ export const WorkflowCanvas = React.forwardRef<
       )
       setNodes(newNodes)
       setEdges(newEdges)
+
+      // Save positions after layout
+      if (workflowId) {
+        saveNodePositions(newNodes)
+      }
     },
-    [nodes, edges] // eslint-disable-line react-hooks/exhaustive-deps
+    [nodes, edges, workflowId, setNodes, setEdges, saveNodePositions]
   )
 
-  // Saving react flow instance state
-  useEffect(() => {
-    if (workflowId && reactFlowInstance) {
-      updateWorkflow({ object: pruneReactFlowInstance(reactFlowInstance) })
-    }
-  }, [edges])
+  // Batch update positions when nodes are dragged
+  const onNodesDragStop = useCallback(() => {
+    if (!workflowId || !reactFlowInstance) return
 
-  const onNodesDragStop = () => {
-    if (workflowId && reactFlowInstance) {
-      updateWorkflow({ object: pruneReactFlowInstance(reactFlowInstance) })
-    }
-  }
+    const currentNodes = reactFlowInstance.getNodes()
+    saveNodePositions(currentNodes)
+  }, [workflowId, reactFlowInstance, saveNodePositions])
+
+  // Save viewport when panning/zooming stops
+  const onMoveEnd = useCallback(
+    async (_event: unknown, viewport: Viewport) => {
+      if (!workflowId) return
+
+      const operation: GraphOperation = {
+        type: "update_viewport",
+        payload: {
+          x: viewport.x,
+          y: viewport.y,
+          zoom: viewport.zoom,
+        },
+      }
+
+      try {
+        const result = await applyGraphOperations({
+          baseVersion: graphVersion,
+          operations: [operation],
+        })
+        // Only update version (viewport is already correct locally)
+        setGraphVersion(result.version)
+      } catch (error) {
+        const apiError = error as { status?: number }
+        if (apiError.status === 409) {
+          console.log(
+            "Version conflict on viewport save, refetching and retrying..."
+          )
+          try {
+            const latestGraph = await refetchGraph()
+            // Retry with the latest version
+            const retryResult = await applyGraphOperations({
+              baseVersion: latestGraph.version,
+              operations: [operation],
+            })
+            setGraphVersion(retryResult.version)
+          } catch (retryError) {
+            console.error("Failed to save viewport after retry:", retryError)
+          }
+        } else {
+          console.error("Failed to save viewport:", error)
+        }
+      }
+    },
+    [workflowId, graphVersion, applyGraphOperations, refetchGraph]
+  )
 
   // Add this function to center on a node
   const centerOnNode = useCallback(
@@ -506,6 +819,94 @@ export const WorkflowCanvas = React.forwardRef<
     [reactFlowInstance] // eslint-disable-line react-hooks/exhaustive-deps
   )
 
+  // Handle adding action from toolbar
+  const handleToolbarAddAction = useCallback(
+    async (action: RegistryActionReadMinimal) => {
+      if (!workflowId || !reactFlowInstance) return
+
+      // Get the center of the current viewport in screen coordinates
+      const containerBounds = containerRef.current?.getBoundingClientRect()
+      if (!containerBounds) return
+
+      // screenToFlowPosition expects actual screen coordinates (clientX/clientY)
+      // so we need to add the container's position to get the center in screen space
+      const screenCenterX = containerBounds.left + containerBounds.width / 2
+      const screenCenterY = containerBounds.top + containerBounds.height / 2
+
+      // Convert screen position to flow position
+      const position = screenToFlowPosition({
+        x: screenCenterX,
+        y: screenCenterY,
+      })
+
+      try {
+        const addNodeOp: GraphOperation = {
+          type: "add_node",
+          payload: {
+            type: action.action,
+            title: action.default_title ?? action.action,
+            position_x: position.x,
+            position_y: position.y,
+          },
+        }
+
+        const result = await applyGraphOperations({
+          baseVersion: graphVersion,
+          operations: [addNodeOp],
+        })
+
+        updateStateFromGraph(result)
+        toast({
+          title: "Action added",
+          description: `Added "${action.default_title ?? action.action}" to the workflow.`,
+        })
+      } catch (error) {
+        const apiError = error as { status?: number }
+        if (apiError.status === 409) {
+          try {
+            const latestGraph = await refetchGraph()
+            const addNodeOp: GraphOperation = {
+              type: "add_node",
+              payload: {
+                type: action.action,
+                title: action.default_title ?? action.action,
+                position_x: position.x,
+                position_y: position.y,
+              },
+            }
+            const result = await applyGraphOperations({
+              baseVersion: latestGraph.version,
+              operations: [addNodeOp],
+            })
+            updateStateFromGraph(result)
+          } catch (retryError) {
+            console.error("Failed to add action after retry:", retryError)
+            toast({
+              title: "Failed to add action",
+              description: "Could not add action. Please try again.",
+            })
+          }
+        } else {
+          console.error("Failed to add action:", error)
+          toast({
+            title: "Failed to add action",
+            description: "Could not add action. Please try again.",
+          })
+        }
+      }
+    },
+    [
+      workflowId,
+      reactFlowInstance,
+      screenToFlowPosition,
+      graphVersion,
+      applyGraphOperations,
+      updateStateFromGraph,
+      refetchGraph,
+      toast,
+    ]
+  )
+
   return (
     <div ref={containerRef} style={{ height: "100%", width: "100%" }}>
       <ReactFlow
@@ -520,6 +921,8 @@ export const WorkflowCanvas = React.forwardRef<
         onNodesChange={handleNodesChange}
         onEdgesChange={handleEdgesChange}
         onNodeDragStop={onNodesDragStop}
+        onMoveEnd={onMoveEnd}
+        onPaneClick={onPaneClick}
         defaultEdgeOptions={defaultEdgeOptions}
         nodeTypes={nodeTypes}
         proOptions={{ hideAttribution: true }}
@@ -557,6 +960,9 @@ export const WorkflowCanvas = React.forwardRef<
           >
             <MoveHorizontalIcon className="size-3" strokeWidth={2} />
           </Button>
+        </Panel>
+        <Panel position="bottom-center" className="mb-4">
+          <CanvasToolbar onAddAction={handleToolbarAddAction} />
         </Panel>
         <NodeSilhouette
           position={silhouettePosition}

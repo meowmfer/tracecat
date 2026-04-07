@@ -1,8 +1,21 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from functools import cached_property
+from typing import Literal
 
 from temporalio.common import SearchAttributeKey, SearchAttributePair
+
+WorkflowExecutionStatusLiteral = Literal[
+    "RUNNING",
+    "COMPLETED",
+    "FAILED",
+    "CANCELED",
+    "TERMINATED",
+    "CONTINUED_AS_NEW",
+    "TIMED_OUT",
+]
+"""Mapped literal types for workflow execution statuses."""
 
 
 class WorkflowExecutionEventStatus(StrEnum):
@@ -97,12 +110,38 @@ class TriggerType(StrEnum):
     MANUAL = "manual"
     SCHEDULED = "scheduled"
     WEBHOOK = "webhook"
+    CASE = "case"
 
     def to_temporal_search_attr_pair(self) -> SearchAttributePair[str]:
-        return SearchAttributePair(
-            key=SearchAttributeKey.for_keyword(TemporalSearchAttr.TRIGGER_TYPE.value),
-            value=self.value,
-        )
+        return TemporalSearchAttr.TRIGGER_TYPE.create_pair(self.value)
+
+
+class ExecutionType(StrEnum):
+    """Execution type for a workflow execution.
+
+    Distinguishes between draft (development) and published (production) executions.
+    """
+
+    DRAFT = "draft"
+    """Draft execution uses the draft workflow graph and resolves aliases from draft workflows."""
+
+    PUBLISHED = "published"
+    """Published execution uses the committed workflow definition and resolves aliases from committed workflows."""
+
+    def to_temporal_search_attr_pair(self) -> SearchAttributePair[str]:
+        return TemporalSearchAttr.EXECUTION_TYPE.create_pair(self.value)
+
+
+class WorkflowRunExcludedWorkflowType(StrEnum):
+    """Workflow types that should not appear in the workflow runs UI."""
+
+    DURABLE_AGENT = "DurableAgentWorkflow"
+    EXECUTE_REGISTRY_TOOL = "ExecuteRegistryToolWorkflow"
+
+
+WORKFLOW_RUN_EXCLUDED_WORKFLOW_TYPES = frozenset(
+    workflow_type.value for workflow_type in WorkflowRunExcludedWorkflowType
+)
 
 
 class TemporalSearchAttr(StrEnum):
@@ -113,3 +152,25 @@ class TemporalSearchAttr(StrEnum):
 
     TRIGGERED_BY_USER_ID = "TracecatTriggeredByUserId"
     """The `Keyword` Search Attribute for the user ID that triggered the workflow execution."""
+
+    WORKSPACE_ID = "TracecatWorkspaceId"
+    """The `Keyword` Search Attribute for the workspace that owns the workflow execution."""
+
+    ALIAS = "TracecatAlias"
+    """The `Keyword` Search Attribute for a human-friendly workflow alias (e.g., workflow or agent slugs)."""
+
+    CORRELATION_ID = "TracecatCorrelationId"
+    """The `Keyword` Search Attribute for grouping related workflow executions."""
+
+    EXECUTION_TYPE = "TracecatExecutionType"
+    """The `Keyword` Search Attribute for the execution type (draft or published)."""
+
+    @cached_property
+    def key(self) -> SearchAttributeKey[str]:
+        return SearchAttributeKey.for_keyword(self.value)
+
+    def create_pair(self, value: str) -> SearchAttributePair[str]:
+        return SearchAttributePair(
+            key=self.key,
+            value=value,
+        )

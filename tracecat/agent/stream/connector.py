@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
+from time import monotonic
 from typing import Any
 
 import orjson
-from fastapi import Request
 from pydantic_core import to_jsonable_python
 
-from tracecat.agent.runtime import ModelMessageTA
+from tracecat.agent.session.service import AgentSessionService
 from tracecat.agent.stream.events import (
     AgentStreamEventTA,
     StreamConnected,
@@ -18,19 +18,37 @@ from tracecat.agent.stream.events import (
     StreamError,
     StreamEvent,
     StreamFormat,
+    StreamKeepAlive,
     StreamMessage,
+    UnifiedStreamEventTA,
 )
+from tracecat.agent.types import ModelMessageTA, StreamKey
 from tracecat.chat import tokens
-from tracecat.chat.service import ChatService
 from tracecat.logger import logger
-from tracecat.redis.client import RedisClient
+from tracecat.redis.client import RedisClient, get_redis_client
 
 
 class AgentStream:
-    def __init__(self, client: RedisClient, session_id: uuid.UUID):
+    """Stream adapter backed by Redis streams."""
+
+    KEEPALIVE_INTERVAL_SECONDS = 10
+    COMPLETED_STREAM_TTL_SECONDS = 5 * 60
+
+    def __init__(
+        self,
+        client: RedisClient,
+        workspace_id: uuid.UUID,
+        session_id: uuid.UUID,
+    ):
         self.client = client
+        self.workspace_id = workspace_id
         self.session_id = session_id
-        self._stream_key = f"agent-stream:{str(self.session_id)}"
+        self._stream_key = StreamKey(workspace_id, session_id)
+
+    @classmethod
+    async def new(cls, session_id: uuid.UUID, workspace_id: uuid.UUID) -> AgentStream:
+        client = await get_redis_client()
+        return cls(client, workspace_id, session_id)
 
     async def append(self, event: Any) -> None:
         """Stream a message to a Redis stream."""
@@ -43,53 +61,96 @@ class AgentStream:
 
     async def error(self, error: str) -> None:
         """Emit an error marker."""
-        logger.debug("Adding error marker", stream_key=self._stream_key)
         await self.append({"kind": "error", "error": error})
 
     async def done(self) -> None:
         """Emit an end-of-turn marker."""
-        logger.debug("Adding end-of-turn marker", stream_key=self._stream_key)
         await self.append({tokens.END_TOKEN: tokens.END_TOKEN_VALUE})
 
-    async def _set_last_stream_id(self, last_stream_id: str) -> None:
-        async with ChatService.with_session() as chat_svc:
-            if chat := await chat_svc.get_chat(self.session_id):
-                chat.last_stream_id = last_stream_id
-                await chat_svc.update_chat(chat)
-                logger.info(
-                    "Updated chat with last stream id",
-                    chat_id=chat.id,
-                    last_stream_id=last_stream_id,
-                )
-            else:
-                logger.warning("Chat not found", session_id=self.session_id)
+    async def reset_for_new_turn(self) -> None:
+        """Delete the persisted stream buffer and reset the saved cursor."""
+        await self.client.delete(self._stream_key)
+        await self._set_last_stream_id(None)
+
+    async def _expire_completed_stream(self) -> None:
+        """Keep completed streams briefly for reconnects, then let Redis evict them."""
+        try:
+            redis_client = await self.client._get_client()
+            await redis_client.expire(
+                name=self._stream_key,
+                time=self.COMPLETED_STREAM_TTL_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to shorten completed stream TTL",
+                stream_key=self._stream_key,
+                error=str(exc),
+            )
+
+    async def _set_last_stream_id(self, last_stream_id: str | None) -> None:
+        """Update last stream ID for reconnection support."""
+
+        async with AgentSessionService.with_session() as session_svc:
+            if agent_session := await session_svc.get_session(self.session_id):
+                await session_svc.update_last_stream_id(agent_session, last_stream_id)
 
     async def _stream_events(
-        self, request: Request, last_id: str
+        self, stop_condition: Callable[[], Awaitable[bool]], last_id: str
     ) -> AsyncIterator[StreamEvent]:
+        """Stream events from Redis until a stop condition is met.
+
+        Continuously reads messages from the Redis stream and yields them as
+        StreamEvent objects. Handles different event types including agent events,
+        model messages, errors, and end-of-stream markers.
+
+        Args:
+            stop_condition: Async callable that returns True when streaming should stop
+                          (e.g., when client disconnects).
+            last_id: The Redis stream ID to start reading from. Use "0-0" to read
+                    from the beginning, or a specific ID to resume from that point.
+
+        Yields:
+            StreamEvent: One of StreamDelta (agent events), StreamMessage (model messages),
+                        StreamError (error events), or StreamEnd (end-of-stream marker).
+
+        Note:
+            - Periodically updates the chat's last_stream_id for reconnection support
+            - Implements exponential backoff on errors (1s sleep)
+            - Blocks for up to 1 second waiting for new messages
+            - Processes up to 100 messages per read operation
+        """
         current_id = last_id
+        last_keepalive = monotonic()
+        stream_completed = False
         try:
-            while not await request.is_disconnected():
+            while not await stop_condition():
                 try:
                     if result := await self.client.xread(
                         streams={self._stream_key: current_id},
                         count=100,
                         block=1000,
                     ):
+                        last_keepalive = monotonic()
                         for _stream_name, messages in result:
                             for msg_id, fields in messages:
                                 data = orjson.loads(fields[tokens.DATA_KEY])
                                 current_id = msg_id
                                 match data:
                                     case {tokens.END_TOKEN: tokens.END_TOKEN_VALUE}:
-                                        logger.debug("End-of-stream marker")
+                                        stream_completed = True
                                         yield StreamEnd(id=msg_id)
-                                    case {"event_kind": event_kind}:
-                                        event = AgentStreamEventTA.validate_python(data)
-                                        logger.debug(
-                                            "Stream event", kind=event_kind, event=event
+                                    case {"event_kind": _}:
+                                        legacy_event = (
+                                            AgentStreamEventTA.validate_python(data)
                                         )
-                                        yield StreamDelta(id=msg_id, event=event)
+                                        yield StreamDelta(id=msg_id, event=legacy_event)
+                                    case {"type": _}:
+                                        unified_event = (
+                                            UnifiedStreamEventTA.validate_python(data)
+                                        )
+                                        yield StreamDelta(
+                                            id=msg_id, event=unified_event
+                                        )
                                     case {"kind": "error", "error": error_message}:
                                         logger.warning(
                                             "Stream error received",
@@ -97,8 +158,7 @@ class AgentStream:
                                             message_id=msg_id,
                                         )
                                         yield StreamError(error=error_message)
-                                    case {"kind": kind}:
-                                        logger.debug("Model message", kind=kind)
+                                    case {"kind": _}:
                                         message = ModelMessageTA.validate_python(data)
                                         yield StreamMessage(id=msg_id, message=message)
                                     case _:
@@ -108,7 +168,13 @@ class AgentStream:
                                             message_id=msg_id,
                                         )
 
-                        await self._set_last_stream_id(current_id)
+                        if not stream_completed:
+                            await self._set_last_stream_id(current_id)
+
+                    now = monotonic()
+                    if now - last_keepalive >= self.KEEPALIVE_INTERVAL_SECONDS:
+                        yield StreamKeepAlive()
+                        last_keepalive = now
 
                     await asyncio.sleep(0)
 
@@ -122,11 +188,22 @@ class AgentStream:
             yield StreamError(error="Fatal stream error")
         finally:
             logger.info("Chat stream ended", stream_key=self._stream_key)
-            await self._set_last_stream_id(current_id)
+            if stream_completed:
+                await self._set_last_stream_id(None)
+                await self._expire_completed_stream()
+            else:
+                await self._set_last_stream_id(current_id)
+
+    async def stream_events(
+        self, stop_condition: Callable[[], Awaitable[bool]], last_id: str
+    ) -> AsyncIterator[StreamEvent]:
+        """Public stream-events iterator for external stream consumers."""
+        async for event in self._stream_events(stop_condition, last_id):
+            yield event
 
     def sse(
         self,
-        request: Request,
+        stop_condition: Callable[[], Awaitable[bool]],
         last_id: str,
         format: StreamFormat,
     ) -> AsyncIterable[str]:
@@ -134,31 +211,32 @@ class AgentStream:
             case "vercel":
                 from tracecat.agent.adapter.vercel import sse_vercel
 
-                return sse_vercel(self._stream_events(request, last_id))
+                return sse_vercel(self.stream_events(stop_condition, last_id))
             case "basic":
-                return self.simple_sse(request, last_id)
+                return self.simple_sse(stop_condition, last_id)
             case _:
                 raise ValueError(f"Invalid format: {format}")
 
-    async def simple_sse(self, request: Request, last_id: str) -> AsyncIterable[str]:
+    async def simple_sse(
+        self, stop_condition: Callable[[], Awaitable[bool]], last_id: str
+    ) -> AsyncIterable[str]:
         try:
             yield StreamConnected(id=last_id).sse()
-            async for event in self._stream_events(request, last_id):
+            async for event in self.stream_events(stop_condition, last_id):
                 match event:
+                    case StreamKeepAlive():
+                        yield event.sse()
                     case StreamError(error=error):
                         yield event.sse()
                         if error == "Fatal stream error":
                             break
                         continue
                     case StreamEnd():
-                        logger.debug("End-of-stream marker")
                         yield event.sse()
                         break
-                    case StreamDelta(event=delta):
-                        logger.debug("Stream event", event_kind=delta.event_kind)
+                    case StreamDelta():
                         yield event.sse()
-                    case StreamMessage(message=message):
-                        logger.debug("Model message", kind=message.kind)
+                    case StreamMessage():
                         yield event.sse()
                     case _:
                         logger.warning(

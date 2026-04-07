@@ -1,6 +1,6 @@
 "use client"
 
-import { CheckCheckIcon, CopyIcon } from "lucide-react"
+import { CheckCheckIcon, CopyIcon, LinkIcon } from "lucide-react"
 import React from "react"
 import JsonView from "react18-json-view"
 import type { NodeMeta } from "react18-json-view/dist/types"
@@ -9,11 +9,25 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   Tooltip,
   TooltipContent,
+  TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 
 import "react18-json-view/src/style.css"
+
+function isSimpleIdentifier(segment: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(segment)
+}
+
+function quoteJsonPathKey(segment: string): string {
+  const escaped = String(segment).replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+  return `"${escaped}"`
+}
+
+function escapePathSegment(segment: string): string {
+  return isSimpleIdentifier(segment) ? segment : quoteJsonPathKey(segment)
+}
 
 function flattenObject(
   obj: Record<string, unknown> | unknown[],
@@ -41,11 +55,12 @@ function flattenObject(
   // Original object handling
   return Object.keys(obj).reduce((acc: Record<string, unknown>, k: string) => {
     const pre = prefix.length ? `${prefix}.` : ""
+    const safeKey = escapePathSegment(k)
 
     if (typeof obj[k] === "object" && obj[k] !== null) {
       if (Array.isArray(obj[k])) {
         ;(obj[k] as unknown[]).forEach((item, index) => {
-          const arrayPath = `${k}[${index}]`
+          const arrayPath = `${safeKey}[${index}]`
           if (typeof item === "object" && item !== null) {
             Object.assign(
               acc,
@@ -63,24 +78,27 @@ function flattenObject(
           acc,
           flattenObject(
             obj[k] as Record<string, unknown>,
-            pre ? `${pre}${k}` : k
+            pre ? `${pre}${safeKey}` : safeKey
           )
         )
       }
     } else {
-      acc[pre ? `${pre}${k}` : k] = obj[k]
+      acc[pre ? `${pre}${safeKey}` : safeKey] = obj[k]
     }
     return acc
   }, {})
 }
 
 type JsonViewWithControlsTabs = "flat" | "nested"
+type JsonViewCopyMode = "jsonpath-only" | "jsonpath-and-payload"
+
 interface JsonViewWithControlsProps {
   src: unknown
   defaultExpanded?: boolean
   defaultTab?: JsonViewWithControlsTabs
   showControls?: boolean
   copyPrefix?: string
+  copyMode?: JsonViewCopyMode
   className?: string
 }
 
@@ -90,6 +108,7 @@ export function JsonViewWithControls({
   defaultTab = "flat",
   showControls = true,
   copyPrefix,
+  copyMode = "jsonpath-only",
   className,
 }: JsonViewWithControlsProps): JSX.Element {
   const [isExpanded, setIsExpanded] = React.useState(defaultExpanded)
@@ -182,22 +201,33 @@ export function JsonViewWithControls({
               src={source ?? null}
               className="break-all text-xs"
               theme="atom"
+              CustomOperation={
+                copyMode === "jsonpath-and-payload"
+                  ? ({ node }) => <CopyPayloadButton node={node} />
+                  : undefined
+              }
               CopyComponent={({ onClick, className }) => (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <CopyIcon
-                      className={cn(
-                        "m-0 size-3 p-0 text-muted-foreground",
-                        className
-                      )}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        onClick(e)
-                      }}
-                    />
-                  </TooltipTrigger>
-                  <TooltipContent>Copy JSONPath</TooltipContent>
-                </Tooltip>
+                <TooltipProvider delayDuration={0} skipDelayDuration={0}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        aria-label="Copy JSONPath"
+                        className={cn(
+                          "m-0 inline-flex size-3 items-center justify-center p-0 text-muted-foreground hover:text-foreground",
+                          className
+                        )}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          onClick(e)
+                        }}
+                      >
+                        <LinkIcon className="size-3" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Copy JSONPath</TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
               )}
               CopiedComponent={({ className, style }) => (
                 <CheckCheckIcon
@@ -210,7 +240,10 @@ export function JsonViewWithControls({
                 nodeMeta: NodeMeta | undefined
               ) => {
                 const { currentPath } = nodeMeta || {}
-                const copyValue = buildJsonPath(currentPath || [], copyPrefix)
+                const copyValue =
+                  value === "flat"
+                    ? buildFlattenedJsonPath(currentPath || [], copyPrefix)
+                    : buildJsonPath(currentPath || [], copyPrefix)
                 return copyValue
               }}
             />
@@ -221,35 +254,106 @@ export function JsonViewWithControls({
   )
 }
 
+function CopyPayloadButton({ node }: { node: unknown }): JSX.Element {
+  const [copied, setCopied] = React.useState(false)
+
+  const handleCopy = React.useCallback(
+    async (event: React.MouseEvent<HTMLButtonElement>) => {
+      event.stopPropagation()
+      await navigator.clipboard.writeText(serializeJsonPayload(node))
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 3000)
+    },
+    [node]
+  )
+
+  return (
+    <TooltipProvider delayDuration={0} skipDelayDuration={0}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            aria-label="Copy JSON payload"
+            className="json-view--copy inline-flex size-3 items-center justify-center p-0 pl-1.5 text-muted-foreground hover:text-foreground"
+            onClick={handleCopy}
+          >
+            {copied ? (
+              <CheckCheckIcon className="size-3 text-muted-foreground" />
+            ) : (
+              <CopyIcon className="size-3" />
+            )}
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>Copy JSON payload</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
+
 function isNumeric(str: string): boolean {
   return /^\d+$/.test(str)
 }
-function buildJsonPath(path: string[], prefix?: string): string | undefined {
+
+export function buildJsonPath(
+  path: string[],
+  prefix?: string
+): string | undefined {
   // Combine the arrays
   if (path.length === 0 && !prefix) {
     return undefined
   }
-  const allSegments = []
-  if (prefix) {
-    allSegments.push(prefix)
-  }
-  if (path.length > 0) {
-    allSegments.push(...path)
-  }
-  return allSegments.reduce((path, segment, index) => {
-    // Convert segment to string for type safety
+
+  // Start from the raw prefix (do not escape/modify it), then append the processed segments
+  const seed = prefix ?? ""
+  const remainingSegments = path ?? []
+
+  return remainingSegments.reduce((accPath, segment) => {
     const currentSegment = String(segment)
 
-    // Handle different cases
+    if (currentSegment.startsWith("[")) {
+      // Already bracketed array/index path like [0]
+      return `${accPath}${currentSegment}`
+    }
     if (isNumeric(currentSegment)) {
       // For numeric segments, use bracket notation
-      return `${path}[${currentSegment}]`
-    } else if (currentSegment.startsWith("[")) {
-      // For array segments, use bracket notation
-      return `${path}${currentSegment}`
-    } else {
-      // For string segments, use dot notation unless it's the first segment
-      return index === 0 ? currentSegment : `${path}.${currentSegment}`
+      return `${accPath}[${currentSegment}]`
     }
-  }, "")
+
+    const safeSegment = escapePathSegment(currentSegment)
+
+    // If there's no accumulated path yet (no prefix), start with the segment directly
+    if (accPath.length === 0) {
+      return safeSegment
+    }
+    return `${accPath}.${safeSegment}`
+  }, seed)
+}
+
+export function buildFlattenedJsonPath(
+  path: string[],
+  prefix?: string
+): string | undefined {
+  const suffix = path.join(".")
+
+  if (!suffix && !prefix) {
+    return undefined
+  }
+  if (!suffix) {
+    return prefix
+  }
+  if (!prefix) {
+    return suffix
+  }
+  if (suffix.startsWith("[")) {
+    return `${prefix}${suffix}`
+  }
+  return `${prefix}.${suffix}`
+}
+
+export function serializeJsonPayload(node: unknown): string {
+  try {
+    return JSON.stringify(node, null, 2) ?? String(node)
+  } catch {
+    return String(node)
+  }
 }

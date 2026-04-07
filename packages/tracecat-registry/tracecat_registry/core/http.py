@@ -21,18 +21,18 @@ from tenacity import (
     wait_fixed,
 )
 import yaml
-from tracecat.expressions.common import build_safe_lambda, eval_jsonpath
-from tracecat.logger import logger
 from typing_extensions import Doc
 
-from tracecat.config import (
-    TRACECAT__MAX_FILE_SIZE_BYTES,
+from tracecat_registry import RegistrySecret, registry, secrets
+from tracecat_registry._internal.exceptions import TracecatException
+from tracecat_registry._internal.jsonpath import eval_jsonpath
+from tracecat_registry._internal.logger import logger
+from tracecat_registry._internal.safe_lambda import build_safe_lambda
+from tracecat_registry.config import (
     TRACECAT__MAX_AGGREGATE_UPLOAD_SIZE_BYTES,
+    TRACECAT__MAX_FILE_SIZE_BYTES,
     TRACECAT__MAX_UPLOAD_FILES_COUNT,
 )
-
-from tracecat.types.exceptions import TracecatException
-from tracecat_registry import RegistrySecret, registry, secrets
 
 RequestMethods = Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 JSONObjectOrArray = dict[str, Any] | list[Any]
@@ -76,25 +76,40 @@ Files = Annotated[
     ),
 ]
 
-ssl_secret = RegistrySecret(
-    name="ssl",
-    optional_keys=["SSL_CLIENT_CERT", "SSL_CLIENT_KEY", "SSL_CLIENT_PASSWORD"],
+mtls_secret = RegistrySecret(
+    name="mtls",
+    keys=["TLS_CERTIFICATE", "TLS_PRIVATE_KEY"],
     optional=True,
+    secret_type="mtls",
 )
-"""HTTP SSL certificate secrets.
+"""HTTP mTLS certificate secret.
 
 By default, the HTTP action uses the CA bundle from Certifi.
-This optional secret allows you to specify a custom client-side certificate to use for SSL verification.
+This optional secret allows you to specify a client certificate and key for mTLS.
 
-- name: `ssl`
-- optional keys:
-    - `SSL_CLIENT_CERT`
-    - `SSL_CLIENT_KEY`
-    - `SSL_CLIENT_PASSWORD`
+- name: `mtls`
+- keys:
+    - `TLS_CERTIFICATE`
+    - `TLS_PRIVATE_KEY`
 
-Note: `SSL_CLIENT_CERT` and `SSL_CLIENT_KEY` are text fields that contain the certificate and key respectively.
-`SSL_CLIENT_PASSWORD` is optional.
+Note: `TLS_CERTIFICATE` and `TLS_PRIVATE_KEY` are PEM text values.
+"""
 
+ca_cert_secret = RegistrySecret(
+    name="ca_cert",
+    keys=["CA_CERTIFICATE"],
+    optional=True,
+    secret_type="ca_cert",
+)
+"""HTTP CA certificate secret.
+
+This optional secret allows you to specify a custom CA bundle for server verification.
+
+- name: `ca_cert`
+- keys:
+    - `CA_CERTIFICATE`
+
+Note: `CA_CERTIFICATE` is a PEM text value.
 """
 
 
@@ -151,9 +166,19 @@ class HTTPResponse(TypedDict):
     data: str | dict[str, Any] | list[Any] | None
 
 
+def _write_temp_pem_file(
+    pem_value: str, temp_files: list[tempfile._TemporaryFileWrapper]
+) -> str:
+    temp_file = tempfile.NamedTemporaryFile(mode="w", delete=True, encoding="utf-8")
+    temp_files.append(temp_file)
+    temp_file.write(pem_value)
+    temp_file.flush()
+    return temp_file.name
+
+
 class TemporaryClientCertificate:
     """
-    Manages temporary files for SSL client certificate and key.
+    Manages temporary files for TLS client certificate and key.
     Ensures files are deleted upon exiting the context.
     """
 
@@ -173,22 +198,10 @@ class TemporaryClientCertificate:
         key_path: str | None = None
 
         if self.client_cert_str:
-            cert_file = tempfile.NamedTemporaryFile(
-                mode="w", delete=True, encoding="utf-8"
-            )
-            self._temp_files.append(cert_file)
-            cert_file.write(self.client_cert_str)
-            cert_file.flush()
-            cert_path = cert_file.name
+            cert_path = _write_temp_pem_file(self.client_cert_str, self._temp_files)
 
         if self.client_key_str:
-            key_file = tempfile.NamedTemporaryFile(
-                mode="w", delete=True, encoding="utf-8"
-            )
-            self._temp_files.append(key_file)
-            key_file.write(self.client_key_str)
-            key_file.flush()
-            key_path = key_file.name
+            key_path = _write_temp_pem_file(self.client_key_str, self._temp_files)
 
         if cert_path and key_path:
             if self.client_key_password:
@@ -213,13 +226,45 @@ class TemporaryClientCertificate:
                 )
 
 
-def httpx_to_response(response: httpx.Response) -> HTTPResponse:
+class TemporaryCACertificate:
+    """Manages a temporary file for a CA bundle."""
+
+    def __init__(self, ca_cert_str: str | None = None):
+        self.ca_cert_str = ca_cert_str
+        self._temp_files: list[tempfile._TemporaryFileWrapper] = []
+
+    def __enter__(self) -> str | None:
+        if not self.ca_cert_str:
+            return None
+        return _write_temp_pem_file(self.ca_cert_str, self._temp_files)
+
+    def __exit__(self, exc_type, exc_val, traceback):
+        for temp_file in self._temp_files:
+            try:
+                temp_file.close()
+            except Exception:
+                logger.error(
+                    f"Error closing temporary CA certificate file {temp_file.name}",
+                    exc_info=True,
+                )
+
+
+def httpx_to_response(
+    response: httpx.Response, *, base64_encode_data: bool = False
+) -> HTTPResponse:
     # Handle 204 No Content responses
     if response.status_code == 204:
         return HTTPResponse(
             status_code=response.status_code,
             headers=dict(response.headers.items()),
             data=None,  # RFC 7231: 204 responses MUST NOT contain a body
+        )
+
+    if base64_encode_data:
+        return HTTPResponse(
+            status_code=response.status_code,
+            headers=dict(response.headers.items()),
+            data=base64.b64encode(response.content).decode(),
         )
 
     # Parse response based on content type
@@ -534,7 +579,7 @@ def _process_file_uploads(
     namespace="core",
     description="Perform a HTTP request to a given URL.",
     default_title="HTTP request",
-    secrets=[ssl_secret],
+    secrets=[mtls_secret, ca_cert_secret],
 )
 async def http_request(
     url: Url,
@@ -548,10 +593,23 @@ async def http_request(
     timeout: Timeout = 10.0,
     follow_redirects: FollowRedirects = False,
     max_redirects: MaxRedirects = 20,
+    ignore_status_codes: Annotated[
+        list[int] | None,
+        Doc(
+            "If specified, these status codes will not be treated as errors. Defaults to None."
+        ),
+    ] = None,
+    base64_encode_data: Annotated[
+        bool,
+        Doc(
+            "Base64 encode the raw response body before returning. Use this for binary downloads to prevent corruption from text decoding."
+        ),
+    ] = False,
     verify_ssl: VerifySSL = True,
 ) -> HTTPResponse:
     """Perform a HTTP request to a given URL."""
 
+    ignore_status_codes = ignore_status_codes or []
     basic_auth = httpx.BasicAuth(**auth) if auth else None
 
     try:
@@ -561,24 +619,27 @@ async def http_request(
         logger.error(f"File processing error in http_request: {str(e)}")
         raise TracecatException(str(e)) from e
 
-    client_cert_str = secrets.get_or_default("SSL_CLIENT_CERT")
-    client_key_str = secrets.get_or_default("SSL_CLIENT_KEY")
-    client_key_password = secrets.get_or_default("SSL_CLIENT_PASSWORD")
+    client_cert_str = secrets.get_or_default("TLS_CERTIFICATE")
+    client_key_str = secrets.get_or_default("TLS_PRIVATE_KEY")
+    ca_cert_str = secrets.get_or_default("CA_CERTIFICATE")
 
-    # Manage SSL certificates with proper cleanup
-    with TemporaryClientCertificate(
-        client_cert_str=client_cert_str,
-        client_key_str=client_key_str,
-        client_key_password=client_key_password,
-    ) as cert_for_httpx:
+    # Manage TLS certificates with proper cleanup
+    with (
+        TemporaryClientCertificate(
+            client_cert_str=client_cert_str,
+            client_key_str=client_key_str,
+        ) as cert_for_httpx,
+        TemporaryCACertificate(ca_cert_str) as ca_cert_path,
+    ):
+        verify = False if not verify_ssl else (ca_cert_path or True)
         try:
             async with httpx.AsyncClient(
-                cert=cert_for_httpx,  # SSL cert configuration from context manager
+                cert=cert_for_httpx,  # TLS cert configuration from context manager
                 auth=basic_auth,
                 timeout=httpx.Timeout(timeout),
                 follow_redirects=follow_redirects,
                 max_redirects=max_redirects,
-                verify=verify_ssl,
+                verify=verify,
             ) as client:
                 response = await client.request(
                     method=method,
@@ -589,20 +650,24 @@ async def http_request(
                     data=form_data,
                     files=httpx_files_param,
                 )
-            if response.status_code >= 400:
+            if (
+                response.status_code >= 400
+                and response.status_code not in ignore_status_codes
+            ):
                 response.raise_for_status()
         except httpx.HTTPStatusError as e:
             error_message = _http_status_error_to_message(e)
             logger.error(
-                "HTTP request failed",
-                status_code=e.response.status_code,
-                error_message=error_message,
+                f"HTTP request failed with status {e.response.status_code}: {error_message}"
             )
             raise TracecatException(error_message) from e
         except httpx.ReadTimeout as e:
             logger.error(f"HTTP request timed out after {timeout} seconds.")
             raise e
-        return httpx_to_response(response)
+        return httpx_to_response(
+            response,
+            base64_encode_data=base64_encode_data,
+        )
 
 
 class PredicateArgs(TypedDict):
@@ -615,7 +680,7 @@ class PredicateArgs(TypedDict):
     namespace="core",
     description="Perform a HTTP request to a given URL with polling.",
     default_title="HTTP poll",
-    secrets=[ssl_secret],
+    secrets=[mtls_secret, ca_cert_secret],
 )
 async def http_poll(
     *,
@@ -712,24 +777,27 @@ async def http_poll(
         reraise=True,
     )
     async def call() -> httpx.Response:
-        client_cert_str = secrets.get_or_default("SSL_CLIENT_CERT")
-        client_key_str = secrets.get_or_default("SSL_CLIENT_KEY")
-        client_key_password = secrets.get_or_default("SSL_CLIENT_PASSWORD")
+        client_cert_str = secrets.get_or_default("TLS_CERTIFICATE")
+        client_key_str = secrets.get_or_default("TLS_PRIVATE_KEY")
+        ca_cert_str = secrets.get_or_default("CA_CERTIFICATE")
 
-        # SSL certificate management for each polling attempt
-        with TemporaryClientCertificate(
-            client_cert_str=client_cert_str,
-            client_key_str=client_key_str,
-            client_key_password=client_key_password,
-        ) as cert_for_httpx:
+        # TLS certificate management for each polling attempt
+        with (
+            TemporaryClientCertificate(
+                client_cert_str=client_cert_str,
+                client_key_str=client_key_str,
+            ) as cert_for_httpx,
+            TemporaryCACertificate(ca_cert_str) as ca_cert_path,
+        ):
+            verify = False if not verify_ssl else (ca_cert_path or True)
             try:
                 async with httpx.AsyncClient(
-                    cert=cert_for_httpx,  # SSL cert configuration from context manager
+                    cert=cert_for_httpx,  # TLS cert configuration from context manager
                     auth=basic_auth,
                     timeout=httpx.Timeout(timeout),
                     follow_redirects=follow_redirects,
                     max_redirects=max_redirects,
-                    verify=verify_ssl,
+                    verify=verify,
                 ) as client:
                     response = await client.request(
                         method=method,

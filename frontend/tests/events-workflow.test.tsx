@@ -4,7 +4,7 @@
 
 import { render } from "@testing-library/react"
 import type { WorkflowExecutionEventStatus } from "@/client"
-import { getWorkflowEventIcon } from "@/components/builder/events/events-workflow"
+import { getWorkflowEventIcon } from "@/components/events/workflow-event-status"
 
 // Mock the Lucide React icons
 jest.mock("lucide-react", () => ({
@@ -72,6 +72,7 @@ jest.mock("@/lib/utils", () => ({
   ),
   undoSlugify: jest.fn((str: string) => str),
   slugify: jest.fn((str: string) => str),
+  slugifyActionRef: jest.fn((str: string) => str),
 }))
 
 // Mock complex dependency chains that cause issues

@@ -2,8 +2,8 @@
 
 from typing import ClassVar
 
-from tracecat.integrations.models import ProviderMetadata, ProviderScopes
 from tracecat.integrations.providers.base import MCPAuthProvider
+from tracecat.integrations.schemas import ProviderMetadata, ProviderScopes
 
 
 class LinearMCPProvider(MCPAuthProvider):
@@ -20,7 +20,7 @@ class LinearMCPProvider(MCPAuthProvider):
     id: ClassVar[str] = "linear_mcp"
 
     # MCP server endpoint - OAuth endpoints discovered automatically
-    _mcp_server_uri: ClassVar[str] = "https://mcp.linear.app/mcp"
+    mcp_server_uri: ClassVar[str] = "https://mcp.linear.app/mcp"
 
     # No default scopes - authorization server determines based on user permissions
     scopes: ClassVar[ProviderScopes] = ProviderScopes(default=[])
@@ -36,11 +36,5 @@ class LinearMCPProvider(MCPAuthProvider):
             "Connect to Linear MCP to access issues, projects, and teams. "
             "Permissions are automatically determined based on your Linear workspace access."
         ),
-        setup_steps=[
-            "Click 'Connect' to begin OAuth authorization",
-            "Select your Linear workspace if prompted",
-            "Review and approve the OAuth client permissions",
-            "Complete authorization to enable MCP integration",
-        ],
         api_docs_url="https://linear.app/docs/mcp",
     )

@@ -1,15 +1,18 @@
 """Simplified tests for WorkflowImportService functionality."""
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 import yaml
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from tracecat.auth.types import Role
 from tracecat.dsl.common import DSLConfig, DSLEntrypoint, DSLInput
-from tracecat.dsl.models import ActionStatement
+from tracecat.dsl.schemas import ActionStatement
 from tracecat.identifiers.workflow import WorkflowUUID
-from tracecat.types.auth import Role
+from tracecat.registry.lock.types import RegistryLock
 from tracecat.workflow.store.import_service import WorkflowImportService
-from tracecat.workflow.store.models import (
+from tracecat.workflow.store.schemas import (
     RemoteWorkflowDefinition,
 )
 
@@ -73,16 +76,52 @@ class TestWorkflowImportServiceSimple:
     async def test_create_actions_from_dsl_simple(
         self, import_service: WorkflowImportService, simple_dsl: DSLInput
     ):
-        """Test creating actions from DSL without database complications."""
+        """Test creating actions from DSL."""
+        # Create workflow first (actions require existing workflow due to FK constraint)
         workflow_id = WorkflowUUID.new("wf_testactions")
-        actions = await import_service._create_actions_from_dsl(simple_dsl, workflow_id)
+        base_dsl = DSLInput(
+            title="Base Workflow",
+            description="Workflow for testing actions",
+            entrypoint=DSLEntrypoint(ref="placeholder"),
+            actions=[
+                ActionStatement(
+                    ref="placeholder",
+                    action="core.transform.transform",
+                    args={"value": "placeholder"},
+                    description="Placeholder",
+                )
+            ],
+            config=DSLConfig(timeout=300),
+        )
+        with patch(
+            "tracecat.workflow.management.management.RegistryLockService.resolve_lock_with_bindings",
+            new=AsyncMock(
+                return_value=RegistryLock(
+                    origins={"tracecat_registry": "test"},
+                    actions={"core.transform.transform": "tracecat_registry"},
+                )
+            ),
+        ):
+            workflow = await import_service.wf_mgmt.create_db_workflow_from_dsl(
+                base_dsl, workflow_id=workflow_id, commit=False
+            )
+        # Remove placeholder actions
+        await import_service.session.refresh(workflow, ["actions"])
+        for action in workflow.actions:
+            await import_service.session.delete(action)
+        await import_service.session.flush()
+
+        # Now test creating actions from DSL
+        actions = await import_service.wf_mgmt.create_actions_from_dsl(
+            simple_dsl, workflow_id
+        )
 
         assert len(actions) == 1
         action = actions[0]
         assert action.type == "core.transform.transform"
         assert action.description == "Simple transform action"
         assert action.workflow_id == workflow_id
-        assert action.owner_id == import_service.workspace_id
+        assert action.workspace_id == import_service.workspace_id
 
         # Verify inputs are YAML serialized
         inputs = yaml.safe_load(action.inputs)

@@ -1,33 +1,118 @@
-from datetime import UTC, datetime
+from collections.abc import Iterator
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
+from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, StatementError
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from tracecat.db.schemas import Table
+from tracecat import config
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import EDITOR_SCOPES, VIEWER_SCOPES
+from tracecat.db.models import Table, TableColumn, Workspace
+from tracecat.exceptions import TracecatAuthorizationError, TracecatNotFoundError
 from tracecat.logger import logger
-from tracecat.tables.common import parse_postgres_default
+from tracecat.pagination import CursorPaginationParams
+from tracecat.tables.common import handle_default_value, parse_postgres_default
 from tracecat.tables.enums import SqlType
-from tracecat.tables.models import (
+from tracecat.tables.schemas import (
     TableColumnCreate,
     TableColumnUpdate,
     TableCreate,
     TableRowInsert,
     TableUpdate,
 )
-from tracecat.tables.service import TablesService
-from tracecat.types.auth import Role
-from tracecat.types.exceptions import TracecatNotFoundError
+from tracecat.tables.service import (
+    DYNAMIC_WORKSPACE_TENANT_COLUMN,
+    TableEditorService,
+    TablesService,
+    is_internal_column_name,
+    sanitize_identifier,
+    validate_identifier,
+    visible_column_names,
+)
 
 pytestmark = pytest.mark.usefixtures("db")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def workflow_bucket() -> Iterator[None]:
+    """Disable MinIO-dependent workflow bucket setup for these tests."""
+    yield
 
 
 @pytest.fixture(scope="function")
 async def tables_service(session: AsyncSession, svc_admin_role: Role) -> TablesService:
     """Fixture to create a TablesService instance using an admin role."""
     return TablesService(session=session, role=svc_admin_role)
+
+
+@pytest.fixture(scope="function")
+async def other_workspace(session: AsyncSession, svc_workspace: Workspace) -> Workspace:
+    """Secondary workspace for cross-workspace isolation tests."""
+    workspace = Workspace(
+        name="other-tables-workspace",
+        organization_id=svc_workspace.organization_id,
+    )
+    session.add(workspace)
+    await session.commit()
+    await session.refresh(workspace)
+    return workspace
+
+
+@pytest.fixture(scope="function")
+async def other_admin_role(svc_admin_role: Role, other_workspace: Workspace) -> Role:
+    """Org admin role scoped to the secondary workspace."""
+    return svc_admin_role.model_copy(
+        update={
+            "workspace_id": other_workspace.id,
+            "organization_id": other_workspace.organization_id,
+            "user_id": uuid4(),
+        }
+    )
+
+
+@pytest.fixture(scope="function")
+async def other_tables_service(
+    session: AsyncSession, other_admin_role: Role
+) -> TablesService:
+    """TablesService instance scoped to the secondary workspace."""
+    return TablesService(session=session, role=other_admin_role)
+
+
+@pytest.fixture(scope="function")
+async def svc_editor_role(svc_workspace) -> Role:  # type: ignore[override]
+    """Workspace editor role for tables tests."""
+    return Role(
+        type="user",
+        workspace_id=svc_workspace.id,
+        organization_id=svc_workspace.organization_id,
+        user_id=uuid4(),
+        service_id="tracecat-api",
+        scopes=EDITOR_SCOPES,
+    )
+
+
+@pytest.fixture(scope="function")
+async def tables_service_editor(
+    session: AsyncSession, svc_editor_role: Role
+) -> TablesService:
+    """TablesService bound to a workspace editor role."""
+    return TablesService(session=session, role=svc_editor_role)
+
+
+@pytest.fixture(scope="function")
+async def tables_service_basic(session: AsyncSession, svc_role: Role) -> TablesService:
+    """TablesService bound to a basic member without workspace role."""
+    return TablesService(
+        session=session,
+        role=svc_role.model_copy(update={"scopes": VIEWER_SCOPES}),
+    )
 
 
 # New fixture to create a table with 'name' and 'age' columns for row tests
@@ -51,8 +136,65 @@ async def table(tables_service: TablesService) -> Table:
     return table
 
 
+async def _list_rows_page(
+    tables_service: TablesService,
+    table: Table,
+    *,
+    limit: int = 100,
+    cursor: str | None = None,
+    reverse: bool = False,
+):
+    """List rows in tests using cursor semantics with deterministic ordering."""
+    return await tables_service.list_rows(
+        table,
+        params=CursorPaginationParams(
+            limit=limit,
+            cursor=cursor,
+            reverse=reverse,
+        ),
+        order_by="created_at",
+        sort="asc",
+    )
+
+
+async def _list_rows(
+    tables_service: TablesService,
+    table: Table,
+    *,
+    limit: int = 100,
+    cursor: str | None = None,
+    reverse: bool = False,
+) -> list[dict[str, Any]]:
+    """List rows in tests using cursor semantics."""
+    rows: list[dict[str, Any]] = []
+    next_cursor = cursor
+
+    while len(rows) < limit:
+        page_limit = min(limit - len(rows), config.TRACECAT__LIMIT_CURSOR_MAX)
+        page = await _list_rows_page(
+            tables_service,
+            table,
+            limit=page_limit,
+            cursor=next_cursor,
+            reverse=reverse,
+        )
+        rows.extend(page.items)
+        if not page.has_more or page.next_cursor is None:
+            break
+        next_cursor = page.next_cursor
+
+    return rows
+
+
 @pytest.mark.anyio
 class TestTablesService:
+    async def test_internal_column_name_check_is_case_insensitive(self) -> None:
+        """Internal column detection should normalize case for reserved namespaces."""
+        assert is_internal_column_name("__tc_workspace_id") is True
+        assert is_internal_column_name("__TC_workspace_id") is True
+        assert is_internal_column_name("__tc_shadow") is True
+        assert is_internal_column_name("user_field") is False
+
     async def test_create_and_get_table(self, tables_service: TablesService) -> None:
         """Test creating a table and retrieving it by name and id."""
         # Create a table using TableCreate
@@ -67,6 +209,63 @@ class TestTablesService:
         # Retrieve by id
         retrieved_by_id = await tables_service.get_table(created_table.id)
         assert retrieved_by_id.id == created_table.id
+
+    async def test_create_table_with_keyword_name(
+        self, tables_service: TablesService
+    ) -> None:
+        """Creating a keyword-named table should still succeed."""
+        created_table = await tables_service.create_table(TableCreate(name="user"))
+
+        retrieved_table = await tables_service.get_table_by_name("user")
+        assert retrieved_table.id == created_table.id
+
+    async def test_get_table_by_name_rejects_invalid_alias(
+        self, tables_service: TablesService
+    ) -> None:
+        """Invalid external names should not alias to a different stored table name."""
+        await tables_service.create_table(TableCreate(name="badname"))
+
+        with pytest.raises(ValueError, match="Identifier must"):
+            await tables_service.get_table_by_name("bad-name")
+
+    async def test_get_table_by_name_allows_exact_legacy_metadata_name(
+        self, tables_service: TablesService
+    ) -> None:
+        """Legacy metadata names should still resolve when matched exactly."""
+        table = await tables_service.create_table(TableCreate(name="legacyname"))
+        table.name = "legacy-name"
+        await tables_service.session.flush()
+
+        resolved = await tables_service.get_table_by_name("legacy-name")
+        assert resolved.id == table.id
+
+    async def test_editor_can_create_table(
+        self, tables_service_editor: TablesService
+    ) -> None:
+        """Workspace editors should be allowed to create tables."""
+
+        table = await tables_service_editor.create_table(
+            TableCreate(name="editor_table")
+        )
+        fetched = await tables_service_editor.get_table(table.id)
+        assert fetched.name == "editor_table"
+
+    async def test_editor_cannot_delete_table(
+        self, tables_service_editor: TablesService, tables_service: TablesService
+    ) -> None:
+        """Workspace editors should not be allowed to delete tables (admin only)."""
+
+        table = await tables_service.create_table(TableCreate(name="editor_nodelete"))
+        with pytest.raises(TracecatAuthorizationError):
+            await tables_service_editor.delete_table(table)
+
+    async def test_basic_member_cannot_create_table(
+        self, tables_service_basic: TablesService
+    ) -> None:
+        """Members lacking a workspace role should be rejected for DDL."""
+
+        with pytest.raises(TracecatAuthorizationError):
+            await tables_service_basic.create_table(TableCreate(name="blocked_table"))
 
     async def test_list_tables(self, tables_service: TablesService) -> None:
         """Test listing tables after creating multiple tables."""
@@ -137,6 +336,125 @@ class TestTablesService:
                 assert col.nullable is True
                 assert col.default == "0"  # Default values are stored as strings
 
+    async def test_import_table_from_csv(self, tables_service: TablesService) -> None:
+        """Importing a CSV should create table, columns, and rows."""
+        csv_content = "\n".join(
+            [
+                "Full Name,Age,Active,Joined",
+                "Alice,30,true,2024-01-01T12:00:00Z",
+                "Bob,25,false,2024-01-02",
+            ]
+        )
+
+        (
+            table,
+            rows_inserted,
+            inferred_columns,
+        ) = await tables_service.import_table_from_csv(
+            contents=csv_content.encode(),
+            filename="People.csv",
+        )
+
+        assert table.name == "people"
+        assert rows_inserted == 2
+        mapping = {col.original_name: col.name for col in inferred_columns}
+        assert mapping["Full Name"] == "fullname"
+        assert mapping["Age"] == "age"
+        assert mapping["Active"] == "active"
+
+        retrieved_table = await tables_service.get_table(table.id)
+        rows = await _list_rows(tables_service, retrieved_table)
+        assert len(rows) == 2
+        rows_by_name = {row["fullname"]: row for row in rows}
+        assert rows_by_name.keys() == {"Alice", "Bob"}
+        assert isinstance(rows_by_name["Alice"]["age"], int)
+        assert isinstance(rows_by_name["Alice"]["active"], bool)
+        assert isinstance(rows_by_name["Bob"]["age"], int)
+        assert isinstance(rows_by_name["Bob"]["active"], bool)
+
+        second_table, _, _ = await tables_service.import_table_from_csv(
+            contents=csv_content.encode(),
+            filename="People.csv",
+        )
+        assert second_table.name == "people_1"
+
+    async def test_import_table_from_csv_json_arrays(
+        self, tables_service: TablesService
+    ) -> None:
+        """JSON array cells should be stored as JSONB instead of plain text."""
+        csv_content = "\n".join(
+            [
+                "Name,Tags",
+                'Widget,"[""foo"", ""bar""]"',
+            ]
+        )
+
+        table, inserted, inferred_columns = await tables_service.import_table_from_csv(
+            contents=csv_content.encode(),
+            filename="JsonArrays.csv",
+        )
+
+        assert inserted == 1
+        tags_column = next(
+            column for column in inferred_columns if column.original_name == "Tags"
+        )
+        assert tags_column.type is SqlType.JSONB
+
+        retrieved_table = await tables_service.get_table(table.id)
+        rows = await _list_rows(tables_service, retrieved_table)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["name"] == "Widget"
+        assert row["tags"] == ["foo", "bar"]
+
+    async def test_import_table_handles_empty_numeric_values(
+        self, tables_service: TablesService
+    ) -> None:
+        """Empty cells in numeric columns should be treated as NULL."""
+        csv_content = "\n".join(
+            [
+                "Name,Age",
+                "Alice,",
+                "Bob,42",
+            ]
+        )
+
+        table, _, _ = await tables_service.import_table_from_csv(
+            contents=csv_content.encode(),
+            filename="Ages.csv",
+        )
+
+        retrieved_table = await tables_service.get_table(table.id)
+        rows = await _list_rows(tables_service, retrieved_table)
+        assert len(rows) == 2
+        rows_by_name = {row["name"]: row for row in rows}
+        assert rows_by_name["Alice"]["age"] is None
+        assert rows_by_name["Bob"]["age"] == 42
+
+    async def test_import_table_from_csv_honors_chunk_size(
+        self, tables_service: TablesService
+    ) -> None:
+        """Imports should allow larger chunk sizes without hitting the default cap."""
+
+        header = "name"
+        total_rows = 1500
+        rows = [f"row_{i}" for i in range(total_rows)]
+        csv_content = "\n".join([header, *rows])
+
+        table, inserted, _ = await tables_service.import_table_from_csv(
+            contents=csv_content.encode(),
+            filename="Large.csv",
+            chunk_size=total_rows,
+        )
+
+        assert inserted == total_rows
+
+        retrieved_table = await tables_service.get_table(table.id)
+        actual_rows = await _list_rows(
+            tables_service, retrieved_table, limit=total_rows
+        )
+        assert len(actual_rows) == total_rows
+
     async def test_update_table(self, tables_service: TablesService) -> None:
         """Test updating table metadata."""
         # Create table
@@ -165,6 +483,14 @@ class TestTablesService:
         with pytest.raises(TracecatNotFoundError):
             await tables_service.get_table_by_name("deletable_table")
 
+    @pytest.mark.parametrize("invalid_type", ["TIMESTAMP", "UUID"])
+    def test_table_column_create_rejects_removed_types(self, invalid_type: str) -> None:
+        """Removed user-defined SQL types should fail schema validation."""
+        with pytest.raises(ValidationError, match=invalid_type):
+            TableColumnCreate.model_validate(
+                {"name": "legacy_column", "type": invalid_type}
+            )
+
 
 class TestParsePostgresDefault:
     @pytest.fixture
@@ -176,6 +502,7 @@ class TestParsePostgresDefault:
         [
             (None, None),
             ("'attack'::text", "attack"),
+            ("'O''Brien'::text", "O'Brien"),
             ("0::integer", "0"),
             ("true::boolean", "true"),
             ("'2024-01-01'::timestamp", "2024-01-01"),
@@ -202,6 +529,121 @@ class TestParsePostgresDefault:
         assert parse_default(raw) == expected
 
 
+class TestHandleDefaultValue:
+    @pytest.mark.parametrize(
+        ("sql_type", "default", "expected"),
+        [
+            pytest.param(
+                SqlType.TEXT,
+                "O'Brien",
+                "'O''Brien'",
+                id="text-escapes-single-quote",
+            ),
+            pytest.param(
+                SqlType.SELECT,
+                "O'Brien",
+                "'O''Brien'",
+                id="select-escapes-single-quote",
+            ),
+            pytest.param(
+                SqlType.INTEGER,
+                "42",
+                "42",
+                id="integer-literal",
+            ),
+            pytest.param(
+                SqlType.NUMERIC,
+                "3.14159",
+                "3.14159",
+                id="numeric-literal",
+            ),
+            pytest.param(
+                SqlType.JSONB,
+                {"author": "O'Brien"},
+                "'{\"author\":\"O''Brien\"}'::jsonb",
+                id="jsonb-literal",
+            ),
+        ],
+    )
+    def test_formats_literal_safe_defaults(
+        self, sql_type: SqlType, default: Any, expected: str
+    ) -> None:
+        assert handle_default_value(sql_type, default) == expected
+
+    @pytest.mark.parametrize(
+        ("sql_type", "default", "error_message"),
+        [
+            pytest.param(
+                SqlType.INTEGER,
+                "1 + 2",
+                "Invalid integer default value",
+                id="integer-expression",
+            ),
+            pytest.param(
+                SqlType.INTEGER,
+                "Infinity",
+                "Invalid integer default value",
+                id="integer-infinity",
+            ),
+            pytest.param(
+                SqlType.INTEGER,
+                "1e500000",
+                "Invalid integer default value",
+                id="integer-out-of-range-exponent",
+            ),
+            pytest.param(
+                SqlType.NUMERIC,
+                "1 / 0.5",
+                "Invalid numeric default value",
+                id="numeric-expression",
+            ),
+            pytest.param(
+                SqlType.NUMERIC,
+                "Infinity",
+                "Invalid numeric default value",
+                id="numeric-infinity",
+            ),
+        ],
+    )
+    def test_rejects_non_literal_defaults(
+        self, sql_type: SqlType, default: Any, error_message: str
+    ) -> None:
+        with pytest.raises(ValueError, match=error_message):
+            handle_default_value(sql_type, default)
+
+    def test_text_sql_injection_payload_is_rendered_as_literal(self) -> None:
+        payload = "'; SELECT pg_sleep(1); --"
+        assert (
+            handle_default_value(SqlType.TEXT, payload)
+            == "'''; SELECT pg_sleep(1); --'"
+        )
+
+    def test_jsonb_sql_injection_payload_is_rendered_as_literal(self) -> None:
+        payload = {"query": "'; SELECT pg_sleep(1); --"}
+        rendered = handle_default_value(SqlType.JSONB, payload)
+        assert rendered.startswith("'")
+        assert rendered.endswith("'::jsonb")
+        assert "SELECT pg_sleep(1)" in rendered
+
+
+class TestSanitizeIdentifier:
+    @pytest.mark.parametrize(
+        ("identifier", "expected"),
+        [
+            ("display_name", "display_name"),
+            ("bad-name", "badname"),
+            ('";drop', "drop"),
+        ],
+    )
+    def test_normalizes_identifiers(self, identifier: str, expected: str) -> None:
+        assert sanitize_identifier(identifier) == expected
+
+    @pytest.mark.parametrize("identifier", ["", '";drop', "123field"])
+    def test_rejects_identifiers_without_valid_sql_shape(self, identifier: str) -> None:
+        with pytest.raises(ValueError):
+            validate_identifier(identifier)
+
+
 @pytest.mark.anyio
 class TestTableColumns:
     async def test_create_and_get_column(self, tables_service: TablesService) -> None:
@@ -220,6 +662,29 @@ class TestTableColumns:
         assert retrieved_col.id == column.id
         assert retrieved_col.name == "age"
         assert retrieved_col.type == SqlType.INTEGER
+
+    async def test_create_column_rejects_internal_namespace(
+        self, tables_service: TablesService
+    ) -> None:
+        """TablesService should reject creating internal/system-managed columns."""
+        table = await tables_service.create_table(
+            TableCreate(name="create_internal_column_reject")
+        )
+
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await tables_service.create_column(
+                table,
+                TableColumnCreate(
+                    name=DYNAMIC_WORKSPACE_TENANT_COLUMN,
+                    type=SqlType.TEXT,
+                ),
+            )
+
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await tables_service.create_column(
+                table,
+                TableColumnCreate(name="__tc_shadow", type=SqlType.TEXT),
+            )
 
     async def test_delete_column(self, tables_service: TablesService) -> None:
         """Test deleting a column from a table and ensuring it is removed."""
@@ -272,6 +737,280 @@ class TestTableColumns:
         assert retrieved_column.default == "default_value"
         assert retrieved_column.type == SqlType.TEXT
 
+    async def test_update_column_rejects_internal_namespace(
+        self, tables_service: TablesService
+    ) -> None:
+        """TablesService should reject operating on internal/system-managed columns."""
+        table = await tables_service.create_table(
+            TableCreate(name="update_internal_column_reject")
+        )
+        column = await tables_service.create_column(
+            table,
+            TableColumnCreate(name="nickname", type=SqlType.TEXT, nullable=True),
+        )
+
+        column.name = DYNAMIC_WORKSPACE_TENANT_COLUMN
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await tables_service.update_column(
+                column,
+                TableColumnUpdate(name="display_name"),
+            )
+
+        column.name = "nickname"
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await tables_service.update_column(
+                column,
+                TableColumnUpdate(name="__TC_workspace_id"),
+            )
+
+    async def test_update_column_ignores_null_rename(
+        self, tables_service: TablesService
+    ) -> None:
+        """TablesService should treat explicit null rename payloads as no-ops."""
+        table = await tables_service.create_table(
+            TableCreate(name="reject_null_column_rename")
+        )
+        column = await tables_service.create_column(
+            table,
+            TableColumnCreate(name="nickname", type=SqlType.TEXT, nullable=True),
+        )
+
+        updated = await tables_service.update_column(
+            column, TableColumnUpdate(name=None)
+        )
+
+        assert updated.name == "nickname"
+
+    async def test_create_column_default_with_single_quote(
+        self, tables_service: TablesService
+    ) -> None:
+        """Quoted text defaults should be stored as string literals, not SQL."""
+        table = await tables_service.create_table(
+            TableCreate(name="quoted_default_create")
+        )
+
+        column = await tables_service.create_column(
+            table,
+            TableColumnCreate(
+                name="nickname",
+                type=SqlType.TEXT,
+                nullable=True,
+                default="O'Brien",
+            ),
+        )
+        assert column.default == "O'Brien"
+
+        inserted = await tables_service.insert_row(table, TableRowInsert(data={}))
+        assert inserted["nickname"] == "O'Brien"
+
+    async def test_update_column_default_with_single_quote(
+        self, tables_service: TablesService
+    ) -> None:
+        """TablesService updates should safely apply quoted defaults."""
+        table = await tables_service.create_table(
+            TableCreate(name="quoted_default_update")
+        )
+        column = await tables_service.create_column(
+            table,
+            TableColumnCreate(name="nickname", type=SqlType.TEXT, nullable=True),
+        )
+
+        await tables_service.update_column(
+            column,
+            TableColumnUpdate(name="display_name", default="O'Brien"),
+        )
+        updated_column = await tables_service.get_column(table.id, column.id)
+        assert updated_column.default == "O'Brien"
+
+        inserted = await tables_service.insert_row(table, TableRowInsert(data={}))
+        assert inserted["display_name"] == "O'Brien"
+
+    async def test_table_editor_update_column_default_with_single_quote(
+        self, tables_service: TablesService
+    ) -> None:
+        """TableEditorService should also escape quoted defaults."""
+        table = await tables_service.create_table(
+            TableCreate(name="quoted_default_editor_update")
+        )
+        await tables_service.create_column(
+            table,
+            TableColumnCreate(name="nickname", type=SqlType.TEXT, nullable=True),
+        )
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+
+        await editor.update_column("nickname", TableColumnUpdate(default="O'Brien"))
+
+        inserted = await editor.insert_row(TableRowInsert(data={}))
+        assert inserted["nickname"] == "O'Brien"
+
+    async def test_table_editor_create_column_rejects_internal_name(
+        self, tables_service: TablesService
+    ) -> None:
+        """Editor column creation should reject internal/system-managed names."""
+        table = await tables_service.create_table(
+            TableCreate(name="editor_reject_internal_create")
+        )
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await editor.create_column(
+                TableColumnCreate(
+                    name=DYNAMIC_WORKSPACE_TENANT_COLUMN,
+                    type=SqlType.TEXT,
+                )
+            )
+
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await editor.create_column(
+                TableColumnCreate(name="__tc_shadow", type=SqlType.TEXT)
+            )
+
+    async def test_table_editor_update_column_rejects_internal_name(
+        self, tables_service: TablesService
+    ) -> None:
+        """Editor column updates should reject internal/system-managed names."""
+        table = await tables_service.create_table(
+            TableCreate(
+                name="editor_reject_internal_update",
+                columns=[
+                    TableColumnCreate(name="nickname", type=SqlType.TEXT),
+                ],
+            )
+        )
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await editor.update_column(
+                DYNAMIC_WORKSPACE_TENANT_COLUMN,
+                TableColumnUpdate(name="display_name"),
+            )
+
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await editor.update_column(
+                "nickname",
+                TableColumnUpdate(name="__TC_workspace_id"),
+            )
+
+    async def test_table_editor_update_column_ignores_null_rename(
+        self, tables_service: TablesService
+    ) -> None:
+        """TableEditorService should treat explicit null rename payloads as no-ops."""
+        table = await tables_service.create_table(
+            TableCreate(
+                name="editor_reject_null_update",
+                columns=[
+                    TableColumnCreate(name="nickname", type=SqlType.TEXT),
+                ],
+            )
+        )
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+
+        await editor.update_column("nickname", TableColumnUpdate(name=None))
+
+        columns = await editor.get_columns()
+
+        assert any(column["name"] == "nickname" for column in columns)
+
+    async def test_update_column_handles_legacy_metadata_name(
+        self, tables_service: TablesService
+    ) -> None:
+        """Legacy metadata names should still resolve to the physical column."""
+        table = await tables_service.create_table(
+            TableCreate(name="legacy_column_name")
+        )
+        column = await tables_service.create_column(
+            table,
+            TableColumnCreate(name="badname", type=SqlType.TEXT, nullable=True),
+        )
+        column.name = "bad-name"
+        await tables_service.session.flush()
+
+        updated_column = await tables_service.update_column(
+            column,
+            TableColumnUpdate(name="display_name"),
+        )
+
+        assert updated_column.name == "display_name"
+
+    async def test_create_column_sql_injection_payload_is_stored_as_text_literal(
+        self, tables_service: TablesService
+    ) -> None:
+        """Text defaults that look like SQL must round-trip as plain text."""
+        payload = "'; SELECT pg_sleep(1); --"
+        table = await tables_service.create_table(
+            TableCreate(name="default_sql_injection_create")
+        )
+
+        column = await tables_service.create_column(
+            table,
+            TableColumnCreate(
+                name="notes",
+                type=SqlType.TEXT,
+                nullable=True,
+                default=payload,
+            ),
+        )
+
+        assert column.default == payload
+        inserted = await tables_service.insert_row(table, TableRowInsert(data={}))
+        assert inserted["notes"] == payload
+
+    async def test_update_column_rejects_sql_injection_payload_for_integer_default(
+        self, tables_service: TablesService
+    ) -> None:
+        """Typed defaults should reject SQL-expression payloads instead of rendering them."""
+        payload = "1; SELECT pg_sleep(1); --"
+        table = await tables_service.create_table(
+            TableCreate(name="default_sql_injection_update")
+        )
+        column = await tables_service.create_column(
+            table,
+            TableColumnCreate(name="attempts", type=SqlType.INTEGER, nullable=True),
+        )
+
+        with pytest.raises(ValueError, match="Invalid integer default value"):
+            await tables_service.update_column(
+                column,
+                TableColumnUpdate(default=payload),
+            )
+
+    async def test_get_column_rejects_cross_workspace_lookup(
+        self,
+        tables_service: TablesService,
+        other_tables_service: TablesService,
+    ) -> None:
+        """Column lookup should fail when table belongs to another workspace."""
+        other_table = await other_tables_service.create_table(
+            TableCreate(name="other_workspace_table")
+        )
+        other_column = await other_tables_service.create_column(
+            other_table,
+            TableColumnCreate(name="external_col", type=SqlType.TEXT),
+        )
+
+        with pytest.raises(TracecatNotFoundError):
+            await tables_service.get_column(other_table.id, other_column.id)
+
     async def test_create_single_column_unique_index(
         self, tables_service: TablesService, table: Table
     ) -> None:
@@ -293,6 +1032,24 @@ class TestTableColumns:
         # Verify the error message indicates a unique constraint violation
         error_msg = str(exc_info.value)
         assert "unique" in error_msg.lower() or "duplicate" in error_msg.lower()
+
+    async def test_update_column_can_create_unique_index(
+        self, tables_service: TablesService, table: Table, session: AsyncSession
+    ) -> None:
+        """Creating a unique index via update_column should not trigger lazy-load IO."""
+        name_column_id = await session.scalar(
+            select(TableColumn.id).where(
+                TableColumn.table_id == table.id,
+                TableColumn.name == "name",
+            )
+        )
+        assert name_column_id is not None
+        column = await tables_service.get_column(table.id, name_column_id)
+
+        await tables_service.update_column(column, TableColumnUpdate(is_index=True))
+
+        index_columns = await tables_service.get_index(table)
+        assert "name" in index_columns
 
     async def test_create_unique_index_with_existing_duplicates(
         self, tables_service: TablesService, table: Table
@@ -349,6 +1106,37 @@ class TestTableRows:
         assert "created_at" in retrieved
         assert "updated_at" in retrieved
 
+    async def test_row_payloads_hide_internal_tenant_column(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Row payloads should hide internal tenant columns."""
+        inserted = await tables_service.insert_row(
+            table, TableRowInsert(data={"name": "Hidden", "age": 33})
+        )
+
+        assert DYNAMIC_WORKSPACE_TENANT_COLUMN not in inserted
+
+        retrieved = await tables_service.get_row(table, inserted["id"])
+        assert DYNAMIC_WORKSPACE_TENANT_COLUMN not in retrieved
+
+        rows = await _list_rows(tables_service, table)
+        assert all(DYNAMIC_WORKSPACE_TENANT_COLUMN not in row for row in rows)
+
+        conn = await tables_service.session.connection()
+        physical_row = (
+            await conn.execute(
+                sa.text(
+                    f'''
+                    SELECT "{DYNAMIC_WORKSPACE_TENANT_COLUMN}"
+                    FROM "{tables_service._get_schema_name()}"."{table.name}"
+                    WHERE id = :row_id
+                    '''
+                ),
+                {"row_id": inserted["id"]},
+            )
+        ).one()
+        assert physical_row[0] == tables_service.workspace_id
+
     async def test_upsert_single_column_unique_index(
         self, tables_service: TablesService, table: Table
     ) -> None:
@@ -371,7 +1159,7 @@ class TestTableRows:
         assert upserted["age"] == 35
 
         # Verify only one row exists
-        rows = await tables_service.list_rows(table)
+        rows = await _list_rows(tables_service, table)
         assert len(rows) == 1, "Only one row should exist after upsert"
 
         assert "updated_at" in upserted
@@ -478,8 +1266,52 @@ class TestTableRows:
         assert result["name"] == "Bob"
         assert result["age"] == 40
 
+    async def test_lookup_row_rejects_invalid_column_alias(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Invalid external column names should not alias to a different column."""
+        with pytest.raises(ValueError, match="Identifier must"):
+            await tables_service.lookup_rows(
+                table_name=table.name,
+                columns=["na-me"],
+                values=["Bob"],
+            )
+
+    async def test_lookup_row_allows_system_id_column(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """System columns should remain available to lookup_rows."""
+        inserted = await tables_service.insert_row(
+            table, TableRowInsert(data={"name": "Bob", "age": 40})
+        )
+
+        results = await tables_service.lookup_rows(
+            table_name=table.name,
+            columns=["id"],
+            values=[inserted["id"]],
+        )
+
+        assert len(results) == 1
+        assert results[0]["id"] == inserted["id"]
+
+    async def test_exists_rows_allows_system_id_column(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """System columns should remain available to exists_rows."""
+        inserted = await tables_service.insert_row(
+            table, TableRowInsert(data={"name": "Bob", "age": 40})
+        )
+
+        exists = await tables_service.exists_rows(
+            table_name=table.name,
+            columns=["id"],
+            values=[inserted["id"]],
+        )
+
+        assert exists is True
+
     async def test_list_rows(self, tables_service: TablesService, table: Table) -> None:
-        """Test listing rows with pagination using limit and offset."""
+        """Test listing rows with cursor-based pagination."""
         # Insert multiple test rows
         test_data = [
             {"name": "Alice", "age": 25},
@@ -492,25 +1324,249 @@ class TestTableRows:
         for data in test_data:
             await tables_service.insert_row(table, TableRowInsert(data=data))
 
-        # Test default pagination (limit=100, offset=0)
-        all_rows = await tables_service.list_rows(table)
+        # Test default pagination
+        all_rows = await _list_rows(tables_service, table)
         assert len(all_rows) == 5
 
-        # Test with limit
-        limited_rows = await tables_service.list_rows(table, limit=2)
-        assert len(limited_rows) == 2
-        assert limited_rows[0]["name"] == "Alice"
-        assert limited_rows[1]["name"] == "Bob"
+        # Test first page
+        first_page = await _list_rows_page(tables_service, table, limit=2)
+        assert len(first_page.items) == 2
+        assert [row["id"] for row in first_page.items] == [
+            row["id"] for row in all_rows[:2]
+        ]
+        assert first_page.has_more is True
+        assert first_page.next_cursor is not None
 
-        # Test with offset
-        offset_rows = await tables_service.list_rows(table, offset=2, limit=2)
-        assert len(offset_rows) == 2
-        assert offset_rows[0]["name"] == "Carol"
-        assert offset_rows[1]["name"] == "David"
+        # Test second page using cursor
+        second_page = await _list_rows_page(
+            tables_service,
+            table,
+            limit=2,
+            cursor=first_page.next_cursor,
+        )
+        assert len(second_page.items) == 2
+        assert [row["id"] for row in second_page.items] == [
+            row["id"] for row in all_rows[2:4]
+        ]
+        assert second_page.has_more is True
+        assert second_page.next_cursor is not None
 
-        # Test with offset that exceeds available rows
-        empty_rows = await tables_service.list_rows(table, offset=10)
-        assert len(empty_rows) == 0
+        # Final page should contain the remainder and no next cursor
+        final_page = await _list_rows_page(
+            tables_service,
+            table,
+            limit=2,
+            cursor=second_page.next_cursor,
+        )
+        assert len(final_page.items) == 1
+        assert [row["id"] for row in final_page.items] == [
+            row["id"] for row in all_rows[4:5]
+        ]
+        assert final_page.has_more is False
+        assert final_page.next_cursor is None
+
+    async def test_list_rows_reverse_pagination_flags(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Reverse pagination flags should match the returned page direction."""
+        # Insert enough rows to paginate
+        for i in range(5):
+            await tables_service.insert_row(
+                table, TableRowInsert(data={"name": f"User{i}", "age": 20 + i})
+            )
+
+        all_rows = await _list_rows(tables_service, table)
+        first_page = await _list_rows_page(tables_service, table, limit=2)
+
+        # Navigate backward from the first forward page cursor.
+        reverse_page = await _list_rows_page(
+            tables_service,
+            table,
+            limit=2,
+            cursor=first_page.next_cursor,
+            reverse=True,
+        )
+
+        # The reverse page should contain only rows before the cursor.
+        assert [row["id"] for row in reverse_page.items] == [all_rows[0]["id"]]
+
+        # In response direction:
+        # - has_more: there is a forward page available (cursor origin and newer items)
+        # - has_previous: there are no older rows before this reverse page
+        assert reverse_page.has_more is True
+        assert reverse_page.has_previous is False
+
+    async def test_table_editor_list_rows_reverse_pagination_flags(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """TableEditorService reverse pagination should expose forward-facing flags."""
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+
+        for i in range(5):
+            await editor.insert_row(
+                TableRowInsert(data={"name": f"Editor{i}", "age": i})
+            )
+
+        first_page = await editor.list_rows(limit=2)
+        assert first_page.next_cursor is not None
+
+        reverse_page = await editor.list_rows(
+            limit=2, cursor=first_page.next_cursor, reverse=True
+        )
+
+        assert len(reverse_page.items) == 1
+        assert reverse_page.has_more is True
+        assert reverse_page.has_previous is False
+        assert reverse_page.next_cursor is not None
+        assert reverse_page.prev_cursor is None
+
+    async def test_table_editor_row_payloads_hide_internal_tenant_column(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Editor row payloads should hide internal tenant columns."""
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+
+        inserted = await editor.insert_row(
+            TableRowInsert(data={"name": "Editor hidden", "age": 33})
+        )
+        assert DYNAMIC_WORKSPACE_TENANT_COLUMN not in inserted
+
+        retrieved = await editor.get_row(inserted["id"])
+        assert DYNAMIC_WORKSPACE_TENANT_COLUMN not in retrieved
+
+        page = await editor.list_rows(limit=10)
+        assert all(DYNAMIC_WORKSPACE_TENANT_COLUMN not in row for row in page.items)
+
+    async def test_table_editor_get_columns_hides_internal_tenant_column(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Editor column listings should hide internal tenant columns."""
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+
+        columns = await editor.get_columns()
+
+        assert DYNAMIC_WORKSPACE_TENANT_COLUMN not in {
+            column["name"] for column in columns
+        }
+
+        conn = await tables_service.session.connection()
+        physical_columns = await conn.run_sync(
+            lambda sync_conn: sa.inspect(sync_conn).get_columns(
+                table.name, schema=tables_service._get_schema_name()
+            )
+        )
+        assert DYNAMIC_WORKSPACE_TENANT_COLUMN in {
+            column["name"] for column in physical_columns
+        }
+
+    async def test_table_editor_visible_columns_refresh_after_create_column(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Editor visible-column cache should refresh after schema changes."""
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+
+        await editor.list_rows(limit=1)
+        await editor.create_column(TableColumnCreate(name="city", type=SqlType.TEXT))
+
+        inserted = await editor.insert_row(
+            TableRowInsert(data={"name": "Editor city", "age": 4, "city": "NYC"})
+        )
+        assert inserted["city"] == "NYC"
+
+        retrieved = await editor.get_row(inserted["id"])
+        assert retrieved["city"] == "NYC"
+
+    async def test_visible_column_names_preserves_legacy_underscore_names(self) -> None:
+        """Visibility filtering should not reject legacy underscore-prefixed names."""
+        assert visible_column_names(["_legacy_field", "__tc_workspace_id"]) == [
+            "id",
+            "created_at",
+            "updated_at",
+            "_legacy_field",
+        ]
+
+    async def test_table_editor_insert_row_rejects_internal_column(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Editor inserts should reject internal/system-managed columns."""
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await editor.insert_row(
+                TableRowInsert(
+                    data={
+                        DYNAMIC_WORKSPACE_TENANT_COLUMN: str(
+                            tables_service.workspace_id
+                        )
+                    }
+                )
+            )
+
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await editor.insert_row(
+                TableRowInsert(
+                    data={"__TC_workspace_id": str(tables_service.workspace_id)}
+                )
+            )
+
+    async def test_table_editor_update_row_rejects_internal_column(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Editor updates should reject internal/system-managed columns."""
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+        inserted = await editor.insert_row(
+            TableRowInsert(data={"name": "Editor", "age": 1})
+        )
+
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await editor.update_row(
+                inserted["id"],
+                {DYNAMIC_WORKSPACE_TENANT_COLUMN: str(tables_service.workspace_id)},
+            )
+
+    async def test_table_editor_delete_column_rejects_internal_column(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Editor column deletion should reject internal/system-managed columns."""
+        editor = TableEditorService(
+            tables_service.session,
+            tables_service.role,
+            table_name=table.name,
+            schema_name=tables_service._get_schema_name(),
+        )
+
+        with pytest.raises(ValueError, match="reserved for internal use"):
+            await editor.delete_column(DYNAMIC_WORKSPACE_TENANT_COLUMN)
 
     async def test_batch_insert_rows(
         self, tables_service: TablesService, table: Table
@@ -529,7 +1585,7 @@ class TestTableRows:
         assert inserted_count == 3
 
         # Verify all rows were inserted
-        all_rows = await tables_service.list_rows(table)
+        all_rows = await _list_rows(tables_service, table)
         assert len(all_rows) == 3
         names = {row["name"] for row in all_rows}
         assert names == {"Alice", "Bob", "Carol"}
@@ -565,7 +1621,7 @@ class TestTableRows:
             await tables_service.batch_insert_rows(table, rows)
 
         # Verify no rows were inserted (transaction rolled back)
-        all_rows = await tables_service.list_rows(table)
+        all_rows = await _list_rows(tables_service, table)
         assert len(all_rows) == 0
 
     async def test_batch_insert_empty_list(
@@ -577,7 +1633,7 @@ class TestTableRows:
         assert inserted_count == 0
 
         # Verify no rows were inserted
-        all_rows = await tables_service.list_rows(table)
+        all_rows = await _list_rows(tables_service, table)
         assert len(all_rows) == 0
 
     async def test_batch_insert_rows_with_upsert(
@@ -597,7 +1653,7 @@ class TestTableRows:
         assert inserted_count == 3
 
         # Verify initial insert
-        all_rows = await tables_service.list_rows(table)
+        all_rows = await _list_rows(tables_service, table)
         assert len(all_rows) == 3
 
         # Batch upsert with some existing and some new rows
@@ -613,7 +1669,7 @@ class TestTableRows:
         assert upserted_count == 4  # 2 updates + 2 inserts
 
         # Verify final state
-        final_rows = await tables_service.list_rows(table)
+        final_rows = await _list_rows(tables_service, table)
         assert len(final_rows) == 5  # 3 original + 2 new
 
         # Check updated values
@@ -636,7 +1692,7 @@ class TestTableRows:
         await tables_service.insert_row(table, TableRowInsert(data=initial_row))
 
         # Verify initial state
-        rows = await tables_service.list_rows(table)
+        rows = await _list_rows(tables_service, table)
         assert len(rows) == 1
         assert rows[0]["name"] == "Alice"
         assert rows[0]["age"] == 25
@@ -652,7 +1708,7 @@ class TestTableRows:
         await tables_service.batch_insert_rows(table, upsert_rows, upsert=True)
 
         # Verify that Alice's age was NOT overwritten with NULL
-        final_rows = await tables_service.list_rows(table)
+        final_rows = await _list_rows(tables_service, table)
         assert len(final_rows) == 2
 
         alice_row = next(row for row in final_rows if row["name"] == "Alice")
@@ -734,7 +1790,7 @@ class TestTableRows:
         assert count == 5  # 2 updates + 3 inserts
 
         # Verify final state
-        final_rows = await tables_service.list_rows(table)
+        final_rows = await _list_rows(tables_service, table)
         assert len(final_rows) == 5
 
         # Check all values
@@ -804,9 +1860,7 @@ class TestTableDataTypes:
             TableColumnCreate(name="numeric_col", type=SqlType.NUMERIC),
             TableColumnCreate(name="bool_col", type=SqlType.BOOLEAN),
             TableColumnCreate(name="json_col", type=SqlType.JSONB),
-            TableColumnCreate(name="timestamp_col", type=SqlType.TIMESTAMP),
             TableColumnCreate(name="timestamptz_col", type=SqlType.TIMESTAMPTZ),
-            TableColumnCreate(name="uuid_col", type=SqlType.UUID),
         ]
 
         for column in columns:
@@ -819,10 +1873,8 @@ class TestTableDataTypes:
         self, tables_service: TablesService, complex_table: Table
     ) -> None:
         """Test inserting and retrieving values of all supported SQL types."""
-        # Test data for each type
-        test_uuid = uuid4()
-        test_timestamp = datetime(2024, 2, 24, 12, 0)
-        test_datetime_tz = datetime(2024, 2, 24, 12, 0, tzinfo=UTC)
+        naive_timestamp = datetime(2024, 2, 24, 12, 0)
+        expected_timestamp = naive_timestamp.replace(tzinfo=UTC)
         test_json = {"key": "value", "nested": {"list": [1, 2, 3]}}
 
         # Create test data covering all types
@@ -832,9 +1884,7 @@ class TestTableDataTypes:
             "numeric_col": Decimal("3.14159"),
             "bool_col": True,
             "json_col": test_json,
-            "timestamp_col": test_timestamp,
-            "timestamptz_col": test_datetime_tz,
-            "uuid_col": test_uuid,
+            "timestamptz_col": naive_timestamp,
         }
 
         # Insert the test data
@@ -854,15 +1904,78 @@ class TestTableDataTypes:
         assert retrieved["json_col"] == test_json
 
         # DateTime comparisons
-        retrieved_timestamp = retrieved["timestamp_col"]
         retrieved_timestamptz = retrieved["timestamptz_col"]
-        assert isinstance(retrieved_timestamp, datetime)
         assert isinstance(retrieved_timestamptz, datetime)
-        assert retrieved_timestamp == test_timestamp
-        assert retrieved_timestamptz == test_datetime_tz
+        assert retrieved_timestamptz == expected_timestamp
+        assert retrieved_timestamptz.tzinfo == UTC
 
-        # UUID comparison
-        assert str(retrieved["uuid_col"]) == str(test_uuid)
+    async def test_timestamptz_normalisation(
+        self, tables_service: TablesService, complex_table: Table
+    ) -> None:
+        """Ensure TIMESTAMPTZ values are normalised to UTC on insert and update."""
+        naive_value = datetime(2024, 3, 1, 10, 30)
+        inserted = await tables_service.insert_row(
+            complex_table, TableRowInsert(data={"timestamptz_col": naive_value})
+        )
+
+        expected_insert_value = naive_value.replace(tzinfo=UTC)
+        assert inserted["timestamptz_col"] == expected_insert_value
+
+        row_id = inserted["id"]
+        offset_zone = timezone(timedelta(hours=-5))
+        aware_value = datetime(2024, 3, 1, 5, 30, tzinfo=offset_zone)
+        updated = await tables_service.update_row(
+            complex_table, row_id, {"timestamptz_col": aware_value}
+        )
+        expected_update_value = aware_value.astimezone(UTC)
+        assert updated["timestamptz_col"] == expected_update_value
+
+        batch_rows = [
+            {"timestamptz_col": datetime(2024, 3, 2, 9, 0)},
+            {
+                "timestamptz_col": datetime(
+                    2024, 3, 2, 6, 0, tzinfo=timezone(timedelta(hours=-3))
+                )
+            },
+        ]
+        affected = await tables_service.batch_insert_rows(complex_table, batch_rows)
+        assert affected == 2
+
+        rows = await _list_rows(tables_service, complex_table)
+        # Extract non-null TIMESTAMPTZ values for verification
+        extracted = [row["timestamptz_col"] for row in rows if row["timestamptz_col"]]
+        assert len(extracted) == 3
+        assert all(value.tzinfo == UTC for value in extracted)
+
+        expected_values = sorted(
+            [
+                expected_update_value,
+                datetime(2024, 3, 2, 9, 0, tzinfo=UTC),
+                datetime(2024, 3, 2, 9, 0, tzinfo=UTC),
+            ]
+        )
+        assert sorted(extracted) == expected_values
+
+    async def test_date_coercion_on_insert_and_update(
+        self, tables_service: TablesService
+    ) -> None:
+        """Ensure DATE values are coerced before binding to the database."""
+        table = await tables_service.create_table(TableCreate(name="date_type_table"))
+        await tables_service.create_column(
+            table, TableColumnCreate(name="date_col", type=SqlType.DATE)
+        )
+
+        inserted = await tables_service.insert_row(
+            table, TableRowInsert(data={"date_col": "2026-02-06"})
+        )
+        assert inserted["date_col"] == date(2026, 2, 6)
+
+        updated = await tables_service.update_row(
+            table,
+            inserted["id"],
+            {"date_col": datetime(2026, 2, 7, 12, 30)},
+        )
+        assert updated["date_col"] == date(2026, 2, 7)
 
     @pytest.mark.usefixtures("db")
     @pytest.mark.parametrize(
@@ -880,12 +1993,6 @@ class TestTableDataTypes:
                 "Expected bool or 0/1, got str",
                 id="invalid_boolean",
             ),
-            # Test invalid UUID
-            pytest.param(
-                {"uuid_col": "not-a-uuid"},
-                "invalid UUID",
-                id="invalid_uuid",
-            ),
             # Test invalid JSON - this raises TypeError directly
             pytest.param(
                 {"json_col": object()},
@@ -894,8 +2001,8 @@ class TestTableDataTypes:
             ),
             # Test invalid timestamp
             pytest.param(
-                {"timestamp_col": "not-a-timestamp"},
-                "expected a datetime.date or datetime.datetime instance",
+                {"timestamptz_col": "not-a-timestamp"},
+                "Invalid ISO datetime string: 'not-a-timestamp'",
                 id="invalid_timestamp",
             ),
         ],
@@ -949,13 +2056,9 @@ class TestTableDataTypes:
             "numeric_col": Decimal("0.0"),  # Zero decimal
             "bool_col": False,  # False boolean
             "json_col": {},  # Empty JSON
-            "timestamp_col": datetime(
-                1, 1, 1, 0, 0
-            ),  # Minimum datetime without timezone
             "timestamptz_col": datetime(
                 2025, 3, 15, 12, 0, 0, 0, tzinfo=UTC
-            ),  # Maximum datetime
-            "uuid_col": UUID("00000000-0000-0000-0000-000000000000"),  # Nil UUID
+            ),  # Arbitrary future datetime
         }
 
         # Insert edge cases
@@ -974,12 +2077,6 @@ class TestTableDataTypes:
         assert retrieved["bool_col"] is False
         assert retrieved["json_col"] == {}
 
-        # DateTime comparisons - fix the timezone comparison issue
-        assert (
-            retrieved["timestamp_col"].replace(tzinfo=None)
-            == edge_cases["timestamp_col"]
-        )
-
         # For timestamptz, we need to handle the timezone comparison
         # The database might return a datetime with a different timezone representation
         # but equivalent time
@@ -990,6 +2087,3 @@ class TestTableDataTypes:
         assert retrieved_timestamptz.astimezone(UTC).replace(
             tzinfo=None
         ) == expected_timestamptz.astimezone(UTC).replace(tzinfo=None)
-
-        # UUID comparison using string representation
-        assert str(retrieved["uuid_col"]) == str(edge_cases["uuid_col"])

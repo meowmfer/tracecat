@@ -26,24 +26,14 @@ import React, { useCallback, useMemo, useRef, useState } from "react"
 import { type Control, type FieldValues, useController } from "react-hook-form"
 import YAML from "yaml"
 import type { ActionRead } from "@/client"
-import { useOrgAppSettings } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
 import { useWorkflow } from "@/providers/workflow"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 import {
-  createAtKeyCompletion,
   createAutocomplete,
-  createBlurHandler,
   createCoreKeymap,
-  createExitEditModeKeyHandler,
-  createExpressionNodeHover,
-  createPillClickHandler,
-  createPillDeleteKeymap,
-  createTemplatePillPlugin,
   EDITOR_STYLE,
-  editingRangeField,
-  pillKeybinds,
   templatePillTheme,
 } from "./common"
 import { createSimpleTemplatePlugin } from "./highlight-plugin"
@@ -77,7 +67,6 @@ export const YamlStyledEditor = React.forwardRef<
   })
   const workspaceId = useWorkspaceId()
   const { workflow } = useWorkflow()
-  const { appSettings } = useOrgAppSettings()
   const [hasErrors, setHasErrors] = useState(false)
   const [saveState, setSaveState] = useState<SaveState>(SaveState.IDLE)
   const [validationErrors, setValidationErrors] = useState<string[]>([])
@@ -209,29 +198,17 @@ export const YamlStyledEditor = React.forwardRef<
 
   // Custom blur handler that commits YAML to form (stable function using refs)
   const yamlBlurHandler = useCallback(() => {
-    return (event: FocusEvent, view: EditorView): boolean => {
-      // Call the original blur handler for template pills, but only if the
-      // necessary state field is present to avoid a crash.
-      const originalResult = view.state.field(editingRangeField, false)
-        ? createBlurHandler()(event, view)
-        : false
-
-      // Commit to form on blur if there are unsaved changes
+    return (): boolean => {
       if (saveStateRef.current === SaveState.UNSAVED) {
-        // Call the commitToForm function to commit the changes to the form
         commitToFormRef.current()
         setSaveStateRef.current(SaveState.IDLE)
       }
 
-      return originalResult
+      return false
     }
   }, []) // No dependencies - stable function
 
   const extensions = useMemo(() => {
-    const pillsEnabled = Boolean(
-      appSettings?.app_editor_pill_decorations_enabled
-    )
-
     const errorMonitorPlugin = ViewPlugin.fromClass(
       class {
         constructor(view: EditorView) {
@@ -259,9 +236,7 @@ export const YamlStyledEditor = React.forwardRef<
       }
     )
 
-    const templatePlugin = pillsEnabled
-      ? createTemplatePillPlugin(workspaceId)
-      : createSimpleTemplatePlugin(workspaceId)
+    const templatePlugin = createSimpleTemplatePlugin(workspaceId)
 
     const baseExtensions = [
       lintGutter(),
@@ -287,29 +262,13 @@ export const YamlStyledEditor = React.forwardRef<
       yamlLiteralHighlighter,
     ]
 
-    if (pillsEnabled) {
-      return [
-        createPillDeleteKeymap(), // This must be first to ensure that the delete key is handled before the core keymap
-        createCoreKeymap(...pillKeybinds),
-        createAtKeyCompletion(),
-        createExitEditModeKeyHandler(),
-        ...baseExtensions,
-        editingRangeField,
-        createExpressionNodeHover(workspaceId),
-        EditorView.domEventHandlers({
-          mousedown: createPillClickHandler(),
-          blur: yamlBlurHandler(),
-        }),
-      ]
-    }
-
     return baseExtensions.concat([
       createCoreKeymap(),
       EditorView.domEventHandlers({
         blur: yamlBlurHandler(),
       }),
     ])
-  }, [workspaceId, actions, yamlBlurHandler, appSettings, forEachExpressions]) // Only stable dependencies
+  }, [workspaceId, actions, yamlBlurHandler, forEachExpressions]) // Only stable dependencies
 
   // Save-related keybindings (separate from core extensions to avoid recreation)
   const saveKeymap = useMemo(() => {
@@ -369,7 +328,7 @@ export const YamlStyledEditor = React.forwardRef<
           <span>{fieldState.error.message ?? "Invalid YAML"}</span>
         </div>
       )}
-      <div className="no-scrollbar max-h-[800px] overflow-auto rounded-md border-[0.5px] border-border shadow-sm">
+      <div className="relative rounded-md border-[0.5px] border-border shadow-sm">
         <CodeMirror
           value={buffer}
           height="auto"
@@ -524,7 +483,25 @@ const yamlEditorTheme = EditorView.theme({
     whiteSpace: "pre !important",
   },
   ".cm-scroller": {
+    maxHeight: "800px",
+    overflow: "auto",
     overflowX: "auto",
+    scrollbarWidth: "none",
+    msOverflowStyle: "none",
+  },
+  ".cm-scroller::-webkit-scrollbar": {
+    display: "none",
+  },
+  ".cm-editor": {
+    overflow: "visible",
+  },
+  ".cm-tooltip": {
+    zIndex: "60",
+    position: "fixed",
+  },
+  ".cm-tooltip-autocomplete": {
+    zIndex: "60",
+    position: "fixed",
   },
   ".cm-diagnostic-error": {
     borderBottom: "2px wavy #ef4444",
@@ -789,10 +766,9 @@ export function YamlViewOnlyEditor({
   className?: string
 }) {
   const workspaceId = useWorkspaceId()
-  const { appSettings } = useOrgAppSettings()
 
   const textValue = React.useMemo(() => {
-    if (!value) return ""
+    if (value == null) return ""
     return stripNewline(
       typeof value === "string"
         ? value
@@ -804,13 +780,7 @@ export function YamlViewOnlyEditor({
   }, [value])
 
   const extensions = useMemo(() => {
-    const pillsEnabled = Boolean(
-      appSettings?.app_editor_pill_decorations_enabled
-    )
-
-    const templatePlugin = pillsEnabled
-      ? createTemplatePillPlugin(workspaceId)
-      : createSimpleTemplatePlugin(workspaceId)
+    const templatePlugin = createSimpleTemplatePlugin(workspaceId)
 
     const baseExtensions = [
       // Core language support with proper indentation
@@ -832,12 +802,8 @@ export function YamlViewOnlyEditor({
       yamlLiteralHighlighter,
     ]
 
-    if (pillsEnabled) {
-      return baseExtensions.concat([editingRangeField])
-    }
-
     return baseExtensions
-  }, [workspaceId, appSettings])
+  }, [workspaceId])
 
   return (
     <div className="relative">

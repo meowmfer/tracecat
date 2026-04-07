@@ -1,16 +1,19 @@
 from collections import Counter
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 import orjson
 import pytest
 
+from tracecat.contexts import ctx_logical_time
 from tracecat.expressions.functions import (
     _bool,
     add,
     add_prefix,
     add_suffix,
     and_,
+    at,
     b64_to_str,
     b64url_to_str,
     capitalize,
@@ -33,6 +36,7 @@ from tracecat.expressions.functions import (
     div,
     endswith,
     flatten,
+    flatten_dict,
     format_datetime,
     format_string,
     from_timestamp,
@@ -51,7 +55,6 @@ from tracecat.expressions.functions import (
     hash_sha256,
     hash_sha512,
     hours_between,
-    index_by_key,
     intersection,
     ipv4_in_subnet,
     ipv4_is_public,
@@ -77,6 +80,7 @@ from tracecat.expressions.functions import (
     not_equal,
     not_in,
     not_null,
+    now,
     or_,
     parse_datetime,
     parse_time,
@@ -86,6 +90,7 @@ from tracecat.expressions.functions import (
     regex_match,
     regex_not_match,
     seconds_between,
+    serialize,
     serialize_json,
     set_timezone,
     slice_str,
@@ -101,11 +106,14 @@ from tracecat.expressions.functions import (
     to_datetime,
     to_time,
     to_timestamp,
+    today,
     union,
     unset_timezone,
     uppercase,
     url_decode,
     url_encode,
+    utcnow,
+    wall_clock,
     weeks_between,
     zip_iterables,
 )
@@ -255,6 +263,15 @@ def test_to_datetime_invalid_date_string(input: str) -> None:
     [
         (r"\d+", "abc123def", "123"),
         (r"[a-z]+", "ABC123def", "def"),
+        (
+            r"eventId=(\d+)",
+            (
+                "https://example.com/regions/eu-west-1/organizations/"
+                "1111111111/deployments/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+                "deployment?eventId=19759328"
+            ),
+            "19759328",
+        ),
         (r"test", "no match", None),
     ],
 )
@@ -475,6 +492,62 @@ def test_set_operations(func, a: Any, b: Any, expected: list[Any]) -> None:
 
 
 @pytest.mark.parametrize(
+    "sequence,idx,expected",
+    [
+        # List indexing
+        ([1, 2, 3, 4, 5], 0, 1),
+        ([1, 2, 3, 4, 5], 2, 3),
+        ([1, 2, 3, 4, 5], 4, 5),
+        ([1, 2, 3, 4, 5], -1, 5),
+        ([1, 2, 3, 4, 5], -2, 4),
+        (["a", "b", "c"], 0, "a"),
+        (["a", "b", "c"], 1, "b"),
+        (["a", "b", "c"], -1, "c"),
+        # String indexing
+        ("hello", 0, "h"),
+        ("hello", 1, "e"),
+        ("hello", 4, "o"),
+        ("hello", -1, "o"),
+        ("hello", -5, "h"),
+        # Tuple indexing
+        ((10, 20, 30), 0, 10),
+        ((10, 20, 30), 1, 20),
+        ((10, 20, 30), -1, 30),
+        # Mixed types in list
+        ([1, "two", 3.0, None], 0, 1),
+        ([1, "two", 3.0, None], 1, "two"),
+        ([1, "two", 3.0, None], 2, 3.0),
+        ([1, "two", 3.0, None], 3, None),
+        # Nested structures
+        ([[1, 2], [3, 4]], 0, [1, 2]),
+        ([[1, 2], [3, 4]], 1, [3, 4]),
+        ([{"a": 1}, {"b": 2}], 0, {"a": 1}),
+        ([{"a": 1}, {"b": 2}], -1, {"b": 2}),
+    ],
+)
+def test_at(sequence: Any, idx: int, expected: Any) -> None:
+    """Test at function with various sequence types and indices."""
+    assert at(sequence, idx) == expected
+
+
+@pytest.mark.parametrize(
+    "sequence,idx",
+    [
+        ([1, 2, 3], 5),  # Index too large
+        ([1, 2, 3], -10),  # Negative index too large
+        ("hello", 10),  # String index out of range
+        ([], 0),  # Empty list
+        ("", 0),  # Empty string
+        ((), 0),  # Empty tuple
+    ],
+)
+def test_at_out_of_range(sequence: Any, idx: int) -> None:
+    """Test that at raises IndexError for out-of-range indices."""
+    with pytest.raises(IndexError):
+        at(sequence, idx)
+
+
+@pytest.mark.parametrize(
     "func,input_str,expected",
     [
         (slice_str, ("hello", 1, 3), "ell"),
@@ -513,15 +586,15 @@ def test_mappable_decorator() -> None:
     assert result == 5
 
     # Test mapped function call with scalars
-    result = mapped_add.map(2, 3)
+    result = mapped_add.map(2, 3)  # type: ignore[attr-defined]
     assert result == [5]
 
     # Test mapped function call with sequences
-    result = mapped_add.map([1, 2, 3], [4, 5, 6])
+    result = mapped_add.map([1, 2, 3], [4, 5, 6])  # type: ignore[attr-defined]
     assert result == [5, 7, 9]
 
     # Test mapped function with mixed scalar and sequence
-    result = mapped_add.map([1, 2, 3], 1)
+    result = mapped_add.map([1, 2, 3], 1)  # type: ignore[attr-defined]
     assert result == [2, 3, 4]
 
 
@@ -700,6 +773,25 @@ def test_logical_operations(func, a: bool, b: Any, expected: bool) -> None:
 @pytest.mark.parametrize(
     "input_data,expected",
     [
+        ({"a": 1}, {"a": 1}),
+        ([1, 2, 3], [1, 2, 3]),
+        ("test", "test"),
+        (123, 123),
+    ],
+)
+def test_serialize(input_data: Any, expected: Any) -> None:
+    result = serialize(input_data)
+    assert orjson.loads(result) == expected
+
+
+def test_serialize_unsupported_type_raises() -> None:
+    with pytest.raises(TypeError):
+        serialize({"value": object()})
+
+
+@pytest.mark.parametrize(
+    "input_data,expected",
+    [
         ({"a": 1, "b": 2}, {"a": 1, "b": 2}),
         ([1, 2, 3], [1, 2, 3]),
         ("test", "test"),
@@ -835,48 +927,6 @@ def test_dict_lookup(input_dict: dict, key: Any, expected: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    "input_list,field_key,value_key,expected",
-    [
-        # Basic case with value_key
-        (
-            [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}],
-            "id",
-            "name",
-            {1: "Alice", 2: "Bob"},
-        ),
-        # Basic case without value_key
-        (
-            [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}],
-            "id",
-            None,
-            {1: {"id": 1, "name": "Alice"}, 2: {"id": 2, "name": "Bob"}},
-        ),
-        # Empty list
-        ([], "id", "name", {}),
-        # Different key types
-        (
-            [{"num": 1.5, "val": "a"}, {"num": 2.5, "val": "b"}],
-            "num",
-            "val",
-            {1.5: "a", 2.5: "b"},
-        ),
-        # Nested dictionaries
-        (
-            [{"key": "a", "data": {"x": 1}}, {"key": "b", "data": {"x": 2}}],
-            "key",
-            "data",
-            {"a": {"x": 1}, "b": {"x": 2}},
-        ),
-    ],
-)
-def test_index_by_key(
-    input_list: list[dict], field_key: str, value_key: str | None, expected: dict
-) -> None:
-    """Test indexing a list of dictionaries by a specified key."""
-    assert index_by_key(input_list, field_key, value_key) == expected
-
-
-@pytest.mark.parametrize(
     "input_dict,key_mapping,expected",
     [
         # Basic key mapping
@@ -957,6 +1007,21 @@ def test_flatten(input_iterables: list, expected: list) -> None:
     The function recursively flattens all sequences (including tuples) into a single list.
     """
     assert flatten(input_iterables) == expected
+
+
+@pytest.mark.parametrize(
+    "input_json,expected",
+    [
+        ('{"a": {"b": 1}}', {"a.b": 1}),
+        ('{"items": [1, 2]}', {"items[0]": 1, "items[1]": 2}),
+        (
+            '{"user": {"name": "Alice", "data": [1, 2]}}',
+            {"user.name": "Alice", "user.data[0]": 1, "user.data[1]": 2},
+        ),
+    ],
+)
+def test_flatten_dict_string_input(input_json: str, expected: dict[str, Any]) -> None:
+    assert flatten_dict(input_json) == expected
 
 
 @pytest.mark.parametrize(
@@ -1565,3 +1630,196 @@ def test_hash_sha512() -> None:
         hash_sha512(b"test")
         == "ee26b0dd4af7e749aa1a8ee3c10ae9923f618980772e473f8819a5d4940e0db27ac185f8a0e1d5f84f88bc887fd67b143732c304cc5fa9ad8e6f57f50028a8ff"
     )
+
+
+# ============================================================================
+# Time Anchor Tests (FN.now(), FN.utcnow(), FN.today(), FN.wall_clock())
+# ============================================================================
+
+
+class TestTimeAnchorFunctions:
+    """Tests for time anchor functionality in FN.now(), FN.utcnow(), FN.today(), and FN.wall_clock()."""
+
+    def test_now_with_logical_time(self) -> None:
+        """Test that now() uses ctx_logical_time when set."""
+        # Set a specific logical time (UTC-aware datetime)
+        logical_time = datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)
+        token = ctx_logical_time.set(logical_time)
+        try:
+            result = now()
+            # Type narrowing: when called without as_isoformat, now() returns datetime
+            assert isinstance(result, datetime)
+            # Result should be naive (no tzinfo) - the logical_time converted to local
+            assert result.tzinfo is None
+            # The result should be the logical_time converted to local timezone
+            # The actual local time depends on the system timezone
+            expected_local = logical_time.astimezone().replace(tzinfo=None)
+            assert result == expected_local
+        finally:
+            ctx_logical_time.reset(token)
+
+    def test_now_without_logical_time(self) -> None:
+        """Test that now() falls back to wall clock when ctx_logical_time is not set."""
+        # Ensure ctx_logical_time is not set (default is None)
+        assert ctx_logical_time.get() is None
+
+        before = datetime.now()
+        result = now()
+        after = datetime.now()
+
+        # Type narrowing: when called without as_isoformat, now() returns datetime
+        assert isinstance(result, datetime)
+        # Result should be a naive datetime close to wall clock time
+        assert result.tzinfo is None
+        assert before <= result <= after
+
+    def test_now_with_isoformat(self) -> None:
+        """Test now() with as_isoformat=True."""
+        logical_time = datetime(2024, 6, 15, 10, 30, 45, tzinfo=UTC)
+        token = ctx_logical_time.set(logical_time)
+        try:
+            result = now(as_isoformat=True)
+            assert isinstance(result, str)
+            # Should be ISO 8601 format
+            parsed = datetime.fromisoformat(result)
+            expected_local = logical_time.astimezone().replace(tzinfo=None)
+            assert parsed == expected_local
+        finally:
+            ctx_logical_time.reset(token)
+
+    def test_utcnow_with_logical_time(self) -> None:
+        """Test that utcnow() uses ctx_logical_time when set."""
+        logical_time = datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)
+        token = ctx_logical_time.set(logical_time)
+        try:
+            result = utcnow()
+            # Type narrowing: when called without as_isoformat, utcnow() returns datetime
+            assert isinstance(result, datetime)
+            # Result should be UTC-aware
+            assert result.tzinfo == UTC
+            assert result == logical_time
+        finally:
+            ctx_logical_time.reset(token)
+
+    def test_utcnow_without_logical_time(self) -> None:
+        """Test that utcnow() falls back to wall clock when ctx_logical_time is not set."""
+        assert ctx_logical_time.get() is None
+
+        before = datetime.now(UTC)
+        result = utcnow()
+        after = datetime.now(UTC)
+
+        # Type narrowing: when called without as_isoformat, utcnow() returns datetime
+        assert isinstance(result, datetime)
+        # Result should be UTC-aware
+        assert result.tzinfo == UTC
+        assert before <= result <= after
+
+    def test_utcnow_with_naive_logical_time(self) -> None:
+        """Test that utcnow() handles naive logical_time by treating it as UTC."""
+        # Naive datetime (no timezone info)
+        logical_time = datetime(2024, 6, 15, 10, 30, 0)
+        token = ctx_logical_time.set(logical_time)
+        try:
+            result = utcnow()
+            # Type narrowing: when called without as_isoformat, utcnow() returns datetime
+            assert isinstance(result, datetime)
+            # Should add UTC timezone to naive datetime
+            assert result.tzinfo == UTC
+            assert result == datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)
+        finally:
+            ctx_logical_time.reset(token)
+
+    def test_utcnow_with_isoformat(self) -> None:
+        """Test utcnow() with as_isoformat=True."""
+        logical_time = datetime(2024, 6, 15, 10, 30, 45, tzinfo=UTC)
+        token = ctx_logical_time.set(logical_time)
+        try:
+            result = utcnow(as_isoformat=True)
+            assert isinstance(result, str)
+            # Should contain timezone info
+            assert "+" in result or "Z" in result or result.endswith("+00:00")
+        finally:
+            ctx_logical_time.reset(token)
+
+    def test_utcnow_with_non_utc_timezone(self) -> None:
+        """Test that utcnow() converts non-UTC timezones to UTC."""
+        # Create a logical_time in a non-UTC timezone (US/Eastern = UTC-5 or UTC-4 DST)
+        eastern = ZoneInfo("America/New_York")
+        # June 15 2024 10:30 AM Eastern (during DST, so UTC-4)
+        logical_time = datetime(2024, 6, 15, 10, 30, 0, tzinfo=eastern)
+        token = ctx_logical_time.set(logical_time)
+        try:
+            result = utcnow()
+            assert isinstance(result, datetime)
+            # Result should be in UTC
+            assert result.tzinfo == UTC
+            # 10:30 AM Eastern (UTC-4 in June) should be 14:30 UTC
+            assert result == datetime(2024, 6, 15, 14, 30, 0, tzinfo=UTC)
+        finally:
+            ctx_logical_time.reset(token)
+
+    def test_today_with_logical_time(self) -> None:
+        """Test that today() uses ctx_logical_time when set."""
+        logical_time = datetime(2024, 6, 15, 10, 30, 0, tzinfo=UTC)
+        token = ctx_logical_time.set(logical_time)
+        try:
+            result = today()
+            # Result should be a date object
+            assert isinstance(result, date)
+            # The date should be the local date of the logical_time
+            expected_date = logical_time.astimezone().date()
+            assert result == expected_date
+        finally:
+            ctx_logical_time.reset(token)
+
+    def test_today_without_logical_time(self) -> None:
+        """Test that today() falls back to wall clock when ctx_logical_time is not set."""
+        assert ctx_logical_time.get() is None
+
+        result = today()
+        expected = date.today()
+
+        assert isinstance(result, date)
+        assert result == expected
+
+    def test_wall_clock_always_returns_current_time(self) -> None:
+        """Test that wall_clock() ignores ctx_logical_time and returns actual time."""
+        # Set a logical time to a specific past time
+        logical_time = datetime(2000, 1, 1, 0, 0, 0, tzinfo=UTC)
+        token = ctx_logical_time.set(logical_time)
+        try:
+            before = datetime.now()
+            result = wall_clock()
+            after = datetime.now()
+
+            # Type narrowing: when called without as_isoformat, wall_clock() returns datetime
+            assert isinstance(result, datetime)
+            # wall_clock should return current wall time, not logical_time
+            assert result.tzinfo is None
+            assert before <= result <= after
+            # Definitely not the year 2000
+            assert result.year >= 2024
+        finally:
+            ctx_logical_time.reset(token)
+
+    def test_wall_clock_with_isoformat(self) -> None:
+        """Test wall_clock() with as_isoformat=True."""
+        result = wall_clock(as_isoformat=True)
+        assert isinstance(result, str)
+        # Should be parseable as ISO 8601
+        parsed = datetime.fromisoformat(result)
+        assert parsed.year >= 2024
+
+    def test_wall_clock_without_logical_time(self) -> None:
+        """Test wall_clock() when ctx_logical_time is not set."""
+        assert ctx_logical_time.get() is None
+
+        before = datetime.now()
+        result = wall_clock()
+        after = datetime.now()
+
+        # Type narrowing: when called without as_isoformat, wall_clock() returns datetime
+        assert isinstance(result, datetime)
+        assert result.tzinfo is None
+        assert before <= result <= after

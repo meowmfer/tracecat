@@ -1,16 +1,20 @@
 import contextlib
+import hashlib
+import os
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Sequence
 from datetime import UTC, datetime
-from typing import Annotated, cast
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.security import OAuth2PasswordRequestForm
 from fastapi_users import (
     BaseUserManager,
     FastAPIUsers,
     InvalidPasswordException,
     UUIDIDMixin,
     models,
+    schemas,
 )
 from fastapi_users.authentication import (
     AuthenticationBackend,
@@ -28,28 +32,35 @@ from fastapi_users.exceptions import (
     UserNotExists,
 )
 from fastapi_users.openapi import OpenAPIResponseType
+from fastapi_users_db_sqlalchemy.access_token import SQLAlchemyAccessTokenDatabase
 from pydantic import EmailStr
-from sqlalchemy.ext.asyncio import AsyncSession as SQLAlchemyAsyncSession
-from sqlmodel import col, select
-from sqlmodel.ext.asyncio.session import AsyncSession as SQLModelAsyncSession
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracecat import config
 from tracecat.api.common import bootstrap_role
-from tracecat.auth.models import UserCreate, UserRole, UserUpdate
-from tracecat.authz.models import WorkspaceRole
-from tracecat.authz.service import MembershipService
+from tracecat.audit.service import AuditService
+from tracecat.auth.enums import AuthType
+from tracecat.auth.schemas import UserCreate, UserUpdate
+from tracecat.auth.secrets import get_user_auth_secret
+from tracecat.auth.types import PlatformRole
 from tracecat.contexts import ctx_role
-from tracecat.db.adapter import (
-    SQLModelAccessTokenDatabaseAsync,
-    SQLModelUserDatabaseAsync,
+from tracecat.db.engine import (
+    get_async_session,
+    get_async_session_bypass_rls_context_manager,
 )
-from tracecat.db.engine import get_async_session, get_async_session_context_manager
-from tracecat.db.schemas import AccessToken, OAuthAccount, User
+from tracecat.db.models import (
+    AccessToken,
+    OAuthAccount,
+    OrganizationDomain,
+    OrganizationMembership,
+    User,
+)
+from tracecat.exceptions import TracecatAuthorizationError, TracecatNotFoundError
+from tracecat.identifiers import OrganizationID
 from tracecat.logger import logger
+from tracecat.organization.domains import normalize_domain
 from tracecat.settings.service import get_setting
-from tracecat.types.auth import AccessLevel, system_role
-from tracecat.workspaces.models import WorkspaceMembershipCreate
-from tracecat.workspaces.service import WorkspaceService
 
 
 class InvalidEmailException(FastAPIUsersException):
@@ -64,31 +75,33 @@ class PermissionsException(FastAPIUsersException):
 
 
 class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
-    reset_password_token_secret = config.USER_AUTH_SECRET
-    verification_token_secret = config.USER_AUTH_SECRET
-
-    def __init__(self, user_db: SQLAlchemyUserDatabase) -> None:
+    def __init__(self, user_db: SQLAlchemyUserDatabase[User, uuid.UUID]) -> None:
         super().__init__(user_db)
+        self._user_db = user_db
+        user_auth_secret = get_user_auth_secret()
+        self.reset_password_token_secret = user_auth_secret
+        self.verification_token_secret = user_auth_secret
         self.logger = logger.bind(unit="UserManager")
-        self.role = bootstrap_role()
+        # Store invitation token between create() and on_after_register()
+        self._pending_invitation_token: str | None = None
 
     async def update(
         self,
-        user_update: UserUpdate,
+        user_update: schemas.BaseUserUpdate,
         user: User,
         safe: bool = False,
         request: Request | None = None,
-    ):
+    ) -> User:
         """Update a user with user privileges."""
         # NOTE(security): Prevent unprivileged users from changing role or is_superuser fields
-        blacklist = ("role", "is_superuser")
+        denylist = ("role", "is_superuser")
         set_fields = user_update.model_fields_set
 
         role = ctx_role.get()
-        is_unprivileged = role is not None and role.access_level != AccessLevel.ADMIN
+        is_unprivileged = role is not None and not role.is_privileged
         if not role or (
-            # Not admin and trying to change role or is_superuser
-            is_unprivileged and any(field in set_fields for field in blacklist)
+            # Not privileged and trying to change role or is_superuser
+            is_unprivileged and any(field in set_fields for field in denylist)
         ):
             raise PermissionsException("Operation not permitted")
 
@@ -96,22 +109,26 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
 
     async def admin_update(
         self,
-        user_update: UserUpdate,
+        user_update: schemas.BaseUserUpdate,
         user: User,
         request: Request | None = None,
-    ):
+    ) -> User:
         """Update a user with admin privileges. This is only used to bootstrap the first user."""
         return await super().update(user_update, user, safe=False, request=request)
 
-    async def validate_password(self, password: str, user: User) -> None:
+    async def validate_password(
+        self, password: str, user: schemas.BaseUserCreate | User
+    ) -> None:
         if len(password) < config.TRACECAT__AUTH_MIN_PASSWORD_LENGTH:
             raise InvalidPasswordException(
                 f"Password must be at least {config.TRACECAT__AUTH_MIN_PASSWORD_LENGTH} characters long"
             )
 
-    async def validate_email(self, email: str) -> None:
+    async def validate_email(
+        self, email: str, *, organization_id: uuid.UUID | None = None
+    ) -> None:
         # Check if this is attempting to be the first user (superadmin)
-        async with get_async_session_context_manager() as session:
+        async with get_async_session_bypass_rls_context_manager() as session:
             users = await list_users(session=session)
             if len(users) == 0:  # This would be the first user
                 # Only allow registration if this is the designated superadmin email
@@ -133,15 +150,133 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
                 return
 
         # For non-first users, apply normal domain validation
-        allowed_domains = cast(
-            list[str] | None,
-            await get_setting("auth_allowed_email_domains", role=self.role),
-            # Allow overriding of empty list
-        ) or list(config.TRACECAT__AUTH_ALLOWED_DOMAINS)
+        allowed_domains = list(config.TRACECAT__AUTH_ALLOWED_DOMAINS)
         self.logger.debug("Allowed domains", allowed_domains=allowed_domains)
         validate_email(email=email, allowed_domains=allowed_domains)
 
-    async def oauth_callback(
+    async def authenticate(self, credentials: OAuth2PasswordRequestForm) -> User | None:
+        """Authenticate local email/password and enforce platform/org policy."""
+        user = await super().authenticate(credentials)
+        if user is None:
+            return None
+        if await self._is_local_password_login_allowed(user):
+            return user
+        self.logger.info(
+            "Blocked local email/password login by auth policy",
+            user_id=str(user.id),
+            email=user.email,
+        )
+        return None
+
+    async def _is_local_password_login_allowed(self, user: User) -> bool:
+        if AuthType.BASIC not in config.TRACECAT__AUTH_TYPES:
+            return False
+
+        org_ids = await self._list_user_org_ids(user.id)
+        if not org_ids:
+            return True
+
+        target_org_id = await self._resolve_target_org_for_email(user.email, org_ids)
+        if target_org_id is not None:
+            # Even with a domain-matched org, block local auth if any membership
+            # enforces SAML to avoid cross-org policy bypass.
+            return not await self._any_org_saml_enforced(org_ids)
+
+        if len(org_ids) == 1:
+            return not await self._is_org_saml_enforced(next(iter(org_ids)))
+
+        # If org is ambiguous (multi-org user with no matching domain), block if any
+        # org membership enforces SAML to avoid bypassing org login policy.
+        return not await self._any_org_saml_enforced(org_ids)
+
+    async def _list_user_org_ids(self, user_id: uuid.UUID) -> set[OrganizationID]:
+        statement = select(OrganizationMembership.organization_id).where(
+            OrganizationMembership.user_id == user_id
+        )
+        async with get_async_session_bypass_rls_context_manager() as session:
+            result = await session.execute(statement)
+            return set(result.scalars().all())
+
+    async def _resolve_target_org_for_email(
+        self, email: str, org_ids: set[OrganizationID]
+    ) -> OrganizationID | None:
+        organization_id = await self._get_org_id_for_email_domain(email)
+        if organization_id is None or organization_id not in org_ids:
+            return None
+        return organization_id
+
+    async def _get_org_id_for_email_domain(self, email: str) -> OrganizationID | None:
+        _, _, email_domain = email.rpartition("@")
+        if not email_domain:
+            return None
+
+        try:
+            normalized_domain = normalize_domain(email_domain).normalized_domain
+        except ValueError:
+            return None
+
+        statement = select(OrganizationDomain.organization_id).where(
+            OrganizationDomain.normalized_domain == normalized_domain,
+            OrganizationDomain.is_active.is_(True),
+        )
+        async with get_async_session_bypass_rls_context_manager() as session:
+            result = await session.execute(statement)
+            return result.scalar_one_or_none()
+
+    async def _is_org_saml_enforced(self, org_id: OrganizationID) -> bool:
+        if AuthType.SAML not in config.TRACECAT__AUTH_TYPES:
+            return False
+
+        saml_enabled = bool(
+            await get_setting(
+                "saml_enabled",
+                role=bootstrap_role(org_id),
+                default=True,
+            )
+        )
+        if not saml_enabled:
+            return False
+
+        saml_enforced = await get_setting(
+            "saml_enforced",
+            role=bootstrap_role(org_id),
+            default=False,
+        )
+        return bool(saml_enforced)
+
+    async def _any_org_saml_enforced(self, org_ids: set[OrganizationID]) -> bool:
+        for org_id in org_ids:
+            if await self._is_org_saml_enforced(org_id):
+                return True
+        return False
+
+    async def _is_saml_enforced_for_oauth(self, email: str) -> bool:
+        """Check if SAML enforcement blocks OAuth for this email.
+
+        Checks both the email-domain-mapped org *and* all orgs the user is a
+        member of, matching the policy applied to local password logins.
+        """
+        if AuthType.SAML not in config.TRACECAT__AUTH_TYPES:
+            return False
+
+        # 1. Domain-based check: the org owning this email domain enforces SAML
+        _, _, email_domain = email.rpartition("@")
+        if email_domain:
+            org_id = await self._get_org_id_for_email_domain(email)
+            if org_id is not None and await self._is_org_saml_enforced(org_id):
+                return True
+
+        # 2. Membership-based check: the user belongs to any enforced org
+        try:
+            user = await self.get_by_email(email)
+        except UserNotExists:
+            return False
+        org_ids = await self._list_user_org_ids(user.id)
+        if not org_ids:
+            return False
+        return await self._any_org_saml_enforced(org_ids)
+
+    async def oauth_callback(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         oauth_name: str,
         access_token: str,
@@ -155,7 +290,17 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         is_verified_by_default: bool = False,
     ) -> User:
         await self.validate_email(account_email)
-        return await super().oauth_callback(  # type: ignore
+        if await self._is_saml_enforced_for_oauth(account_email):
+            self.logger.info(
+                "Blocked OAuth login by SAML enforcement policy",
+                email=account_email,
+                oauth_name=oauth_name,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="SAML authentication is enforced for this organization",
+            )
+        return await super().oauth_callback(  # pyright: ignore[reportAttributeAccessIssue]
             oauth_name,
             access_token,
             account_id,
@@ -169,11 +314,17 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
 
     async def create(
         self,
-        user_create: UserCreate,
+        user_create: schemas.BaseUserCreate,
         safe: bool = False,
         request: Request | None = None,
     ) -> User:
         await self.validate_email(user_create.email)
+
+        # Extract and store invitation token for use in on_after_register()
+        # This allows atomic invitation acceptance during registration
+        if isinstance(user_create, UserCreate) and user_create.invitation_token:
+            self._pending_invitation_token = user_create.invitation_token
+
         try:
             return await super().create(user_create, safe, request)
         except UserAlreadyExists:
@@ -201,61 +352,76 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
     async def on_after_register(
         self, user: User, request: Request | None = None
     ) -> None:
-        self.logger.info(f"User {user.id} has registered.")
+        self.logger.info("User registered", user_id=str(user.id), email=user.email)
 
-        # Check if this user should be promoted to superuser
-        async with get_async_session_context_manager() as session:
-            users = await list_users(session=session)
-            superadmin_email = config.TRACECAT__AUTH_SUPERADMIN_EMAIL
-            if len(users) == 1 and superadmin_email and user.email == superadmin_email:
-                # This is the first user and matches the designated superadmin email
-                update_params = UserUpdate(is_superuser=True, role=UserRole.ADMIN)
-                # NOTE(security): Bypass safety to create sueradmin
-                await self.admin_update(user_update=update_params, user=user)
-                self.logger.info("First user promoted to superadmin", email=user.email)
+        # Log audit event for user registration
+        platform_role = PlatformRole(
+            type="user", user_id=user.id, service_id="tracecat-api"
+        )
+        async with AuditService.with_session(role=platform_role) as audit_svc:
+            await audit_svc.create_event(
+                resource_type="user",
+                action="create",
+                resource_id=user.id,
+            )
 
-            elif len(users) > 1 and await get_setting(
-                "app_create_workspace_on_register", default=False
-            ):
-                # Check if we should auto-create a workspace for the user
-                self.logger.info("Creating workspace for new user", user=user.email)
-                try:
-                    # Determine workspace name
-                    if user.first_name:
-                        workspace_name = f"{user.first_name}'s Workspace"
-                    else:
-                        # Remove domain from email to use as workspace name
-                        email_username = user.email.split("@")[0]
-                        workspace_name = f"{email_username}'s Workspace"
+        # Promote to superuser if email matches configured superadmin email
+        # No count/lock needed - email uniqueness ensures only one user can have this email
+        superadmin_email = config.TRACECAT__AUTH_SUPERADMIN_EMAIL
+        if superadmin_email and user.email == superadmin_email:
+            update_params = UserUpdate(is_superuser=True)
+            await self.admin_update(user_update=update_params, user=user)
+            self.logger.info("User promoted to superadmin", email=user.email)
 
-                    # Create workspace with the system role
-                    sys_role = system_role()
-                    ws_svc = WorkspaceService(session, role=sys_role)
-                    workspace = await ws_svc.create_workspace(
-                        name=workspace_name, users=[user]
-                    )
-                    # Add user to workspace as a workspace admin
-                    membership_svc = MembershipService(session, role=sys_role)
-                    await membership_svc.create_membership(
-                        workspace_id=workspace.id,
-                        params=WorkspaceMembershipCreate(
-                            user_id=user.id, role=WorkspaceRole.ADMIN
-                        ),
-                    )
-                    self.logger.info(
-                        "Created workspace for new user",
-                        workspace_id=workspace.id,
-                        workspace_name=workspace_name,
-                        user_id=user.id,
-                        user_email=user.email,
-                    )
-                except Exception as e:
-                    self.logger.error(
-                        "Failed to create workspace for new user",
-                        error=str(e),
-                        user_id=user.id,
-                        user_email=user.email,
-                    )
+        # Accept invitation atomically if token was provided during registration
+        # This eliminates race conditions in the invitation flow
+        if self._pending_invitation_token:
+            await self._accept_invitation_atomically(user)
+
+        # NOTE: We do NOT add users to any organization/workspace here unless invited.
+        # - Superusers have implicit access to all orgs (via is_platform_superuser)
+        # - Regular users get org membership via invitation acceptance flow
+        # - Workspace membership is managed separately by workspace admins
+
+    async def _accept_invitation_atomically(self, user: User) -> None:
+        """Accept an invitation during registration if a token was provided.
+
+        Errors during invitation acceptance are logged but do NOT fail registration.
+        This ensures users can still register even if the invitation is invalid/expired.
+        """
+        # Import here to avoid circular import (organization.service imports from auth.users)
+        from tracecat.organization.service import accept_invitation_for_user
+
+        token = self._pending_invitation_token
+        self._pending_invitation_token = None  # Clear to prevent reuse
+
+        if not token:
+            return
+
+        try:
+            async with get_async_session_bypass_rls_context_manager() as session:
+                membership = await accept_invitation_for_user(
+                    session, user_id=user.id, token=token
+                )
+                self.logger.info(
+                    "Invitation accepted during registration",
+                    user_id=str(user.id),
+                    email=user.email,
+                    org_id=str(membership.organization_id),
+                )
+        except TracecatNotFoundError:
+            self.logger.warning(
+                "Invitation token not found during registration",
+                user_id=str(user.id),
+                email=user.email,
+            )
+        except TracecatAuthorizationError as e:
+            self.logger.warning(
+                "Invitation acceptance failed during registration",
+                user_id=str(user.id),
+                email=user.email,
+                error=str(e),
+            )
 
     async def on_after_forgot_password(
         self, user: User, token: str, request: Request | None = None
@@ -275,8 +441,10 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         self,
         *,
         email: str,
+        organization_id: uuid.UUID | None = None,
         associate_by_email: bool = True,
         is_verified_by_default: bool = True,
+        allow_auto_provisioning: bool = True,
     ) -> User:
         """
         Handle the callback after a successful SAML authentication.
@@ -284,14 +452,25 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         :param email: Email of the user from SAML response.
         :param associate_by_email: If True, associate existing user with the same email. Defaults to True.
         :param is_verified_by_default: If True, set is_verified flag for new users. Defaults to True.
+        :param allow_auto_provisioning: If True, create new user accounts on first SAML login.
+            When False, only existing users can authenticate.
         :return: A user.
         """
-        await self.validate_email(email)
+        await self.validate_email(email, organization_id=organization_id)
         try:
             user = await self.get_by_email(email)
             if not associate_by_email:
                 raise UserAlreadyExists()
-        except UserNotExists:
+        except UserNotExists as e:
+            if not allow_auto_provisioning:
+                self.logger.info(
+                    "SAML login denied: auto-provisioning disabled and user does not exist",
+                    email=email,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Authentication failed",
+                ) from e
             # Create account
             password = self.password_helper.generate()
             user_dict = {
@@ -306,35 +485,86 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
         return user
 
 
-async def get_user_db(session: SQLAlchemyAsyncSession = Depends(get_async_session)):
-    yield SQLAlchemyUserDatabase(session, User, OAuthAccount)  # type: ignore
+async def get_user_db(session: AsyncSession = Depends(get_async_session)):
+    yield SQLAlchemyUserDatabase(session, User, OAuthAccount)
 
 
 async def get_access_token_db(
-    session: SQLAlchemyAsyncSession = Depends(get_async_session),
-) -> AsyncGenerator[SQLModelAccessTokenDatabaseAsync, None]:
-    yield SQLModelAccessTokenDatabaseAsync(session, AccessToken)  # type: ignore
+    session: AsyncSession = Depends(get_async_session),
+) -> AsyncGenerator[SQLAlchemyAccessTokenDatabase[AccessToken], None]:
+    yield SQLAlchemyAccessTokenDatabase(session, AccessToken)
 
 
 def get_user_db_context(
-    session: SQLAlchemyAsyncSession,
-) -> contextlib.AbstractAsyncContextManager[SQLAlchemyUserDatabase]:
+    session: AsyncSession,
+) -> contextlib.AbstractAsyncContextManager[SQLAlchemyUserDatabase[User, uuid.UUID]]:
     return contextlib.asynccontextmanager(get_user_db)(session=session)
 
 
 async def get_user_manager(
-    user_db: SQLAlchemyUserDatabase = Depends(get_user_db),
+    user_db: SQLAlchemyUserDatabase[User, uuid.UUID] = Depends(get_user_db),
 ) -> AsyncGenerator[UserManager, None]:
     yield UserManager(user_db)
 
 
 def get_user_manager_context(
-    user_db: SQLAlchemyUserDatabase,
+    user_db: SQLAlchemyUserDatabase[User, uuid.UUID],
 ) -> contextlib.AbstractAsyncContextManager[UserManager]:
     return contextlib.asynccontextmanager(get_user_manager)(user_db=user_db)
 
 
+def _get_cookie_name() -> str:
+    """Get the cookie name, respecting environment variable override or generating a stable one.
+
+    Returns:
+        Cookie name from environment variable if set, a stable generated name in development,
+        or None to use the default cookie name.
+    """
+    # Allow explicit override via environment variable (for backward compatibility)
+    if env_cookie_name := (
+        os.environ.get("TRACECAT__DEV_COOKIE_NAME")
+        or os.environ.get("TRACECAT__COOKIE_NAME")
+    ):
+        return env_cookie_name
+
+    # Only generate stable cookie name in development mode
+    if config.TRACECAT__APP_ENV == "development":
+        """Generate a stable cookie name unique to this tracecat instance.
+
+        Uses the Docker Compose project name (COMPOSE_PROJECT_NAME) if available,
+        which provides a stable, instance-specific identifier. Falls back to a hash
+        of stable configuration values if not in a Docker Compose environment.
+
+        This ensures each instance gets a unique cookie name that remains consistent
+        across restarts, preventing cookie conflicts when running multiple instances.
+
+        Returns:
+            A stable cookie name like 'tracecat_auth_<project_name>' or 'tracecat_auth_<hash>'.
+        """
+        # Prefer Docker Compose project name (most stable and human-readable)
+        from slugify import slugify
+
+        if compose_project_name := os.environ.get("COMPOSE_PROJECT_NAME"):
+            return f"tracecat_auth_{slugify(compose_project_name)}"
+
+        # Fallback: use hash of stable instance configuration
+        # Use public app URL as primary source of uniqueness (unique per instance)
+        # The DB URI and internal API URL are typically the same across Docker instances
+        # since they use internal Docker network addresses
+        stable_value = config.TRACECAT__PUBLIC_APP_URL
+
+        # Generate a short hash (first 8 characters of SHA256)
+        hash_obj = hashlib.sha256(stable_value.encode())
+        hash_hex = hash_obj.hexdigest()[:8]
+
+        return f"tracecat_auth_{hash_hex}"
+
+    # In production/staging, use default cookie name (None)
+    return "fastapiusersauth"
+
+
 cookie_transport = CookieTransport(
+    cookie_name=_get_cookie_name(),
     cookie_max_age=config.SESSION_EXPIRE_TIME_SECONDS,
     cookie_secure=config.TRACECAT__API_URL.startswith("https"),
 )
@@ -342,16 +572,16 @@ cookie_transport = CookieTransport(
 
 def get_database_strategy(
     access_token_db: AccessTokenDatabase[AccessToken] = Depends(get_access_token_db),
-) -> DatabaseStrategy:
+) -> DatabaseStrategy[User, uuid.UUID, AccessToken]:
     strategy = DatabaseStrategy(
         access_token_db,
-        lifetime_seconds=config.SESSION_EXPIRE_TIME_SECONDS,  # type: ignore
+        lifetime_seconds=config.SESSION_EXPIRE_TIME_SECONDS,
     )
 
     return strategy
 
 
-auth_backend = AuthenticationBackend(
+auth_backend: AuthenticationBackend[User, uuid.UUID] = AuthenticationBackend(
     name="database",
     transport=cookie_transport,
     get_strategy=get_database_strategy,
@@ -366,7 +596,7 @@ UserManagerDep = Annotated[UserManager, Depends(get_user_manager)]
 class FastAPIUserWithLogoutRouter(FastAPIUsers[models.UP, models.ID]):
     def get_logout_router(
         self,
-        backend: AuthenticationBackend,
+        backend: AuthenticationBackend[models.UP, models.ID],
         requires_verification: bool = config.TRACECAT__AUTH_REQUIRE_EMAIL_VERIFICATION,
     ) -> APIRouter:
         """
@@ -389,7 +619,7 @@ class FastAPIUserWithLogoutRouter(FastAPIUsers[models.UP, models.ID]):
         @router.post(
             "/logout", name=f"auth:{backend.name}.logout", responses=logout_responses
         )
-        async def logout(
+        async def logout(  # pyright: ignore[reportUnusedFunction] - registered as FastAPI route handler
             user_token: tuple[models.UP, str] = Depends(get_current_user_token),
             strategy: Strategy[models.UP, models.ID] = Depends(backend.get_strategy),
         ) -> Response:
@@ -408,12 +638,12 @@ optional_current_active_user = fastapi_users.current_user(active=True, optional=
 
 
 def is_unprivileged(user: User) -> bool:
-    """Check if a user is not privileged (i.e. not an admin or superuser)."""
-    return user.role != UserRole.ADMIN and not user.is_superuser
+    """Check if a user is not privileged (i.e. not a superuser)."""
+    return not user.is_superuser
 
 
 async def get_or_create_user(params: UserCreate, exist_ok: bool = True) -> User:
-    async with get_async_session_context_manager() as session:
+    async with get_async_session_bypass_rls_context_manager() as session:
         async with get_user_db_context(session) as user_db:
             async with get_user_manager_context(user_db) as user_manager:
                 try:
@@ -428,28 +658,22 @@ async def get_or_create_user(params: UserCreate, exist_ok: bool = True) -> User:
                     return await user_manager.get_by_email(params.email)
 
 
-async def get_user_db_sqlmodel(
-    session: SQLAlchemyAsyncSession = Depends(get_async_session),
-):
-    yield SQLModelUserDatabaseAsync(session, User, OAuthAccount)
-
-
-async def list_users(*, session: SQLModelAsyncSession) -> Sequence[User]:
+async def list_users(*, session: AsyncSession) -> Sequence[User]:
     statement = select(User)
-    result = await session.exec(statement)
-    return result.all()
+    result = await session.execute(statement)
+    return result.scalars().all()
 
 
 async def search_users(
     *,
-    session: SQLModelAsyncSession,
+    session: AsyncSession,
     user_ids: Iterable[uuid.UUID] | None = None,
 ) -> Sequence[User]:
     statement = select(User)
     if user_ids:
-        statement = statement.where(col(User.id).in_(user_ids))
-    result = await session.exec(statement)
-    return result.all()
+        statement = statement.where(User.id.in_(user_ids))  # pyright: ignore[reportAttributeAccessIssue]
+    result = await session.execute(statement)
+    return result.scalars().all()
 
 
 def validate_email(
@@ -462,9 +686,7 @@ def validate_email(
     logger.info("Validated email with domain", domain=domain)
 
 
-async def lookup_user_by_email(
-    *, session: SQLModelAsyncSession, email: str
-) -> User | None:
+async def lookup_user_by_email(*, session: AsyncSession, email: str) -> User | None:
     """Look up a user by their email address.
 
     Args:
@@ -474,6 +696,6 @@ async def lookup_user_by_email(
     Returns:
         User | None: The user object if found, None otherwise.
     """
-    statement = select(User).where(User.email == email)
-    result = await session.exec(statement)
-    return result.first()
+    statement = select(User).where(User.email == email)  # pyright: ignore[reportArgumentType]
+    result = await session.execute(statement)
+    return result.scalars().first()

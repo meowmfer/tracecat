@@ -15,24 +15,15 @@ import { useCallback, useMemo } from "react"
 import { useFormContext } from "react-hook-form"
 import type { ActionRead } from "@/client"
 import {
-  createAtKeyCompletion,
   createAutocomplete,
-  createBlurHandler,
   createCoreKeymap,
-  createExitEditModeKeyHandler,
-  createExpressionNodeHover,
-  createPillClickHandler,
-  createPillDeleteKeymap,
-  createTemplatePillPlugin,
   EDITOR_STYLE,
-  editingRangeField,
   templatePillTheme,
 } from "@/components/editor/codemirror/common"
 import { createSimpleTemplatePlugin } from "@/components/editor/codemirror/highlight-plugin"
 import { ExpressionErrorBoundary } from "@/components/error-boundaries"
 import { Input } from "@/components/ui/input"
 import { createTemplateRegex } from "@/lib/expressions"
-import { useOrgAppSettings } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
 import { useWorkflow } from "@/providers/workflow"
 import { useWorkspaceId } from "@/providers/workspace-id"
@@ -124,7 +115,6 @@ function ExpressionInputCore({
   const workspaceId = useWorkspaceId()
   const { workflow } = useWorkflow()
   const methods = useFormContext()
-  const { appSettings } = useOrgAppSettings()
   const actions = workflow?.actions || ({} as Record<string, ActionRead>)
   const forEach = useMemo(() => methods.watch("for_each"), [methods])
 
@@ -171,137 +161,103 @@ function ExpressionInputCore({
   }, [value])
 
   const extensions = useMemo(() => {
-    const pillsEnabled = Boolean(
-      appSettings?.app_editor_pill_decorations_enabled
-    )
+    const templatePlugin = createSimpleTemplatePlugin(workspaceId)
 
-    // Choose between pill plugin and simple highlighting
-    const templatePlugin = pillsEnabled
-      ? createTemplatePillPlugin(workspaceId)
-      : createSimpleTemplatePlugin(workspaceId)
+    const editorVisualTheme = EditorView.theme({
+      // Input-specific styling to match shadcn Input
+      "&": {
+        fontSize: "14px",
+      },
+      ".cm-content": {
+        padding: "8px 12px",
+        lineHeight: "20px",
+        // text-xs
+        fontSize: "12px",
+        caretColor: "hsl(var(--foreground))",
+        ...(defaultHeight === "text-area" && {
+          minHeight: "240px",
+        }),
+      },
+      ".cm-scroller": {
+        fontFamily: "inherit",
+        maxHeight: "800px",
+        overflow: "auto",
+        scrollbarWidth: "none",
+        msOverflowStyle: "none",
+        ...(defaultHeight === "text-area" && {
+          minHeight: "240px",
+        }),
+      },
+      ".cm-scroller::-webkit-scrollbar": {
+        display: "none",
+      },
+      ".cm-editor": {
+        backgroundColor: "hsl(var(--background))",
+        color: "hsl(var(--foreground))",
+        fontSize: "14px",
+        transition: "all 0.2s",
+        overflow: "visible",
+      },
+      ".cm-focused": {
+        outline: "2px solid transparent",
+        outlineOffset: "2px",
+        borderColor: "hsl(var(--ring))",
+        boxShadow: "0 0 0 2px hsl(var(--ring))",
+      },
+      ".cm-editor.cm-focused": {
+        borderColor: "hsl(var(--ring))",
+        boxShadow: "0 0 0 2px hsl(var(--ring))",
+      },
+      "&.cm-disabled": {
+        cursor: "not-allowed",
+        opacity: "0.5",
+      },
+      "&.cm-disabled .cm-content": {
+        color: "hsl(var(--muted-foreground))",
+      },
+      ".cm-placeholder": {
+        color: "hsl(var(--muted-foreground))",
+        fontStyle: "normal",
+      },
+      // Error styling
+      ".cm-diagnostic-error": {
+        borderBottom: "2px wavy hsl(var(--destructive))",
+      },
+      ".cm-lint-marker-error": {
+        backgroundColor: "hsl(var(--destructive))",
+        borderRadius: "50%",
+        width: "0.6em",
+        height: "0.6em",
+      },
+      ".cm-line": {
+        padding: "0px",
+      },
+      ".cm-tooltip": {
+        zIndex: "60",
+        position: "fixed",
+      },
+      ".cm-tooltip-autocomplete": {
+        zIndex: "60",
+        position: "fixed",
+      },
+    })
 
     const baseExtensions = [
-      // Core setup
       history(),
       EditorState.allowMultipleSelections.of(true),
       indentUnit.of("  "),
-
-      // Linting
       linter(expressionLinter),
-
-      // Features
       bracketMatching(),
       closeBrackets(),
-      createAutocomplete({
-        workspaceId,
-        actions,
-        forEach,
-      }),
-
-      // Placeholder
+      createAutocomplete({ workspaceId, actions, forEach }),
       placeholder(placeholderText),
-
-      // Template expression plugin
       templatePlugin,
       templatePillTheme,
+      editorVisualTheme,
     ]
 
-    // Add pill-specific extensions only when pills are enabled
-    if (pillsEnabled) {
-      return [
-        // Keymaps (pill-specific)
-        createPillDeleteKeymap(), // This must be first to ensure that the delete key is handled before the core keymap
-        createCoreKeymap(),
-        createAtKeyCompletion(),
-        createExitEditModeKeyHandler(),
-
-        ...baseExtensions,
-
-        // Pill-specific plugins
-        editingRangeField,
-        createExpressionNodeHover(workspaceId),
-
-        // Event handlers (pill-specific)
-        EditorView.domEventHandlers({
-          mousedown: createPillClickHandler(),
-          blur: createBlurHandler(),
-        }),
-      ]
-    }
-
-    return baseExtensions.concat([
-      createCoreKeymap(),
-      // Input-specific styling to match shadcn Input
-      EditorView.theme({
-        "&": {
-          fontSize: "14px",
-        },
-        ".cm-content": {
-          padding: "8px 12px",
-          lineHeight: "20px",
-          // text-xs
-          fontSize: "12px",
-          caretColor: "hsl(var(--foreground))",
-          ...(defaultHeight === "text-area" && {
-            minHeight: "240px",
-          }),
-        },
-        ".cm-scroller": {
-          fontFamily: "inherit",
-          ...(defaultHeight === "text-area" && {
-            minHeight: "240px",
-          }),
-        },
-        ".cm-focused": {
-          outline: "2px solid transparent",
-          outlineOffset: "2px",
-          borderColor: "hsl(var(--ring))",
-          boxShadow: "0 0 0 2px hsl(var(--ring))",
-        },
-        ".cm-editor": {
-          backgroundColor: "hsl(var(--background))",
-          color: "hsl(var(--foreground))",
-          fontSize: "14px",
-          transition: "all 0.2s",
-        },
-        ".cm-editor.cm-focused": {
-          borderColor: "hsl(var(--ring))",
-          boxShadow: "0 0 0 2px hsl(var(--ring))",
-        },
-        "&.cm-disabled": {
-          cursor: "not-allowed",
-          opacity: "0.5",
-        },
-        "&.cm-disabled .cm-content": {
-          color: "hsl(var(--muted-foreground))",
-        },
-        ".cm-placeholder": {
-          color: "hsl(var(--muted-foreground))",
-          fontStyle: "normal",
-        },
-        // Error styling
-        ".cm-diagnostic-error": {
-          borderBottom: "2px wavy hsl(var(--destructive))",
-        },
-        ".cm-lint-marker-error": {
-          backgroundColor: "hsl(var(--destructive))",
-          borderRadius: "50%",
-          width: "0.6em",
-          height: "0.6em",
-        },
-        ".cm-line": {
-          padding: "0px",
-        },
-      }),
-    ])
-  }, [
-    workspaceId,
-    actions,
-    placeholderText,
-    forEach,
-    defaultHeight,
-    appSettings,
-  ])
+    return baseExtensions.concat([createCoreKeymap()])
+  }, [workspaceId, actions, placeholderText, forEach, defaultHeight])
 
   const handleChange = useCallback(
     (val: string) => {
@@ -314,7 +270,7 @@ function ExpressionInputCore({
 
   return (
     <div className={cn("relative", className)}>
-      <div className="no-scrollbar max-h-[800px] overflow-auto rounded-md border-[0.5px] border-border shadow-sm">
+      <div className="relative rounded-md border-[0.5px] border-border shadow-sm">
         <CodeMirror
           value={safeValue}
           height="auto"

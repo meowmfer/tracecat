@@ -1,15 +1,60 @@
 "use client"
 
-import { useSearchParams } from "next/navigation"
 import { useEffect } from "react"
-import CaseTable from "@/components/cases/case-table"
-import { CaseTagsSidebar } from "@/components/cases/case-tags-sidebar"
-import { CasesViewMode } from "@/components/cases/cases-view-toggle"
+import { CasesLayout } from "@/components/cases/cases-layout"
+import { useCases } from "@/hooks/use-cases"
+import { useEntitlements } from "@/hooks/use-entitlements"
+import { useWorkspaceMembers } from "@/hooks/use-workspace"
+import { useCaseDropdownDefinitions, useCaseTagCatalog } from "@/lib/hooks"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 export default function CasesPage() {
-  const searchParams = useSearchParams()
   const workspaceId = useWorkspaceId()
+
+  const {
+    cases,
+    isLoading,
+    error,
+    filters,
+    refetch,
+    setSearchQuery,
+    setSortBy,
+    setStatusFilter,
+    setStatusMode,
+    setPriorityFilter,
+    setPriorityMode,
+    setPrioritySortDirection,
+    setSeverityFilter,
+    setSeverityMode,
+    setSeveritySortDirection,
+    setAssigneeFilter,
+    setAssigneeMode,
+    setAssigneeSortDirection,
+    setTagFilter,
+    setTagMode,
+    setTagSortDirection,
+    setDropdownFilter,
+    setDropdownMode,
+    setDropdownSortDirection,
+    setUpdatedAfter,
+    setCreatedAfter,
+    totalFilteredCaseEstimate,
+    stageCounts,
+    isCountsLoading,
+    isCountsFetching,
+    hasNextPage,
+    isFetchingNextPage,
+    fetchNextPage,
+  } = useCases()
+
+  const { members } = useWorkspaceMembers(workspaceId)
+  const { caseTags } = useCaseTagCatalog(workspaceId)
+  const { hasEntitlement } = useEntitlements()
+  const caseAddonsEnabled = hasEntitlement("case_addons")
+  const { dropdownDefinitions } = useCaseDropdownDefinitions(
+    workspaceId,
+    caseAddonsEnabled
+  )
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -17,27 +62,48 @@ export default function CasesPage() {
     }
   }, [])
 
-  const viewParam = searchParams?.get("view") as CasesViewMode | null
-  const view = viewParam ?? CasesViewMode.Cases
-
-  if (view === CasesViewMode.Tags) {
-    return (
-      <div className="size-full overflow-auto px-3 py-6">
-        <div className="flex h-full flex-row gap-4">
-          <div className="w-48">
-            <CaseTagsSidebar workspaceId={workspaceId} />
-          </div>
-          <div className="flex-1">
-            <CaseTable />
-          </div>
-        </div>
-      </div>
-    )
-  }
-
   return (
-    <div className="size-full overflow-auto px-3 py-6 space-y-6">
-      <CaseTable />
+    <div className="size-full overflow-hidden">
+      <CasesLayout
+        cases={cases}
+        isLoading={isLoading}
+        error={error}
+        filters={filters}
+        members={members}
+        tags={caseTags}
+        onSearchChange={setSearchQuery}
+        onSortByChange={setSortBy}
+        onStatusChange={setStatusFilter}
+        onStatusModeChange={setStatusMode}
+        onPriorityChange={setPriorityFilter}
+        onPriorityModeChange={setPriorityMode}
+        onPrioritySortDirectionChange={setPrioritySortDirection}
+        onSeverityChange={setSeverityFilter}
+        onSeverityModeChange={setSeverityMode}
+        onSeveritySortDirectionChange={setSeveritySortDirection}
+        onAssigneeChange={setAssigneeFilter}
+        onAssigneeModeChange={setAssigneeMode}
+        onAssigneeSortDirectionChange={setAssigneeSortDirection}
+        onTagChange={setTagFilter}
+        onTagModeChange={setTagMode}
+        onTagSortDirectionChange={setTagSortDirection}
+        onUpdatedAfterChange={setUpdatedAfter}
+        onCreatedAfterChange={setCreatedAfter}
+        dropdownDefinitions={
+          caseAddonsEnabled ? dropdownDefinitions : undefined
+        }
+        onDropdownFilterChange={setDropdownFilter}
+        onDropdownModeChange={setDropdownMode}
+        onDropdownSortDirectionChange={setDropdownSortDirection}
+        totalFilteredCaseEstimate={totalFilteredCaseEstimate}
+        stageCounts={stageCounts}
+        isCountsLoading={isCountsLoading}
+        isCountsFetching={isCountsFetching}
+        hasNextPage={hasNextPage}
+        isFetchingNextPage={isFetchingNextPage}
+        onLoadMore={fetchNextPage}
+        refetch={refetch}
+      />
     </div>
   )
 }

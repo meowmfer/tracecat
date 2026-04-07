@@ -4,54 +4,58 @@ from typing import Any
 
 import orjson
 from async_lru import alru_cache
+from cryptography.fernet import InvalidToken
 from pydantic import BaseModel, SecretStr
 from pydantic_core import to_jsonable_python
-from sqlmodel import col, select
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from tracecat import config
-from tracecat.authz.controls import require_access_level
+from tracecat.api.common import get_default_organization_id
+from tracecat.audit.logger import audit_log
+from tracecat.auth.secrets import get_db_encryption_key
+from tracecat.auth.types import Role
+from tracecat.authz.controls import require_scope
 from tracecat.common import UNSET
 from tracecat.contexts import ctx_role, ctx_session
-from tracecat.db.schemas import OrganizationSetting
+from tracecat.db.engine import get_async_session_bypass_rls_context_manager
+from tracecat.db.models import OrganizationSetting
+from tracecat.db.rls import set_rls_context_from_role
+from tracecat.identifiers import OrganizationID
 from tracecat.logger import logger
 from tracecat.secrets.encryption import decrypt_value, encrypt_value
-from tracecat.service import BaseService
-from tracecat.settings.constants import PUBLIC_SETTINGS_KEYS, SENSITIVE_SETTINGS_KEYS
-from tracecat.settings.models import (
+from tracecat.service import BaseOrgService
+from tracecat.settings.constants import SENSITIVE_SETTINGS_KEYS
+from tracecat.settings.schemas import (
     AgentSettingsUpdate,
     AppSettingsUpdate,
-    AuthSettingsUpdate,
+    AuditSettingsUpdate,
     BaseSettingsGroup,
     GitSettingsUpdate,
-    OAuthSettingsUpdate,
     SAMLSettingsUpdate,
     SettingCreate,
     SettingUpdate,
 )
-from tracecat.types.auth import AccessLevel, Role
 
 
-class SettingsService(BaseService):
-    """Service for managing platform settings"""
+class SettingsService(BaseOrgService):
+    """Service for managing organization settings.
+
+    Requires a role with organization_id (enforced by BaseOrgService).
+    """
 
     service_name = "settings"
     groups: list[type[BaseSettingsGroup]] = [
         AgentSettingsUpdate,
         GitSettingsUpdate,
         SAMLSettingsUpdate,
-        AuthSettingsUpdate,
-        OAuthSettingsUpdate,
         AppSettingsUpdate,
+        AuditSettingsUpdate,
     ]
     """The set of settings groups that are managed by the service."""
 
     def __init__(self, session: AsyncSession, role: Role | None = None):
         super().__init__(session, role=role)
-        try:
-            self._encryption_key = SecretStr(os.environ["TRACECAT__DB_ENCRYPTION_KEY"])
-        except KeyError as e:
-            raise KeyError("TRACECAT__DB_ENCRYPTION_KEY is not set") from e
+        self._encryption_key = SecretStr(get_db_encryption_key())
 
     def _serialize_value_bytes(self, value: Any) -> bytes:
         return orjson.dumps(
@@ -76,9 +80,9 @@ class SettingsService(BaseService):
                             is_sensitive=key in SENSITIVE_SETTINGS_KEYS,
                         )
                     )
-                    self.logger.info("Created setting", key=key)
+                    self.logger.debug("Created setting", key=key)
                 else:
-                    self.logger.info("Setting already exists", key=key)
+                    self.logger.debug("Setting already exists", key=key)
         await self.session.commit()
 
     def get_value(self, setting: OrganizationSetting) -> Any:
@@ -89,6 +93,33 @@ class SettingsService(BaseService):
             )
         return self._deserialize_value_bytes(value_bytes)
 
+    def get_values_with_decryption_fallback(
+        self,
+        settings: Sequence[OrganizationSetting],
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Deserialize settings while tolerating encrypted decrypt failures.
+
+        If an encrypted setting cannot be decrypted, return `None` for that key
+        and include the key in `decryption_failed_keys` so callers can prompt for
+        reconfiguration instead of failing the entire response.
+        """
+        values: dict[str, Any] = {}
+        decryption_failed_keys: list[str] = []
+        for setting in settings:
+            try:
+                values[setting.key] = self.get_value(setting)
+            except (InvalidToken, ValueError) as e:
+                if not setting.is_encrypted:
+                    raise
+                values[setting.key] = None
+                decryption_failed_keys.append(setting.key)
+                self.logger.warning(
+                    "Failed to decrypt org setting; returning null and marking for reconfiguration",
+                    key=setting.key,
+                    error=str(e),
+                )
+        return values, decryption_failed_keys
+
     async def list_org_settings(
         self,
         *,
@@ -96,7 +127,6 @@ class SettingsService(BaseService):
         value_type: str | None = None,
         is_encrypted: bool | None = None,
         limit: int | None = None,
-        offset: int | None = None,
     ) -> Sequence[OrganizationSetting]:
         """List organization settings with optional filters.
 
@@ -105,15 +135,16 @@ class SettingsService(BaseService):
             value_type: Filter settings by their value type
             is_encrypted: Filter settings by their encryption status
             limit: Maximum number of settings to return
-            offset: Number of settings to skip for pagination
 
         Returns:
             Sequence[OrganizationSetting]: List of matching organization settings
         """
-        statement = select(OrganizationSetting)
+        statement = select(OrganizationSetting).where(
+            OrganizationSetting.organization_id == self.organization_id
+        )
 
         if keys is not None:
-            statement = statement.where(col(OrganizationSetting.key).in_(keys))
+            statement = statement.where(OrganizationSetting.key.in_(keys))
         if value_type is not None:
             statement = statement.where(OrganizationSetting.value_type == value_type)
         if is_encrypted is not None:
@@ -121,13 +152,11 @@ class SettingsService(BaseService):
                 OrganizationSetting.is_encrypted == is_encrypted
             )
 
-        if offset is not None:
-            statement = statement.offset(offset)
         if limit is not None:
             statement = statement.limit(limit)
 
-        result = await self.session.exec(statement)
-        return result.all()
+        result = await self.session.execute(statement)
+        return result.scalars().all()
 
     async def get_org_setting(self, key: str) -> OrganizationSetting | None:
         """Get the current organization settings.
@@ -135,14 +164,12 @@ class SettingsService(BaseService):
         Returns:
             Settings: The current organization settings configuration
         """
-        if self.role is None and key not in PUBLIC_SETTINGS_KEYS:
-            # Block access to private settings
-            self.logger.debug("Blocked attempted access to private setting", key=key)
-            return None
-
-        statement = select(OrganizationSetting).where(OrganizationSetting.key == key)
-        result = await self.session.exec(statement)
-        return result.one_or_none()
+        statement = select(OrganizationSetting).where(
+            OrganizationSetting.organization_id == self.organization_id,
+            OrganizationSetting.key == key,
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one_or_none()
 
     async def _create_org_setting(self, params: SettingCreate) -> OrganizationSetting:
         """Create a new organization setting."""
@@ -157,7 +184,7 @@ class SettingsService(BaseService):
         else:
             value = value_bytes
         setting = OrganizationSetting(
-            owner_id=config.TRACECAT__DEFAULT_ORG_ID,
+            organization_id=self.organization_id,
             key=params.key,
             value_type=params.value_type,
             value=value,
@@ -166,7 +193,8 @@ class SettingsService(BaseService):
         self.session.add(setting)
         return setting
 
-    @require_access_level(AccessLevel.ADMIN)
+    @require_scope("org:settings:update")
+    @audit_log(resource_type="organization_setting", action="create")
     async def create_org_setting(self, params: SettingCreate) -> OrganizationSetting:
         """Create a new organization setting."""
         setting = await self._create_org_setting(params)
@@ -198,7 +226,8 @@ class SettingsService(BaseService):
             setattr(setting, field, value)
         return setting
 
-    @require_access_level(AccessLevel.ADMIN)
+    @require_scope("org:settings:update")
+    @audit_log(resource_type="organization_setting", action="update")
     async def update_org_setting(
         self, setting: OrganizationSetting, params: SettingUpdate
     ) -> OrganizationSetting:
@@ -217,7 +246,8 @@ class SettingsService(BaseService):
         await self.session.refresh(updated_setting)
         return updated_setting
 
-    @require_access_level(AccessLevel.ADMIN)
+    @require_scope("org:settings:update")
+    @audit_log(resource_type="organization_setting", action="delete")
     async def delete_org_setting(self, setting: OrganizationSetting) -> None:
         """Delete an organization setting."""
         if setting.key in self._system_keys():
@@ -234,40 +264,51 @@ class SettingsService(BaseService):
         self, settings: Sequence[OrganizationSetting], params: BaseModel
     ) -> None:
         updated_fields = params.model_dump(exclude_unset=True)
-        for setting in settings:
-            if setting.key in updated_fields:
-                params = SettingUpdate(value=updated_fields[setting.key])
+        settings_by_key = {setting.key: setting for setting in settings}
+        for key, value in updated_fields.items():
+            setting = settings_by_key.get(key)
+            if setting is None:
+                setting = await self._create_org_setting(
+                    SettingCreate(
+                        key=key,
+                        value=value,
+                        is_sensitive=key in SENSITIVE_SETTINGS_KEYS,
+                    )
+                )
+                settings_by_key[key] = setting
+            else:
+                params = SettingUpdate(value=value)
                 await self._update_setting(setting, params)
         await self.session.commit()
 
-    @require_access_level(AccessLevel.ADMIN)
+    @require_scope("org:settings:update")
+    @audit_log(resource_type="organization_setting", action="update")
     async def update_git_settings(self, params: GitSettingsUpdate) -> None:
         self.logger.info(f"Updating Git settings: {params}")
         # Ignore read-only fields
         git_settings = await self.list_org_settings(keys=GitSettingsUpdate.keys())
         await self._update_grouped_settings(git_settings, params)
 
-    @require_access_level(AccessLevel.ADMIN)
+    @require_scope("org:settings:update")
+    @audit_log(resource_type="organization_setting", action="update")
     async def update_saml_settings(self, params: SAMLSettingsUpdate) -> None:
         saml_settings = await self.list_org_settings(keys=SAMLSettingsUpdate.keys())
         await self._update_grouped_settings(saml_settings, params)
 
-    @require_access_level(AccessLevel.ADMIN)
-    async def update_auth_settings(self, params: AuthSettingsUpdate) -> None:
-        auth_settings = await self.list_org_settings(keys=AuthSettingsUpdate.keys())
-        await self._update_grouped_settings(auth_settings, params)
+    @require_scope("org:settings:update")
+    @audit_log(resource_type="organization_setting", action="update")
+    async def update_audit_settings(self, params: AuditSettingsUpdate) -> None:
+        audit_settings = await self.list_org_settings(keys=AuditSettingsUpdate.keys())
+        await self._update_grouped_settings(audit_settings, params)
 
-    @require_access_level(AccessLevel.ADMIN)
-    async def update_oauth_settings(self, params: OAuthSettingsUpdate) -> None:
-        oauth_settings = await self.list_org_settings(keys=OAuthSettingsUpdate.keys())
-        await self._update_grouped_settings(oauth_settings, params)
-
-    @require_access_level(AccessLevel.ADMIN)
+    @require_scope("org:settings:update")
+    @audit_log(resource_type="organization_setting", action="update")
     async def update_app_settings(self, params: AppSettingsUpdate) -> None:
         app_settings = await self.list_org_settings(keys=AppSettingsUpdate.keys())
         await self._update_grouped_settings(app_settings, params)
 
-    @require_access_level(AccessLevel.ADMIN)
+    @require_scope("org:settings:update")
+    @audit_log(resource_type="organization_setting", action="update")
     async def update_agent_settings(self, params: AgentSettingsUpdate) -> None:
         agent_settings = await self.list_org_settings(keys=AgentSettingsUpdate.keys())
         await self._update_grouped_settings(agent_settings, params)
@@ -282,6 +323,10 @@ async def get_setting(
 ) -> Any | None:
     """Shorthand to get a setting value from the database."""
     role = role or ctx_role.get()
+
+    # If no role is available, return default or None
+    if role is None:
+        return default if default is not UNSET else None
 
     # If we have an environment override, use it
     if override_val := get_setting_override(key):
@@ -299,7 +344,27 @@ async def get_setting(
             case _:
                 return override_val
 
+    # If role has no organization_id, fetch the default org
+    if role is not None and role.organization_id is None:
+        if session:
+            default_org_id = await get_default_organization_id(session)
+        else:
+            async with get_async_session_bypass_rls_context_manager() as sess:
+                default_org_id = await get_default_organization_id(sess)
+
+        # If no default organization is available, return default
+        if default_org_id is None:
+            logger.debug(
+                "No organization available for setting lookup, using default",
+                key=key,
+            )
+            return default if default is not UNSET else None
+
+        # Preserve all existing role attributes while binding org scope.
+        role = role.model_copy(update={"organization_id": default_org_id})
+
     if session:
+        await set_rls_context_from_role(session, role)
         service = SettingsService(session=session, role=role)
         setting = await service.get_org_setting(key)
         no_default_val = service.get_value(setting) if setting else None
@@ -315,27 +380,43 @@ async def get_setting(
     return no_default_val
 
 
-@alru_cache(ttl=30)
 async def get_setting_cached(
     key: str,
     *,
-    role: Role | None = None,
-    session: AsyncSession | None = None,
     default: Any | None = None,
 ) -> Any | None:
     """Cached version of get_setting function.
 
+    Cache is keyed by (key, organization_id) to prevent cross-tenant data leakage.
+    Uses context role and session - use get_setting() for explicit role/session control.
+
     Args:
         key: The setting key to retrieve
-        role: Optional role to use for permissions check
-        session: Optional database session to use
         default: Optional default value if setting not found. Must be hashable.
 
     Returns:
         The setting value or None if not found
     """
-    logger.debug("Cache miss", key=key)
-    sess = session or ctx_session.get(None)
+    # Resolve organization_id from context for cache key
+    role = ctx_role.get()
+    organization_id = role.organization_id if role else None
+
+    return await _get_setting_cached_by_org(key, organization_id, default)
+
+
+@alru_cache(ttl=30)
+async def _get_setting_cached_by_org(
+    key: str,
+    organization_id: OrganizationID | None,
+    default: Any | None = None,
+) -> Any | None:
+    """Internal cached implementation keyed by (key, organization_id).
+
+    This ensures different organizations have isolated cache entries.
+    """
+    logger.debug("Cache miss", key=key, organization_id=organization_id)
+    role = ctx_role.get()
+    sess = ctx_session.get(None)
     return await get_setting(key, role=role, session=sess, default=default)
 
 
@@ -344,8 +425,6 @@ def get_setting_override(key: str) -> Any | None:
     # Only allow overrides for specific settings
     allowed_override_keys = {
         "saml_enabled",
-        "oauth_google_enabled",
-        "auth_basic_enabled",
     }
 
     if key not in allowed_override_keys:

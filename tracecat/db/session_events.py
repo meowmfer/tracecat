@@ -6,7 +6,7 @@ from typing import Any, Final, cast
 
 import sqlalchemy.orm
 from sqlalchemy import event
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracecat.logger import logger
 
@@ -22,7 +22,7 @@ def add_after_commit_callback(session: AsyncSession, callback: AsyncCallback) ->
     the event loop captured during registration.
 
     Args:
-        session: The async SQLModel session to register the callback with.
+        session: The async SQLAlchemy session to register the callback with.
         callback: The callable function to execute after commit. Should return an awaitable.
 
     Returns:
@@ -45,7 +45,7 @@ def add_after_commit_callback(session: AsyncSession, callback: AsyncCallback) ->
 
 
 @event.listens_for(sqlalchemy.orm.Session, "after_commit")
-def _run_after_commit(session: sqlalchemy.orm.Session) -> None:
+def _run_after_commit(session: sqlalchemy.orm.Session) -> None:  # pyright: ignore[reportUnusedFunction] - registered as SQLAlchemy event listener
     """Execute all registered after-commit callbacks for the given session.
 
     This function is automatically called by SQLAlchemy after a session commits.

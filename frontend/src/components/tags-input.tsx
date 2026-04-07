@@ -1,11 +1,12 @@
 "use client"
 
-import type { TagInputProps } from "emblor"
+import type { Tag as _Tag, TagInputProps } from "emblor"
 import { TagInput as EmblorTagInput } from "emblor"
 import fuzzysort from "fuzzysort"
 import { ChevronDown, X } from "lucide-react"
 import type React from "react"
 import { useCallback, useMemo, useRef, useState } from "react"
+import { LockedFeatureChip } from "@/components/locked-feature-modal"
 import { Badge } from "@/components/ui/badge"
 import {
   Command,
@@ -17,6 +18,7 @@ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
 
+export type Tag = _Tag
 // Define the props we want to expose to consumers
 type CustomTagInputProps = Omit<
   TagInputProps,
@@ -41,17 +43,12 @@ export function CustomTagInput(props: CustomTagInputProps) {
         inlineTagsContainer:
           "shadow-sm min-h-9 flex flex-wrap items-center gap-1 border text-xs",
         tag: {
-          body: "h-5 text-xs",
+          body: "h-5 text-xs border-[0.5px]",
+          closeButton: "px-1.5",
         },
       }}
     />
   )
-}
-
-export interface Tag {
-  id: string
-  text: string
-  value: string
 }
 
 export interface Suggestion {
@@ -61,6 +58,8 @@ export interface Suggestion {
   description?: string
   group?: string
   icon?: React.ReactNode
+  locked?: boolean
+  onSelect?: () => void
 }
 
 export interface MultiTagCommandInputProps {
@@ -116,6 +115,7 @@ export function MultiTagCommandInput({
           id: `${index}`,
           text: suggestion?.label || val,
           value: val,
+          icon: suggestion?.icon,
         }
       }) || []
     )
@@ -141,10 +141,15 @@ export function MultiTagCommandInput({
     return filterActions(filtered, inputValue).map((result) => result.obj)
   }, [suggestions, inputValue, valueSet, filterActions])
 
-  const handleSelect = (suggestionValue: string) => {
+  const handleSelect = (suggestion: Suggestion) => {
+    if (suggestion.locked) {
+      suggestion.onSelect?.()
+      return
+    }
+
     if (maxTags && value.length >= maxTags) return
 
-    const newValue = [...value, suggestionValue]
+    const newValue = [...value, suggestion.value]
     onChange?.(newValue)
     setInputValue("")
     setHighlightedIndex(-1)
@@ -205,7 +210,7 @@ export function MultiTagCommandInput({
           <div
             className={cn(
               "flex min-h-10 w-full flex-wrap items-center gap-1 rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm ring-offset-background",
-              "focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2",
+              "focus-within:ring-1 focus-within:ring-inset focus-within:ring-ring",
               disabled && "cursor-not-allowed opacity-50",
               className
             )}
@@ -218,7 +223,16 @@ export function MultiTagCommandInput({
                 variant="secondary"
                 className="gap-1 pr-1 text-xs"
               >
-                {tag.text}
+                {tag.icon ? (
+                  <span className="flex items-center gap-1">
+                    <span className="flex items-center justify-center rounded-sm bg-transparent">
+                      {tag.icon}
+                    </span>
+                    <span>{tag.text}</span>
+                  </span>
+                ) : (
+                  tag.text
+                )}
                 {!disabled && (
                   <button
                     type="button"
@@ -276,10 +290,12 @@ export function MultiTagCommandInput({
                     <CommandItem
                       key={suggestion.id}
                       value={suggestion.value}
-                      onSelect={() => handleSelect(suggestion.value)}
+                      onSelect={() => handleSelect(suggestion)}
+                      onMouseDown={(e) => e.preventDefault()}
                       data-suggestion-index={index}
                       className={cn(
                         "flex cursor-pointer gap-2",
+                        suggestion.locked && "text-muted-foreground",
                         index === highlightedIndex &&
                           "bg-accent text-accent-foreground"
                       )}
@@ -290,14 +306,19 @@ export function MultiTagCommandInput({
                         </div>
                       )}
                       <div className="flex flex-col gap-1">
-                        <span className="font-medium">
-                          {suggestion.label}{" "}
-                          {suggestion.group && (
-                            <span className="text-xs text-muted-foreground">
-                              {suggestion.group}
-                            </span>
-                          )}
-                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">
+                            {suggestion.label}{" "}
+                            {suggestion.group && (
+                              <span className="text-xs text-muted-foreground">
+                                {suggestion.group}
+                              </span>
+                            )}
+                          </span>
+                          {suggestion.locked ? (
+                            <LockedFeatureChip className="shrink-0" />
+                          ) : null}
+                        </div>
                         {suggestion.description && (
                           <span className="text-xs text-muted-foreground">
                             {suggestion.description}

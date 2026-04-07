@@ -7,6 +7,9 @@ import orjson
 from pydantic import Discriminator, TypeAdapter
 from pydantic_ai.messages import AgentStreamEvent, ModelMessage, ModelResponse, TextPart
 
+from tracecat.agent.common.stream_types import UnifiedStreamEvent
+
+UnifiedStreamEventTA: TypeAdapter[UnifiedStreamEvent] = TypeAdapter(UnifiedStreamEvent)
 AgentStreamEventTA: TypeAdapter[AgentStreamEvent] = TypeAdapter(AgentStreamEvent)
 
 
@@ -16,7 +19,7 @@ class StreamDelta:
 
     kind: Literal["event"] = "event"
     id: str
-    event: AgentStreamEvent
+    event: UnifiedStreamEvent | AgentStreamEvent
 
     def sse(self) -> str:
         return f"id: {self.id}\nevent: delta\ndata: {orjson.dumps(self.event).decode()}\n\n"
@@ -79,8 +82,19 @@ class StreamError:
         )
 
 
+@dataclass(slots=True, kw_only=True)
+class StreamKeepAlive:
+    """Periodic keep-alive event to prevent proxy timeouts."""
+
+    kind: Literal["keepalive"] = "keepalive"
+
+    @staticmethod
+    def sse() -> str:
+        return ": keep-alive\n\n"
+
+
 type StreamEvent = Annotated[
-    StreamDelta | StreamMessage | StreamEnd | StreamError,
+    StreamDelta | StreamMessage | StreamEnd | StreamError | StreamKeepAlive,
     Discriminator("kind"),
 ]
 

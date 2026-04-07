@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from timeit import default_timer
 from types import ModuleType
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, cast, get_args, get_origin, get_type_hints
 
 from pydantic import (
     BaseModel,
@@ -23,21 +23,23 @@ from pydantic import (
     create_model,
 )
 from pydantic_core import to_jsonable_python
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 from tracecat_registry import RegistrySecretType
 from typing_extensions import Doc
 
 from tracecat import config
+from tracecat.auth.types import Role
 from tracecat.contexts import ctx_role
 from tracecat.db.engine import get_async_session_context_manager
+from tracecat.exceptions import RegistryError
 from tracecat.expressions.expectations import create_expectation_model
 from tracecat.expressions.validation import TemplateValidator
 from tracecat.git.utils import GitUrl, get_git_repository_sha, parse_git_url
 from tracecat.logger import logger
 from tracecat.parse import safe_url
-from tracecat.registry.actions.models import BoundRegistryAction, TemplateAction
+from tracecat.registry.actions.bound import BoundRegistryAction
+from tracecat.registry.actions.schemas import TemplateAction
 from tracecat.registry.constants import (
-    CUSTOM_REPOSITORY_ORIGIN,
     DEFAULT_LOCAL_REGISTRY_ORIGIN,
     DEFAULT_REGISTRY_ORIGIN,
 )
@@ -51,15 +53,70 @@ from tracecat.registry.fields import (
     get_components_for_union_type,
     type_drop_null,
 )
-from tracecat.registry.repositories.models import RegistryRepositoryCreate
+from tracecat.registry.repositories.schemas import RegistryRepositoryCreate
 from tracecat.registry.repositories.service import RegistryReposService
 from tracecat.settings.service import get_setting
 from tracecat.ssh import SshEnv, ssh_context
-from tracecat.types.auth import Role
-from tracecat.types.exceptions import RegistryError
 
 ArgsClsT = type[BaseModel]
 type F = Callable[..., Any]
+
+
+def get_custom_registry_target() -> Path:
+    """Get the target directory for installing custom registry packages.
+
+    This directory is used to isolate custom registry dependencies from the
+    main tracecat virtual environment, preventing dependency conflicts.
+    The directory is automatically added to sys.path so imports work.
+
+    Returns:
+        Path to the target directory for custom registry packages.
+    """
+    # Use PYTHONUSERBASE if set (production), otherwise ~/.local
+    base = os.getenv("PYTHONUSERBASE") or Path.home().joinpath(".local").as_posix()
+    return Path(base)
+
+
+def ensure_custom_registry_path() -> None:
+    """Ensure the custom registry target directory is in sys.path.
+
+    This must be called before importing any custom registry modules to ensure
+    packages installed via --target are discoverable.
+
+    Uses site.addsitedir() instead of sys.path.insert() to properly process
+    .pth files from editable installs (uv pip install --editable).
+    """
+    import site
+
+    target = get_custom_registry_target()
+    target_str = str(target)
+    if target_str not in sys.path:
+        # Use addsitedir to process .pth files from editable installs
+        # This is required for local registries installed with --editable
+        site.addsitedir(target_str)
+        logger.debug("Added custom registry path via site.addsitedir", path=target_str)
+
+
+DEFAULT_EXCLUDE_DIRNAMES: set[str] = {
+    "cli",
+    "_internal",
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    "env",
+    ".direnv",
+    "build",
+    "dist",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    "eggs",
+    ".eggs",
+    "tests",
+}
 
 
 def iter_valid_files(
@@ -80,26 +137,7 @@ def iter_valid_files(
         Path objects for valid files
     """
     if exclude_dirnames is None:
-        exclude_dirnames = {
-            "cli",
-            "_internal",
-            ".git",
-            "__pycache__",
-            "node_modules",
-            ".venv",
-            "venv",
-            "env",
-            ".direnv",
-            "build",
-            "dist",
-            ".mypy_cache",
-            ".pytest_cache",
-            ".ruff_cache",
-            ".tox",
-            "eggs",
-            ".eggs",
-            "tests",
-        }
+        exclude_dirnames = set(DEFAULT_EXCLUDE_DIRNAMES)
 
     pkg_path = Path(base_path)
 
@@ -159,7 +197,10 @@ class RegisterKwargs(BaseModel):
     author: str | None = None
     deprecated: str | None = None
     secrets: list[RegistrySecretType] | None = None
+    # Options
     include_in_schema: bool = True
+    requires_approval: bool = False
+    required_entitlements: list[str] | None = None
 
 
 class Repository:
@@ -172,10 +213,16 @@ class Repository:
     3. Serve function execution requests from a registry manager
     """
 
-    def __init__(self, origin: str = DEFAULT_REGISTRY_ORIGIN, role: Role | None = None):
+    def __init__(
+        self,
+        origin: str = DEFAULT_REGISTRY_ORIGIN,
+        role: Role | None = None,
+        package_name_override: str | None = None,
+    ):
         self._store: dict[str, BoundRegistryAction[ArgsClsT]] = {}
         self._is_initialized: bool = False
         self._origin = origin
+        self._package_name_override = package_name_override
         self.role = role or ctx_role.get()
 
     def __contains__(self, name: str) -> bool:
@@ -250,6 +297,8 @@ class Repository:
         author: str | None,
         deprecated: str | None,
         include_in_schema: bool,
+        requires_approval: bool = False,
+        required_entitlements: list[str] | None = None,
         template_action: TemplateAction | None = None,
         origin: str = DEFAULT_REGISTRY_ORIGIN,
     ):
@@ -272,6 +321,8 @@ class Repository:
             origin=origin,
             template_action=template_action,
             include_in_schema=include_in_schema,
+            requires_approval=requires_approval,
+            required_entitlements=required_entitlements,
         )
 
         logger.debug(f"Registering action {reg_action.action=}")
@@ -304,7 +355,7 @@ class Repository:
             args_docs={
                 key: schema.description or "-" for key, schema in expectation.items()
             },
-            rtype=Any,  # type: ignore
+            rtype=Any,  # pyright: ignore[reportArgumentType]
             rtype_adapter=TypeAdapter(Any),
             default_title=defn.title,
             display_group=defn.display_group,
@@ -333,8 +384,6 @@ class Repository:
             self._load_base_template_actions()
             return None
 
-        elif self._origin == CUSTOM_REPOSITORY_ORIGIN:
-            raise RegistryError("This repository cannot be synced.")
         # Handle local git repositories
         elif self._origin == DEFAULT_LOCAL_REGISTRY_ORIGIN:
             # The local repo doesn't have to be a git repo, but it should be a directory
@@ -393,19 +442,21 @@ class Repository:
                     "Local repository is not a git repository, skipping commit SHA"
                 )
 
-            # Install the package in editable mode
-            extra_args = []
-            if config.TRACECAT__APP_ENV == "production":
-                # We set PYTHONUSERBASE in the prod Dockerfile
-                # Otherwise default to the user's home dir at ~/.local
-                python_user_base = (
-                    os.getenv("PYTHONUSERBASE")
-                    or Path.home().joinpath(".local").as_posix()
-                )
-                logger.debug(
-                    "Installing to PYTHONUSERBASE", python_user_base=python_user_base
-                )
-                extra_args = ["--target", python_user_base]
+            # Install the package in editable mode to the custom registry target.
+            # We use --target to isolate custom registry dependencies from the
+            # main tracecat venv, and --python to ensure compatibility with the
+            # current interpreter.
+            target_dir = get_custom_registry_target()
+            extra_args = [
+                "--python",
+                sys.executable,
+                "--target",
+                str(target_dir),
+            ]
+            logger.debug(
+                "Installing local repository to target",
+                target=str(target_dir),
+            )
 
             cmd = ["uv", "pip", "install", "--refresh", "--editable"]
             process = await asyncio.create_subprocess_exec(
@@ -467,7 +518,9 @@ class Repository:
                     "Invalid Git repository URL. Please provide a valid Git SSH URL (git+ssh)."
                 ) from e
             package_name = (
-                await get_setting("git_repo_package_name", role=self.role) or repo_name
+                self._package_name_override
+                or await get_setting("git_repo_package_name", role=self.role)
+                or repo_name
             )
             logger.debug(
                 "Parsed Git repository URL",
@@ -521,6 +574,11 @@ class Repository:
         Raises:
             ImportError: If there is an error importing the module
         """
+        # Ensure the custom registry target is in sys.path before importing.
+        # This is required because packages are installed to --target dir,
+        # which is separate from the main tracecat venv.
+        ensure_custom_registry_path()
+
         try:
             logger.info("Importing repository module", module_name=module_name)
             # We only need to call this at the root level because
@@ -584,6 +642,8 @@ class Repository:
             default_title=validated_kwargs.default_title,
             display_group=validated_kwargs.display_group,
             include_in_schema=validated_kwargs.include_in_schema,
+            requires_approval=validated_kwargs.requires_approval,
+            required_entitlements=validated_kwargs.required_entitlements,
             args_cls=args_cls,
             args_docs=args_docs,
             rtype=rtype,
@@ -618,25 +678,39 @@ class Repository:
         origin: str = DEFAULT_REGISTRY_ORIGIN,
     ) -> None:
         start_time = default_timer()
-        base_path = module.__path__[0]
+        base_path = Path(module.__path__[0])
         base_package = module.__name__
         num_udfs = 0
 
+        # Avoid reloading SDK modules to prevent sentinel/class mismatch
+        exclude_dirnames = None
+        search_paths = [base_path]
+        if module.__name__ == DEFAULT_REGISTRY_ORIGIN:
+            exclude_dirnames = DEFAULT_EXCLUDE_DIRNAMES | {"sdk"}
+            search_paths = [
+                base_path / "core",
+                base_path / "integrations",
+            ]
+
         # Use the new free function to iterate over Python files
-        for file_path in iter_valid_files(
-            base_path,
-            file_extensions=(".py",),
-            exclude_filenames=("__init__", "__main__"),
-        ):
-            logger.info(f"Loading UDFs from {file_path!s}")
+        for search_path in search_paths:
+            if not search_path.exists():
+                continue
+            for file_path in iter_valid_files(
+                search_path,
+                file_extensions=(".py",),
+                exclude_filenames=("__init__", "__main__"),
+                exclude_dirnames=exclude_dirnames,
+            ):
+                logger.info(f"Loading UDFs from {file_path!s}")
 
-            # Convert path to module name
-            relative_path = file_path.relative_to(base_path)
-            parts = (*relative_path.parent.parts, relative_path.stem)
-            udf_module_name = f"{base_package}.{'.'.join(parts)}"
+                # Convert path to module name
+                relative_path = file_path.relative_to(base_path)
+                parts = (*relative_path.parent.parts, relative_path.stem)
+                udf_module_name = f"{base_package}.{'.'.join(parts)}"
 
-            mod = import_and_reload(udf_module_name)
-            num_udfs += self._register_udfs_from_module(mod, origin=origin)
+                mod = import_and_reload(udf_module_name)
+                num_udfs += self._register_udfs_from_module(mod, origin=origin)
         time_elapsed = default_timer() - start_time
         logger.info(
             f"✅ Registered {num_udfs} UDFs in {time_elapsed:.2f}s",
@@ -760,22 +834,68 @@ def import_and_reload(module_name: str) -> ModuleType:
             # Skip reload on first import
             loaded_module = importlib.import_module(module_name)
         else:
-            # Reload in-place to refresh definitions without dropping parent package
-            loaded_module = importlib.reload(module)
+            spec = getattr(module, "__spec__", None)
+            loader = getattr(spec, "loader", None) if spec is not None else None
+            if loader is None:
+                # Without a loader importlib.reload will raise ModuleNotFoundError;
+                # fall back to a best-effort fresh import and keep the existing module.
+                loaded_module = importlib.import_module(module_name)
+            else:
+                # Reload in-place to refresh definitions without dropping parent package
+                try:
+                    loaded_module = importlib.reload(module)
+                except (ImportError, ValueError) as e:
+                    logger.warning(
+                        "Reload failed, keeping existing module",
+                        module_name=module_name,
+                        error=e,
+                    )
+                    loaded_module = module
         sys.modules[module_name] = loaded_module
         return loaded_module
 
 
-def attach_validators(func: F, *validators: Any):
-    sig = inspect.signature(func)
+def _annotated_with_validators(annotation: Any, validators: tuple[Any, ...]) -> Any:
+    """Return an Annotated type that includes the provided validators once each."""
 
-    new_annotations = {
-        name: Annotated[param.annotation, *validators]
-        for name, param in sig.parameters.items()
-    }
+    if annotation is inspect._empty:
+        base = Any
+        metadata: list[Any] = []
+    else:
+        origin = get_origin(annotation)
+        if origin is Annotated:
+            args = get_args(annotation)
+            base = args[0]
+            metadata = list(args[1:])
+        else:
+            base = annotation
+            metadata = []
+
+    for validator in validators:
+        if any(isinstance(meta, validator.__class__) for meta in metadata):
+            continue
+        metadata.append(validator)
+
+    if metadata:
+        return Annotated[base, *metadata]
+    return base
+
+
+def attach_validators(func: F, *validators: Any):
+    if not validators:
+        return
+
+    sig = inspect.signature(func)
+    annotations = dict(func.__annotations__)
+
+    for name, param in sig.parameters.items():
+        current = annotations.get(name, param.annotation)
+        annotations[name] = _annotated_with_validators(current, validators)
+
     if sig.return_annotation is not sig.empty:
-        new_annotations["return"] = sig.return_annotation
-    func.__annotations__ = new_annotations
+        annotations.setdefault("return", sig.return_annotation)
+
+    func.__annotations__ = annotations
 
 
 def generate_model_from_function(
@@ -783,13 +903,28 @@ def generate_model_from_function(
 ) -> tuple[type[BaseModel], Any, TypeAdapter]:
     # Get the signature of the function
     sig = inspect.signature(func)
+    # Get the function's module globals for resolving forward references
+    func_module = sys.modules.get(func.__module__)
+    func_globals = getattr(func_module, "__dict__", {}) if func_module else {}
+    # Resolve all type hints upfront to handle ForwardRefs from `from __future__ import annotations`
+    # include_extras=True preserves Annotated metadata like Doc()
+    try:
+        resolved_hints = get_type_hints(
+            func, globalns=func_globals, localns=func_globals, include_extras=True
+        )
+    except Exception:
+        resolved_hints = {}
     # Create a dictionary to hold field definitions
     fields = {}
     for name, param in sig.parameters.items():
-        # Use the annotation and default value of the parameter to define the model field
-        field_annotation = param.annotation
-        # Handle both Annotated types and raw types
-        raw_field_type: type = getattr(field_annotation, "__origin__", field_annotation)
+        # Use resolved type hint if available, otherwise fall back to raw annotation
+        field_annotation = resolved_hints.get(name, param.annotation)
+        # Extract base type from Annotated[T, ...] -> T, preserve other types as-is
+        origin = get_origin(field_annotation)
+        if origin is Annotated:
+            raw_field_type: type = get_args(field_annotation)[0]
+        else:
+            raw_field_type = field_annotation
         field_info_kwargs = {}
         # Get the default UI for the field
         non_null_field_type = type_drop_null(raw_field_type)
@@ -803,6 +938,13 @@ def generate_model_from_function(
                         field_info_kwargs["description"] = doc
                     # Only set the component if no default UI is provided
                     case Component():
+                        manually_set_components.append(meta)
+                    # `tracecat_registry` provides lightweight dataclass component
+                    # definitions that are not instances of
+                    # `tracecat.registry.fields.Component`. These still need to
+                    # propagate to JSONSchema via `x-tracecat-component` so the frontend
+                    # can render specialized editors (code, textarea, etc).
+                    case _ if isinstance(getattr(meta, "component_id", None), str):
                         manually_set_components.append(meta)
 
         final_components = manually_set_components or components
@@ -819,10 +961,16 @@ def generate_model_from_function(
     input_model = create_model(
         _udf_slug_camelcase(func, udf_kwargs.namespace),
         __config__=ConfigDict(extra="forbid"),
+        __module__=func.__module__,
+        __validators__={},
         **fields,
     )
-    # Capture the return type of the function
-    rtype = sig.return_annotation if sig.return_annotation is not sig.empty else Any
+    # Rebuild the model with the function's global namespace to resolve forward references
+    input_model.model_rebuild(_types_namespace=func_globals)
+    # Get return type from resolved hints, fallback to signature annotation
+    rtype = resolved_hints.get("return", Any)
+    if rtype is Any and sig.return_annotation is not sig.empty:
+        rtype = sig.return_annotation
     rtype_adapter = TypeAdapter(rtype)
 
     return input_model, rtype, rtype_adapter
@@ -916,10 +1064,30 @@ async def ensure_base_repository(
 async def install_remote_repository(
     repo_url: str, commit_sha: str, env: SshEnv
 ) -> None:
+    """Install a remote repository to the custom registry target directory.
+
+    Uses `uv pip install --target` instead of `uv add` to isolate custom
+    registry dependencies from the main tracecat virtual environment.
+    This prevents dependency conflicts between tracecat and user repositories.
+    """
     logger.info("Loading remote repository", url=repo_url, commit_sha=commit_sha)
 
-    cmd = ["uv", "add", "--refresh", f"{repo_url}@{commit_sha}"]
-    logger.debug("Installation command", cmd=cmd)
+    target_dir = get_custom_registry_target()
+    cmd = [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        sys.executable,
+        "--target",
+        str(target_dir),
+        "--refresh",
+        f"{repo_url}@{commit_sha}",
+    ]
+    logger.debug(
+        "Installation command",
+        cmd=cmd,
+    )
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,

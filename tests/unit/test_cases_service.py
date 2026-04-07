@@ -1,16 +1,38 @@
 import uuid  # noqa: I001
 import asyncio
-from unittest.mock import patch, MagicMock
+from datetime import UTC, datetime
+from typing import Literal
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
+from tracecat.cases.dropdowns.schemas import (
+    CaseDropdownDefinitionCreate,
+    CaseDropdownOptionCreate,
+    CaseDropdownValueInput,
+)
+from tracecat.cases.dropdowns.service import (
+    CaseDropdownDefinitionsService,
+    CaseDropdownValuesService,
+)
 from tracecat.cases.enums import CasePriority, CaseSeverity, CaseStatus
-from tracecat.cases.models import CaseCreate, CaseFieldCreate, CaseUpdate
+from tracecat.cases.schemas import (
+    CaseCreate,
+    CaseFieldCreate,
+    CaseReadMinimal,
+    CaseUpdate,
+)
+from tracecat.tags.schemas import TagCreate
 from tracecat.cases.service import CaseFieldsService, CasesService
+from tracecat.cases.tags.service import CaseTagsService
+from tracecat.db.models import Case, Workspace
+from tracecat.exceptions import TracecatAuthorizationError
+from tracecat.pagination import CursorPaginationParams
 from tracecat.tables.enums import SqlType
-from tracecat.types.auth import AccessLevel, Role
-from tracecat.types.exceptions import TracecatAuthorizationError
 
 pytestmark = pytest.mark.usefixtures("db")
 
@@ -24,7 +46,7 @@ async def test_service_initialization_requires_workspace(session: AsyncSession) 
         user_id=uuid.uuid4(),
         workspace_id=None,
         service_id="tracecat-service",
-        access_level=AccessLevel.BASIC,
+        scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-service"],
     )
 
     # Attempt to create service without workspace should raise error
@@ -64,6 +86,54 @@ def case_create_params() -> CaseCreate:
     )
 
 
+async def _list_cases(
+    cases_service: CasesService,
+    *,
+    limit: int = 100,
+    order_by: Literal[
+        "created_at", "updated_at", "priority", "severity", "status", "tasks"
+    ]
+    | None = None,
+    sort: Literal["asc", "desc"] | None = None,
+) -> list[CaseReadMinimal]:
+    response = await cases_service.list_cases(
+        limit=limit,
+        order_by=order_by,
+        sort=sort,
+    )
+    return response.items
+
+
+async def _create_dropdown_with_option(
+    cases_service: CasesService,
+    *,
+    definition_name: str,
+    definition_ref: str,
+    option_label: str,
+    option_ref: str,
+):
+    definitions_service = CaseDropdownDefinitionsService(
+        session=cases_service.session, role=cases_service.role
+    )
+    definition = await definitions_service.create_definition(
+        CaseDropdownDefinitionCreate(
+            name=definition_name,
+            ref=definition_ref,
+            is_ordered=False,
+            options=[],
+        )
+    )
+    option = await definitions_service.add_option(
+        definition.id,
+        CaseDropdownOptionCreate(
+            label=option_label,
+            ref=option_ref,
+            position=0,
+        ),
+    )
+    return definition, option
+
+
 @pytest.mark.anyio
 class TestCasesService:
     async def test_create_and_get_case(
@@ -77,7 +147,7 @@ class TestCasesService:
         assert created_case.status == case_create_params.status
         assert created_case.priority == case_create_params.priority
         assert created_case.severity == case_create_params.severity
-        assert created_case.owner_id == cases_service.workspace_id
+        assert created_case.workspace_id == cases_service.workspace_id
 
         # Retrieve case
         retrieved_case = await cases_service.get_case(created_case.id)
@@ -142,11 +212,192 @@ class TestCasesService:
         )
 
         # List all cases
-        cases = await cases_service.list_cases()
+        cases = await _list_cases(cases_service)
         assert len(cases) >= 2
         case_ids = {case.id for case in cases}
         assert case1.id in case_ids
         assert case2.id in case_ids
+
+    async def test_create_case_allocates_consecutive_workspace_case_numbers(
+        self, cases_service: CasesService
+    ) -> None:
+        """Case numbers should advance monotonically within one workspace."""
+        first_case = await cases_service.create_case(
+            CaseCreate(
+                summary="First numbered case",
+                description="First numbered case",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        second_case = await cases_service.create_case(
+            CaseCreate(
+                summary="Second numbered case",
+                description="Second numbered case",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+
+        assert first_case.case_number == 1
+        assert first_case.short_id == "CASE-0001"
+        assert second_case.case_number == 2
+        assert second_case.short_id == "CASE-0002"
+
+    async def test_create_case_allows_duplicate_short_ids_across_workspaces(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+        svc_organization,
+    ) -> None:
+        """Different workspaces should each be able to allocate CASE-0001."""
+        first_case = await cases_service.create_case(
+            CaseCreate(
+                summary="Workspace one",
+                description="Workspace one",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        second_workspace = Workspace(
+            name="second-workspace",
+            organization_id=svc_organization.id,
+        )
+        session.add(second_workspace)
+        await session.commit()
+
+        second_role = cases_service.role.model_copy(
+            update={
+                "workspace_id": second_workspace.id,
+                "organization_id": second_workspace.organization_id,
+            }
+        )
+        second_service = CasesService(session=session, role=second_role)
+        second_case = await second_service.create_case(
+            CaseCreate(
+                summary="Workspace two",
+                description="Workspace two",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+
+        assert first_case.case_number == 1
+        assert second_case.case_number == 1
+        assert first_case.short_id == second_case.short_id == "CASE-0001"
+
+    async def test_search_cases_short_id_is_workspace_scoped(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+        svc_organization,
+    ) -> None:
+        """Exact short ID search should not cross workspace boundaries."""
+        target_case = await cases_service.create_case(
+            CaseCreate(
+                summary="Workspace one target",
+                description="Workspace one target",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        second_workspace = Workspace(
+            name="search-scope-workspace",
+            organization_id=svc_organization.id,
+        )
+        session.add(second_workspace)
+        await session.commit()
+
+        second_role = cases_service.role.model_copy(
+            update={
+                "workspace_id": second_workspace.id,
+                "organization_id": second_workspace.organization_id,
+            }
+        )
+        second_service = CasesService(session=session, role=second_role)
+        second_case = await second_service.create_case(
+            CaseCreate(
+                summary="Workspace two target",
+                description="Workspace two target",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+
+        assert target_case.short_id == second_case.short_id == "CASE-0001"
+
+        params = CursorPaginationParams(limit=20, cursor=None, reverse=False)
+        response = await cases_service.search_cases(
+            params=params,
+            short_id="CASE-0001",
+            order_by="created_at",
+            sort="asc",
+        )
+
+        result_ids = {item.id for item in response.items}
+        assert target_case.id in result_ids
+        assert second_case.id not in result_ids
+
+    async def test_create_case_concurrently_allocates_unique_workspace_numbers(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+        svc_role: Role,
+        svc_workspace: Workspace,
+    ) -> None:
+        """Concurrent creates should serialize on the workspace counter row."""
+        await cases_service.fields._ensure_schema_ready()
+        await cases_service.session.commit()
+        assert session.bind is not None
+        session_factory = async_sessionmaker(bind=session.bind, expire_on_commit=False)
+
+        async def create_case(index: int) -> int:
+            async with session_factory() as concurrent_session:
+                service = CasesService(
+                    session=concurrent_session,
+                    role=svc_role.model_copy(deep=True),
+                )
+                case = await service.create_case(
+                    CaseCreate(
+                        summary=f"Concurrent case {index}",
+                        description=f"Concurrent case {index}",
+                        status=CaseStatus.NEW,
+                        priority=CasePriority.MEDIUM,
+                        severity=CaseSeverity.LOW,
+                    )
+                )
+                return case.case_number
+
+        with patch.object(
+            CaseFieldsService,
+            "_ensure_schema_ready",
+            new=AsyncMock(return_value=None),
+        ):
+            case_numbers = await asyncio.gather(*(create_case(i) for i in range(5)))
+
+        assert sorted(case_numbers) == [1, 2, 3, 4, 5]
+
+        async with session_factory() as verification_session:
+            workspace = await verification_session.scalar(
+                select(Workspace).where(Workspace.id == svc_workspace.id)
+            )
+            assert workspace is not None
+            assert workspace.last_case_number == 5
+
+            stored_case_numbers = (
+                await verification_session.execute(
+                    select(Case.case_number).where(
+                        Case.workspace_id == svc_workspace.id
+                    )
+                )
+            ).scalars()
+            assert sorted(stored_case_numbers.all()) == [1, 2, 3, 4, 5]
 
     async def test_list_cases_with_limit(
         self, cases_service: CasesService, case_create_params: CaseCreate
@@ -165,7 +416,7 @@ class TestCasesService:
             )
 
         # List cases with limit
-        cases = await cases_service.list_cases(limit=2)
+        cases = await _list_cases(cases_service, limit=2)
         assert len(cases) == 2
 
     async def test_list_cases_with_order_by(self, cases_service: CasesService) -> None:
@@ -191,8 +442,8 @@ class TestCasesService:
             )
         )
 
-        # Test ordering by priority (default ascending)
-        cases = await cases_service.list_cases(order_by="priority")
+        # Test ordering by priority ascending
+        cases = await _list_cases(cases_service, order_by="priority", sort="asc")
 
         # Verify cases are ordered correctly (low priority should come first)
         # Find the indices of our test cases
@@ -237,7 +488,7 @@ class TestCasesService:
         )
 
         # Test explicit ascending ordering by severity
-        cases = await cases_service.list_cases(order_by="severity", sort="asc")
+        cases = await _list_cases(cases_service, order_by="severity", sort="asc")
 
         # Find the indices of our test cases
         low_idx = next(
@@ -281,7 +532,7 @@ class TestCasesService:
         )
 
         # Test descending ordering by status
-        cases = await cases_service.list_cases(order_by="status", sort="desc")
+        cases = await _list_cases(cases_service, order_by="status", sort="desc")
 
         # Find the indices of our test cases
         new_idx = next(
@@ -328,7 +579,7 @@ class TestCasesService:
         )
 
         # Test ascending order (oldest first)
-        asc_cases = await cases_service.list_cases(order_by="created_at", sort="asc")
+        asc_cases = await _list_cases(cases_service, order_by="created_at", sort="asc")
 
         # Find the indices of our test cases
         first_idx_asc = next(
@@ -346,7 +597,9 @@ class TestCasesService:
         assert first_idx_asc < second_idx_asc
 
         # Test descending order (newest first)
-        desc_cases = await cases_service.list_cases(order_by="created_at", sort="desc")
+        desc_cases = await _list_cases(
+            cases_service, order_by="created_at", sort="desc"
+        )
 
         # Find the indices of our test cases
         first_idx_desc = next(
@@ -480,8 +733,9 @@ class TestCasesService:
         # Create case without initial field values
         created_case = await cases_service.create_case(case_create_params)
 
-        # Verify case was created with empty fields
-        assert created_case.fields is not None
+        # Verify case was created and has a field values row
+        fields_before = await cases_service.fields.get_fields(created_case)
+        assert fields_before is not None
 
         # Update parameters including fields
         update_params = CaseUpdate(
@@ -495,8 +749,103 @@ class TestCasesService:
         # Verify fields were updated
         assert updated_case.summary == "Updated Test Case"
         fields = await cases_service.fields.get_fields(updated_case)
+        assert fields is not None
         assert fields["field1"] == "updated_value"
         assert fields["field2"] == 2
+
+    async def test_create_case_with_dropdown_values(
+        self, cases_service: CasesService, case_create_params: CaseCreate
+    ) -> None:
+        """Test creating a case with dropdown values."""
+        definition, option = await _create_dropdown_with_option(
+            cases_service,
+            definition_name="Environment",
+            definition_ref="environment",
+            option_label="Production",
+            option_ref="prod",
+        )
+        params = CaseCreate(
+            summary=case_create_params.summary,
+            description=case_create_params.description,
+            status=case_create_params.status,
+            priority=case_create_params.priority,
+            severity=case_create_params.severity,
+            dropdown_values=[
+                CaseDropdownValueInput(
+                    definition_ref=definition.ref,
+                    option_ref=option.ref,
+                )
+            ],
+        )
+
+        created_case = await cases_service.create_case(params)
+
+        dropdowns_service = CaseDropdownValuesService(
+            session=cases_service.session, role=cases_service.role
+        )
+        values = await dropdowns_service.list_values_for_case(created_case.id)
+        assert len(values) == 1
+        assert values[0].definition_id == definition.id
+        assert values[0].option_id == option.id
+
+    async def test_update_case_with_dropdown_values(
+        self, cases_service: CasesService, case_create_params: CaseCreate
+    ) -> None:
+        """Test updating a case with dropdown values."""
+        definition, initial_option = await _create_dropdown_with_option(
+            cases_service,
+            definition_name="Triage",
+            definition_ref="triage",
+            option_label="Needs Review",
+            option_ref="needs_review",
+        )
+        definitions_service = CaseDropdownDefinitionsService(
+            session=cases_service.session, role=cases_service.role
+        )
+        target_option = await definitions_service.add_option(
+            definition.id,
+            CaseDropdownOptionCreate(
+                label="Escalated",
+                ref="escalated",
+                position=1,
+            ),
+        )
+
+        created_case = await cases_service.create_case(
+            CaseCreate(
+                summary=case_create_params.summary,
+                description=case_create_params.description,
+                status=case_create_params.status,
+                priority=case_create_params.priority,
+                severity=case_create_params.severity,
+                dropdown_values=[
+                    CaseDropdownValueInput(
+                        definition_id=definition.id,
+                        option_id=initial_option.id,
+                    )
+                ],
+            )
+        )
+
+        await cases_service.update_case(
+            created_case,
+            CaseUpdate(
+                dropdown_values=[
+                    CaseDropdownValueInput(
+                        definition_id=definition.id,
+                        option_ref="escalated",
+                    )
+                ]
+            ),
+        )
+
+        dropdowns_service = CaseDropdownValuesService(
+            session=cases_service.session, role=cases_service.role
+        )
+        values = await dropdowns_service.list_values_for_case(created_case.id)
+        assert len(values) == 1
+        assert values[0].definition_id == definition.id
+        assert values[0].option_id == target_option.id
 
     async def test_delete_case(
         self, cases_service: CasesService, case_create_params: CaseCreate
@@ -526,11 +875,11 @@ class TestCasesService:
             fields={"custom_field1": "test value", "custom_field2": 123},
         )
 
-        # Mock the create_field_values method
+        # Mock the upsert_field_values method
         with patch.object(
-            cases_service.fields, "create_field_values"
-        ) as mock_insert_fields:
-            mock_insert_fields.return_value = {
+            cases_service.fields, "upsert_field_values"
+        ) as mock_upsert_fields:
+            mock_upsert_fields.return_value = {
                 "custom_field1": "test value",
                 "custom_field2": 123,
             }
@@ -542,8 +891,8 @@ class TestCasesService:
             assert created_case.summary == params_with_fields.summary
             assert created_case.description == params_with_fields.description
 
-            # Verify that create_field_values was called with the case and fields
-            mock_insert_fields.assert_called_once_with(
+            # Verify that upsert_field_values was called with the case and fields
+            mock_upsert_fields.assert_called_once_with(
                 created_case, {"custom_field1": "test value", "custom_field2": 123}
             )
 
@@ -553,20 +902,13 @@ class TestCasesService:
         """Test updating just the fields of a case."""
         # Create a case first
         created_case = await cases_service.create_case(case_create_params)
-
         # Mock the field methods
         with (
             patch.object(cases_service.fields, "get_fields") as mock_get_fields,
             patch.object(
-                cases_service.fields, "update_field_values"
-            ) as mock_update_fields,
+                cases_service.fields, "upsert_field_values"
+            ) as mock_upsert_fields,
         ):
-            # Set case.fields using SQLAlchemy's __dict__ to bypass SQLModel's setattr checks
-            fields_obj = MagicMock()
-            fields_obj.id = uuid.uuid4()
-            # Use __dict__ directly to avoid SQLModel setattr validation
-            created_case.__dict__["fields"] = fields_obj
-
             # Setup mock to return existing field values
             mock_get_fields.return_value = {
                 "existing_field1": "original value",
@@ -584,14 +926,10 @@ class TestCasesService:
             # Verify get_fields was called
             mock_get_fields.assert_called_once_with(created_case)
 
-            # Verify update_field_values was called with merged fields
-            mock_update_fields.assert_called_once_with(
-                fields_obj.id,
-                {
-                    "existing_field1": "updated value",
-                    "existing_field2": 456,
-                    "new_field": "new value",
-                },
+            # Verify upsert_field_values was called with the fields (not merged)
+            mock_upsert_fields.assert_called_once_with(
+                created_case,
+                {"existing_field1": "updated value", "new_field": "new value"},
             )
 
     async def test_cascade_delete(
@@ -618,17 +956,11 @@ class TestCasesService:
         # relationship configuration, which should automatically handle
         # deleting related fields when a case is deleted
 
-    async def test_search_cases_with_date_filters(
+    async def test_search_cases_aliases_list_cases(
         self, cases_service: CasesService
     ) -> None:
-        """Test searching cases with date filtering capabilities."""
-        from datetime import UTC, datetime, timedelta
-
-        # Create cases with specific timing
-        base_time = datetime.now(UTC)
-
-        # Create first case
-        first_case = await cases_service.create_case(
+        """search_cases should match default list_cases behavior when unfiltered."""
+        await cases_service.create_case(
             CaseCreate(
                 summary="First Case",
                 description="This is the first case",
@@ -637,63 +969,284 @@ class TestCasesService:
                 severity=CaseSeverity.LOW,
             )
         )
-        first_created = first_case.created_at
-
-        # Wait a bit and create second case
         await asyncio.sleep(0.01)
-
-        second_case = await cases_service.create_case(
+        await cases_service.create_case(
             CaseCreate(
                 summary="Second Case",
                 description="This is the second case",
-                status=CaseStatus.NEW,
+                status=CaseStatus.IN_PROGRESS,
                 priority=CasePriority.HIGH,
                 severity=CaseSeverity.MEDIUM,
             )
         )
-        second_created = second_case.created_at
 
-        # Test filtering by start_time
-        cases = await cases_service.search_cases(
-            start_time=first_created - timedelta(seconds=1)
+        params = CursorPaginationParams(limit=10, cursor=None, reverse=False)
+        list_response = await cases_service.list_cases(
+            limit=10,
+            order_by="created_at",
+            sort="asc",
         )
-        case_ids = {case.id for case in cases}
-        assert first_case.id in case_ids
-        assert second_case.id in case_ids
-
-        # Test filtering by end_time (should exclude second case)
-        cases = await cases_service.search_cases(
-            end_time=first_created + timedelta(milliseconds=5)
+        search_response = await cases_service.search_cases(
+            params=params,
+            order_by="created_at",
+            sort="asc",
         )
-        case_ids = {case.id for case in cases}
-        assert first_case.id in case_ids
-        assert second_case.id not in case_ids
 
-        # Test filtering by updated_after (should find second case)
-        cases = await cases_service.search_cases(updated_after=first_created)
-        case_ids = {case.id for case in cases}
-        assert second_case.id in case_ids
+        assert search_response.model_dump() == list_response.model_dump()
 
-        # Test filtering by updated_before (should find first case)
-        cases = await cases_service.search_cases(updated_before=second_created)
-        case_ids = {case.id for case in cases}
-        assert first_case.id in case_ids
-
-        # Test combining date filters with other search parameters
-        cases = await cases_service.search_cases(
-            priority=CasePriority.HIGH,
-            start_time=first_created,
-            end_time=base_time + timedelta(minutes=1),
+    async def test_search_cases_tag_filter_uses_or_logic(
+        self, cases_service: CasesService
+    ) -> None:
+        """Multiple tag filters should match cases that have any selected tag."""
+        tags_service = CaseTagsService(
+            session=cases_service.session,
+            role=cases_service.role,
         )
-        case_ids = {case.id for case in cases}
-        assert second_case.id in case_ids
-        assert first_case.id not in case_ids  # Different priority
+        tag_one = await tags_service.create_tag(
+            TagCreate(name="Tag One", color="#111111")
+        )
+        tag_two = await tags_service.create_tag(
+            TagCreate(name="Tag Two", color="#222222")
+        )
+
+        case_with_first_tag = await cases_service.create_case(
+            CaseCreate(
+                summary="Case with first tag",
+                description="Case linked to first tag",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        case_with_second_tag = await cases_service.create_case(
+            CaseCreate(
+                summary="Case with second tag",
+                description="Case linked to second tag",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        unrelated_case = await cases_service.create_case(
+            CaseCreate(
+                summary="Untagged case",
+                description="Case without matching tags",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+
+        await tags_service.add_case_tag(case_with_first_tag.id, str(tag_one.id))
+        await tags_service.add_case_tag(case_with_second_tag.id, str(tag_two.id))
+
+        params = CursorPaginationParams(limit=20, cursor=None, reverse=False)
+        response = await cases_service.search_cases(
+            params=params,
+            tag_ids=[tag_one.id, tag_two.id],
+            order_by="created_at",
+            sort="asc",
+        )
+
+        result_ids = {item.id for item in response.items}
+        assert case_with_first_tag.id in result_ids
+        assert case_with_second_tag.id in result_ids
+        assert unrelated_case.id not in result_ids
+
+    async def test_search_cases_short_id_exact_match(
+        self, cases_service: CasesService
+    ) -> None:
+        """short_id filtering should match the exact case short ID only."""
+        target_case = await cases_service.create_case(
+            CaseCreate(
+                summary="Target case",
+                description="Contains search target",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        await asyncio.sleep(0.01)
+        other_case = await cases_service.create_case(
+            CaseCreate(
+                summary="Other case",
+                description="Should not match target fragment",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+
+        params = CursorPaginationParams(limit=20, cursor=None, reverse=False)
+        response = await cases_service.search_cases(
+            params=params,
+            short_id=target_case.short_id,
+            order_by="created_at",
+            sort="asc",
+        )
+
+        result_ids = {item.id for item in response.items}
+        assert target_case.id in result_ids
+        assert other_case.id not in result_ids
+
+        # Partial strings should not match case short IDs.
+        non_exact_short_id = (
+            str(target_case.case_number * 10)
+            if target_case.case_number < 10
+            else str(target_case.case_number)[:-1]
+        )
+        non_exact_response = await cases_service.search_cases(
+            params=params,
+            short_id=non_exact_short_id,
+            order_by="created_at",
+            sort="asc",
+        )
+        non_exact_ids = {item.id for item in non_exact_response.items}
+        assert target_case.id not in non_exact_ids
+
+    async def test_search_cases_short_id_rejects_invalid_value(
+        self, cases_service: CasesService
+    ) -> None:
+        """short_id filtering should reject non-numeric case identifiers."""
+        params = CursorPaginationParams(limit=20, cursor=None, reverse=False)
+        with pytest.raises(
+            ValueError, match="Short ID must match CASE-<number> or <number>"
+        ):
+            await cases_service.search_cases(
+                params=params,
+                short_id="CASE-ABCD",
+            )
+
+    async def test_get_search_case_aggregates_applies_enum_filters(
+        self, cases_service: CasesService, session: AsyncSession
+    ) -> None:
+        """Aggregate counts should respect include/exclude enum filters."""
+        now = datetime.now(UTC)
+        session.add_all(
+            [
+                Case(
+                    workspace_id=cases_service.workspace_id,
+                    case_number=1,
+                    summary="Case A",
+                    description="A",
+                    status=CaseStatus.NEW,
+                    priority=CasePriority.MEDIUM,
+                    severity=CaseSeverity.LOW,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                Case(
+                    workspace_id=cases_service.workspace_id,
+                    case_number=2,
+                    summary="Case B",
+                    description="B",
+                    status=CaseStatus.IN_PROGRESS,
+                    priority=CasePriority.HIGH,
+                    severity=CaseSeverity.MEDIUM,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                Case(
+                    workspace_id=cases_service.workspace_id,
+                    case_number=3,
+                    summary="Case C",
+                    description="C",
+                    status=CaseStatus.ON_HOLD,
+                    priority=CasePriority.HIGH,
+                    severity=CaseSeverity.HIGH,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                Case(
+                    workspace_id=cases_service.workspace_id,
+                    case_number=4,
+                    summary="Case D",
+                    description="D",
+                    status=CaseStatus.RESOLVED,
+                    priority=CasePriority.CRITICAL,
+                    severity=CaseSeverity.HIGH,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                Case(
+                    workspace_id=cases_service.workspace_id,
+                    case_number=5,
+                    summary="Case E",
+                    description="E",
+                    status=CaseStatus.CLOSED,
+                    priority=CasePriority.LOW,
+                    severity=CaseSeverity.LOW,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+        )
+        await session.commit()
+
+        aggregates = await cases_service.get_search_case_aggregates(
+            status=[CaseStatus.IN_PROGRESS, CaseStatus.RESOLVED],
+            priority=[CasePriority.HIGH, CasePriority.CRITICAL],
+            severity=[CaseSeverity.MEDIUM, CaseSeverity.HIGH],
+        )
+
+        assert aggregates.total == 2
+        assert aggregates.status_groups.new == 0
+        assert aggregates.status_groups.in_progress == 1
+        assert aggregates.status_groups.on_hold == 0
+        assert aggregates.status_groups.resolved == 1
+        assert aggregates.status_groups.closed == 0
+        assert aggregates.status_groups.unknown == 0
+        assert aggregates.status_groups.other == 0
+
+    async def test_get_search_case_aggregates_excludes_unknown_from_other(
+        self, cases_service: CasesService, session: AsyncSession
+    ) -> None:
+        """`other` aggregate should not include cases with `unknown` status."""
+
+        now = datetime.now(UTC)
+        session.add_all(
+            [
+                Case(
+                    workspace_id=cases_service.workspace_id,
+                    case_number=1,
+                    summary="Other status case",
+                    description="Other",
+                    status=CaseStatus.OTHER,
+                    priority=CasePriority.MEDIUM,
+                    severity=CaseSeverity.MEDIUM,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                Case(
+                    workspace_id=cases_service.workspace_id,
+                    case_number=2,
+                    summary="Unknown status case",
+                    description="Unknown",
+                    status=CaseStatus.UNKNOWN,
+                    priority=CasePriority.MEDIUM,
+                    severity=CaseSeverity.MEDIUM,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+        )
+        await session.commit()
+
+        aggregates = await cases_service.get_search_case_aggregates()
+
+        assert aggregates.total == 2
+        assert aggregates.status_groups.new == 0
+        assert aggregates.status_groups.in_progress == 0
+        assert aggregates.status_groups.on_hold == 0
+        assert aggregates.status_groups.resolved == 0
+        assert aggregates.status_groups.closed == 0
+        assert aggregates.status_groups.unknown == 1
+        assert aggregates.status_groups.other == 1
 
     async def test_create_case_with_nonexistent_field(
         self, cases_service: CasesService
     ) -> None:
         """Test creating a case with a field that doesn't exist in the schema."""
-        from tracecat.types.exceptions import TracecatException
 
         params = CaseCreate(
             summary="Test Case",
@@ -704,18 +1257,15 @@ class TestCasesService:
             fields={"nonexistent_field": "some value"},
         )
 
-        # Should raise TracecatException with clear message about undefined field
-        with pytest.raises(TracecatException) as exc_info:
+        # Should raise ValueError with clear message about undefined column
+        with pytest.raises(ValueError):
             await cases_service.create_case(params)
-
-        # Error message should mention that field doesn't exist
-        assert "custom fields do not exist" in str(exc_info.value).lower()
 
     async def test_create_case_fields_update_fails(
         self, cases_service: CasesService, case_create_params: CaseCreate, mocker
     ) -> None:
         """Test that case creation is atomic when field update fails."""
-        from tracecat.types.exceptions import TracecatException, TracecatNotFoundError
+        from tracecat.exceptions import TracecatException, TracecatNotFoundError
 
         # Add fields to the params
         params_with_fields = CaseCreate(
@@ -747,14 +1297,13 @@ class TestCasesService:
         )  # Should not expose DB details
 
         # Verify the case was NOT created (transaction rolled back)
-        cases = await cases_service.list_cases()
+        cases = await _list_cases(cases_service)
         assert len(cases) == 0
 
     async def test_create_case_atomic_rollback_on_field_error(
         self, cases_service: CasesService
     ) -> None:
         """Test that case creation is fully atomic - if fields fail, case also rolls back."""
-        from tracecat.types.exceptions import TracecatException
 
         # Try to create case with invalid field
         params = CaseCreate(
@@ -767,9 +1316,9 @@ class TestCasesService:
         )
 
         # Should fail
-        with pytest.raises(TracecatException):
+        with pytest.raises(ValueError):
             await cases_service.create_case(params)
 
         # Verify the case was NOT created (entire transaction rolled back)
-        cases = await cases_service.list_cases()
+        cases = await _list_cases(cases_service)
         assert len(cases) == 0, "Case should not exist if fields creation failed"

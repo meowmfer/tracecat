@@ -18,7 +18,10 @@ def register(
     namespace: str = DEFAULT_NAMESPACE,
     description: str,
     secrets: list[RegistrySecretType] | None = None,
+    # Options
     include_in_schema: bool = True,
+    requires_approval: bool = False,
+    required_entitlements: list[str] | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator factory to register a new UDF (User-Defined Function) with additional parameters.
 
@@ -47,6 +50,10 @@ def register(
         The version of the UDF, by default None.
     include_in_schema : bool, optional
         Whether to include this UDF in the API schema, by default True.
+    requires_approval : bool, optional
+        Whether to require approval for this UDF, by default False.
+    required_entitlements : list[str] | None, optional
+        Entitlements required to list/use this UDF, by default None.
 
     Returns
     -------
@@ -99,6 +106,8 @@ def register(
                 "namespace": namespace,
                 "description": description,
                 "secrets": [s.model_dump() for s in secrets] if secrets else None,
+                "requires_approval": requires_approval,
+                "required_entitlements": required_entitlements,
             },
         )
         return fn

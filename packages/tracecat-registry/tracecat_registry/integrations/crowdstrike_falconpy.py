@@ -6,6 +6,7 @@ from falconpy import APIHarnessV2
 from pydantic import Field
 
 from tracecat_registry import RegistrySecret, registry, secrets
+from tracecat_registry.context import get_context
 
 crowdstrike_secret = RegistrySecret(
     name="crowdstrike",
@@ -44,11 +45,30 @@ async def call_command(
         str | None,
         Field(..., description="Multi-tenant customer ID"),
     ] = None,
+    base_url: Annotated[
+        str | None,
+        Field(..., description="Base URL for the Falcon API"),
+    ] = None,
+    extra_kwargs: Annotated[
+        dict[str, Any] | None,
+        Field(..., description="Extra keyword arguments to pass to the Falcon API"),
+    ] = None,
 ) -> Any:
     params = params or {}
+    extra_kwargs = extra_kwargs or {}
+
+    # Resolve base_url: parameter takes precedence, then workspace variable
+    resolved_base_url = base_url
+    if not resolved_base_url:
+        resolved_base_url = await get_context().variables.get_or_default(
+            "crowdstrike", "base_url", None
+        )
+
     falcon = APIHarnessV2(
+        base_url=resolved_base_url,
         client_id=secrets.get("CROWDSTRIKE_CLIENT_ID"),
         client_secret=secrets.get("CROWDSTRIKE_CLIENT_SECRET"),
         member_cid=member_cid,
+        **extra_kwargs,
     )
     return falcon.command(operation_id, **params)

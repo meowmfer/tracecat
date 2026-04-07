@@ -48,7 +48,9 @@ const nextConfig = {
                   "frame-ancestors 'none'",
                   "img-src 'self' data:",
                   "object-src 'none'",
+                  "base-uri 'self'",
                   "script-src 'self' 'unsafe-inline' https://*.posthog.com",
+                  "script-src-attr 'none'",
                   "style-src 'self' 'unsafe-inline'",
                 ].join("; ")
               : [
@@ -58,11 +60,22 @@ const nextConfig = {
                   "frame-ancestors 'none'",
                   "img-src 'self' data:",
                   "object-src 'none'",
+                  "base-uri 'self'",
                   "script-src 'self' 'unsafe-inline'",
+                  "script-src-attr 'none'",
                   "style-src 'self' 'unsafe-inline'",
                 ].join("; "),
           },
         ],
+      },
+    ]
+  },
+  redirects: async () => {
+    return [
+      {
+        source: "/workspaces/:workspaceId/agents/presets/:path*",
+        destination: "/workspaces/:workspaceId/agents/:path*",
+        permanent: true,
       },
     ]
   },

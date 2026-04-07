@@ -42,6 +42,13 @@ import { cn } from "@/lib/utils"
 
 import type { DataTableToolbarProps } from "./toolbar"
 
+type ColumnMeta = {
+  headerClassName?: string
+  headerStyle?: React.CSSProperties
+  cellClassName?: string
+  cellStyle?: React.CSSProperties
+}
+
 export type TableCol<TData> = {
   table: ReturnType<typeof useReactTable<TData>>
   column: Column<TData>
@@ -152,6 +159,7 @@ export function DataTable<TData, TValue>({
     getFacetedRowModel: getFacetedRowModel(),
     getFacetedUniqueValues: getFacetedUniqueValues(),
     manualPagination: !!serverSidePagination,
+    manualSorting: !!serverSidePagination,
     pageCount: serverSidePagination ? -1 : undefined,
   })
 
@@ -168,6 +176,16 @@ export function DataTable<TData, TValue>({
     setRowSelection({})
   }, [clearSelectionTrigger])
 
+  // Notify parent of sorting changes for server-side pagination
+  React.useEffect(() => {
+    if (serverSidePagination?.onSortingChange && sorting.length > 0) {
+      const sort = sorting[0]
+      serverSidePagination.onSortingChange(sort.id, sort.desc ? "desc" : "asc")
+    } else if (serverSidePagination?.onSortingChange && sorting.length === 0) {
+      serverSidePagination.onSortingChange("", false)
+    }
+  }, [sorting])
+
   // Handle initial sync when data is first loaded
   const [hasData, setHasData] = React.useState(false)
   React.useEffect(() => {
@@ -183,7 +201,7 @@ export function DataTable<TData, TValue>({
 
   return (
     <div>
-      <div className="space-y-4">
+      <div className="space-y-4 w-full">
         {toolbarProps && (
           <DataTableToolbar
             table={table}
@@ -191,12 +209,16 @@ export function DataTable<TData, TValue>({
             onDeleteRows={onDeleteRows}
           />
         )}
-        <div className="rounded-md border">
+        <div className="rounded-md border w-full overflow-hidden">
           <Table>
             <TableHeader>
               {table.getHeaderGroups().map((headerGroup) => (
                 <TableRow key={headerGroup.id}>
                   {headerGroup.headers.map((header) => {
+                    const columnMeta = header.column.columnDef.meta as
+                      | ColumnMeta
+                      | undefined
+
                     return (
                       <AuxClickMenu
                         key={header.id}
@@ -207,8 +229,10 @@ export function DataTable<TData, TValue>({
                           colSpan={header.colSpan}
                           className={cn(
                             header.column.id?.toString().toLowerCase() ===
-                              "actions" && "text-right"
+                              "actions" && "text-right",
+                            columnMeta?.headerClassName
                           )}
+                          style={columnMeta?.headerStyle}
                         >
                           {header.isPlaceholder
                             ? null
@@ -333,20 +357,29 @@ function TableContents<TData>({
             className="cursor-pointer"
           >
             {row.getVisibleCells().map((cell) => {
-              const isActionsCol =
-                cell.column.id?.toString().toLowerCase() === "actions"
+              const columnId = cell.column.id?.toString().toLowerCase()
+              const isActionsCol = columnId === "actions"
+              const isSelectCol = columnId === "select"
+              const columnMeta = cell.column.columnDef.meta as
+                | ColumnMeta
+                | undefined
+              const cellClassName = cn(
+                columnMeta?.cellClassName,
+                isActionsCol && "p-2"
+              )
 
               const content = flexRender(
                 cell.column.columnDef.cell,
                 cell.getContext()
               )
 
-              // For action columns, don't wrap in Link
-              if (isActionsCol || !href) {
+              // For action and select columns, don't wrap in Link
+              if (isActionsCol || isSelectCol || !href) {
                 return (
                   <TableCell
                     key={cell.id}
-                    className={cn(isActionsCol && "p-2")}
+                    className={cellClassName}
+                    style={columnMeta?.cellStyle}
                   >
                     {isActionsCol ? (
                       <div className="flex justify-end">{content}</div>
@@ -359,8 +392,16 @@ function TableContents<TData>({
 
               // For regular cells with href, wrap content in Link
               return (
-                <TableCell key={cell.id}>
-                  <Link href={href} prefetch={false} className="block -m-2 p-2">
+                <TableCell
+                  key={cell.id}
+                  className={cellClassName}
+                  style={columnMeta?.cellStyle}
+                >
+                  <Link
+                    href={href}
+                    prefetch={false}
+                    className="block w-full -m-2 p-2"
+                  >
                     {content}
                   </Link>
                 </TableCell>

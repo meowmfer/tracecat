@@ -1,266 +1,151 @@
-import inspect
-from typing import Any, get_args
+"""Unit tests for agent tools module.
+
+Tests the harness-agnostic tool creation and execution:
+- Tool dataclass construction
+- ToolExecutionError exception
+- denormalize_tool_name utility
+- create_tool_from_registry
+"""
 
 import pytest
-from pydantic import BaseModel, Field, TypeAdapter
-from pydantic_core import PydanticUndefined
 
 from tracecat.agent.tools import (
-    _create_function_signature,
-    _extract_action_metadata,
-    _generate_google_style_docstring,
+    ToolExecutionError,
+    denormalize_tool_name,
 )
-from tracecat.expressions.expectations import ExpectedField
-from tracecat.registry.actions.models import (
-    ActionStep,
-    BoundRegistryAction,
-    TemplateAction,
-    TemplateActionDefinition,
-)
-from tracecat.registry.repository import Repository
+from tracecat.agent.types import Tool
+
+# =============================================================================
+# Tool Dataclass Tests
+# =============================================================================
 
 
-class DummyField:
-    """Minimal stub that mimics the parts of Pydantic's FieldInfo needed for tests."""
+class TestToolDataclass:
+    """Tests for the harness-agnostic Tool dataclass."""
 
-    def __init__(
-        self,
-        annotation: Any,
-        *,
-        default: Any = PydanticUndefined,
-        default_factory: Any = None,
-    ):
-        self.annotation = annotation
-        self.default = default
-        self.default_factory = default_factory
+    def test_tool_creation_with_required_fields(self):
+        """Test Tool creation with required fields."""
+        tool = Tool(
+            name="core.http_request",
+            description="Make an HTTP request",
+            parameters_json_schema={"type": "object", "properties": {}},
+        )
 
+        assert tool.name == "core.http_request"
+        assert tool.description == "Make an HTTP request"
+        assert tool.parameters_json_schema == {"type": "object", "properties": {}}
+        assert tool.requires_approval is False
 
-class ExampleModel:
-    """Stub model that provides Pydantic-like field metadata and schema information."""
+    def test_tool_creation_with_approval(self):
+        """Test Tool creation with requires_approval=True."""
+        tool = Tool(
+            name="core.cases.delete_case",
+            description="Delete a case permanently",
+            parameters_json_schema={"type": "object"},
+            requires_approval=True,
+        )
 
-    model_fields = {
-        "required": DummyField(int),
-        "with_default": DummyField(str, default="hello"),
-        "with_factory": DummyField(list[int], default_factory=list),
-        "already_optional": DummyField(int | None, default_factory=lambda: 42),
-        "class": DummyField(bool),
-    }
+        assert tool.name == "core.cases.delete_case"
+        assert tool.requires_approval is True
 
-    @staticmethod
-    def model_json_schema():
-        return {
+    def test_tool_uses_canonical_name_with_dots(self):
+        """Test that Tool stores canonical names with dots (not underscores)."""
+        tool = Tool(
+            name="tools.slack.post_message",
+            description="Post a message to Slack",
+            parameters_json_schema={},
+        )
+
+        assert "." in tool.name
+        assert "__" not in tool.name
+
+    def test_tool_with_complex_schema(self):
+        """Test Tool with a complex JSON schema."""
+        schema = {
+            "type": "object",
             "properties": {
-                "required": {"description": "Required field"},
-                "with_default": {"description": "Field with default"},
-                "with_factory": {"description": "Generated value"},
-                "already_optional": {},
-                "class": {"description": "Keyword field"},
-            }
+                "url": {"type": "string", "description": "The URL to request"},
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST", "PUT", "DELETE"],
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["url", "method"],
         }
 
+        tool = Tool(
+            name="core.http_request",
+            description="Make an HTTP request",
+            parameters_json_schema=schema,
+        )
 
-def test_create_function_signature_handles_defaults_and_sanitizes():
-    result = _create_function_signature(ExampleModel, fixed_args={"with_default"})
-
-    params = result.signature.parameters
-    assert list(params) == ["required", "with_factory", "already_optional", "class_"]
-
-    required = params["required"]
-    assert required.kind is inspect.Parameter.KEYWORD_ONLY
-    assert required.annotation is int
-    assert required.default is inspect.Parameter.empty
-
-    with_factory = params["with_factory"]
-    assert with_factory.default is None
-    assert with_factory.kind is inspect.Parameter.KEYWORD_ONLY
-    assert with_factory.annotation == result.annotations["with_factory"]
-    assert get_args(with_factory.annotation) == (list[int], type(None))
-
-    already_optional = params["already_optional"]
-    assert already_optional.default is None
-    assert already_optional.annotation == int | None
-
-    class_param = params["class_"]
-    assert class_param.annotation is bool
-    assert class_param.default is inspect.Parameter.empty
-
-    assert "with_default" not in params
-    assert result.annotations["return"] is Any
-    assert result.param_mapping["class_"] == "class"
+        assert tool.parameters_json_schema == schema
+        assert "required" in tool.parameters_json_schema
 
 
-def test_generate_docstring_includes_schema_descriptions_and_skips_fixed_args():
-    docstring = _generate_google_style_docstring(
-        "Do something useful", ExampleModel, fixed_args={"with_default"}
-    )
-
-    expected = "\n".join(
-        [
-            "Do something useful",
-            "",
-            "Args:",
-            "    required: Required field",
-            "    with_factory: Generated value",
-            "    already_optional: Parameter already_optional",
-            "    class: Keyword field",
-        ]
-    )
-
-    assert docstring == expected
+# =============================================================================
+# ToolExecutionError Tests
+# =============================================================================
 
 
-def test_generate_docstring_returns_none_section_when_no_parameters():
-    class EmptyModel:
-        @staticmethod
-        def model_json_schema():
-            return {}
+class TestToolExecutionError:
+    """Tests for ToolExecutionError exception."""
 
-    docstring = _generate_google_style_docstring(
-        "No parameters here", EmptyModel, fixed_args=set()
-    )
-    assert docstring == "No parameters here\n\nArgs:\n    None"
+    def test_error_with_message(self):
+        """Test ToolExecutionError with a message."""
+        error = ToolExecutionError("Action execution failed: timeout")
 
+        assert str(error) == "Action execution failed: timeout"
+        assert isinstance(error, Exception)
 
-def test_generate_docstring_raises_when_description_missing():
-    with pytest.raises(ValueError):
-        _generate_google_style_docstring(None, ExampleModel)
+    def test_error_can_be_raised_and_caught(self):
+        """Test that ToolExecutionError can be raised and caught."""
+        with pytest.raises(ToolExecutionError) as exc_info:
+            raise ToolExecutionError("Something went wrong")
 
+        assert "Something went wrong" in str(exc_info.value)
 
-class SampleArgs(BaseModel):
-    foo: int = Field(..., description="Foo argument")
-
-
-def sample_udf(foo: int) -> int:
-    return foo
+    def test_error_inheritance(self):
+        """Test that ToolExecutionError inherits from Exception."""
+        error = ToolExecutionError("test")
+        assert isinstance(error, Exception)
 
 
-def build_udf_action(
-    description: str = "Sample UDF description",
-) -> BoundRegistryAction:
-    repo = Repository()
-    repo.register_udf(
-        fn=sample_udf,
-        name="sample_udf",
-        type="udf",
-        namespace="test",
-        description=description,
-        secrets=None,
-        args_cls=SampleArgs,
-        args_docs={"foo": "Foo argument"},
-        rtype=int,
-        rtype_adapter=TypeAdapter(int),
-        default_title=None,
-        display_group=None,
-        doc_url=None,
-        author="Tracecat",
-        deprecated=None,
-        include_in_schema=True,
-    )
-    return repo.get("test.sample_udf")
+# =============================================================================
+# denormalize_tool_name Tests
+# =============================================================================
 
 
-def build_template_action(
-    *,
-    template_description: str = "Template action description",
-    expects_override: dict[str, ExpectedField] | None = None,
-) -> BoundRegistryAction:
-    repo = Repository()
-    expects = expects_override or {
-        "user_id": ExpectedField(type="int", description="User identifier"),
-        "message": ExpectedField(type="str", description="Message to send"),
-    }
-    template_def = TemplateActionDefinition(
-        name="send_message",
-        namespace="templates",
-        title="Send Message",
-        description=template_description,
-        display_group="Messaging",
-        doc_url="https://example.com",
-        author="Tracecat",
-        deprecated=None,
-        secrets=None,
-        expects=expects,
-        steps=[
-            ActionStep(
-                ref="first",
-                action="test.sample_udf",
-                args={"foo": 1},
-            )
-        ],
-        returns="result",
-    )
-    template_action = TemplateAction(type="action", definition=template_def)
-    repo.register_udf(
-        fn=sample_udf,
-        name="sample_udf",
-        type="udf",
-        namespace="test",
-        description="Sample UDF description",
-        secrets=None,
-        args_cls=SampleArgs,
-        args_docs={"foo": "Foo argument"},
-        rtype=int,
-        rtype_adapter=TypeAdapter(int),
-        default_title=None,
-        display_group=None,
-        doc_url=None,
-        author="Tracecat",
-        deprecated=None,
-        include_in_schema=True,
-    )
-    repo.register_template_action(template_action)
-    return repo.get("templates.send_message")
+class TestDenormalizeToolName:
+    """Tests for denormalize_tool_name utility."""
 
+    def test_converts_double_underscores_to_dots(self):
+        """Test conversion of MCP format to canonical format."""
+        result = denormalize_tool_name("core__http_request")
+        assert result == "core.http_request"
 
-def test_extract_action_metadata_udf_returns_description_and_args_model():
-    bound_action = build_udf_action()
-    description, model_cls = _extract_action_metadata(bound_action)
+    def test_handles_multiple_namespaces(self):
+        """Test conversion with multiple namespace levels."""
+        result = denormalize_tool_name("tools__slack__post_message")
+        assert result == "tools.slack.post_message"
 
-    assert description == "Sample UDF description"
-    assert model_cls is SampleArgs
+    def test_handles_canonical_name_unchanged(self):
+        """Test that canonical names without __ pass through."""
+        result = denormalize_tool_name("core.http_request")
+        assert result == "core.http_request"
 
+    def test_preserves_single_underscores(self):
+        """Test that single underscores are preserved."""
+        result = denormalize_tool_name("core__http_request")
+        assert result == "core.http_request"
+        # The action name part still has underscore
+        assert "_" in result
 
-def test_extract_action_metadata_template_uses_template_description():
-    bound_action = build_template_action()
-    description, model_cls = _extract_action_metadata(bound_action)
-
-    assert description == "Template action description"
-    assert issubclass(model_cls, BaseModel)
-    assert set(model_cls.model_fields) == {"user_id", "message"}
-    assert model_cls.model_fields["user_id"].annotation is int
-
-
-def test_extract_action_metadata_template_falls_back_to_bound_description():
-    bound_action = build_template_action(template_description="")
-    bound_action.description = "Fallback description"
-    assert bound_action.template_action is not None
-    bound_action.template_action.definition.description = ""
-
-    description, _ = _extract_action_metadata(bound_action)
-    assert description == "Fallback description"
-
-
-def test_extract_action_metadata_template_without_template_action_raises():
-    bound_action = BoundRegistryAction(
-        fn=sample_udf,
-        name="template_without_body",
-        namespace="tests",
-        description="Template missing body",
-        type="template",
-        origin="unit-test",
-        secrets=None,
-        args_cls=SampleArgs,
-        args_docs={"foo": "Foo argument"},
-        rtype_cls=int,
-        rtype_adapter=TypeAdapter(int),
-        default_title=None,
-        display_group=None,
-        doc_url=None,
-        author="Tracecat",
-        deprecated=None,
-        template_action=None,
-        include_in_schema=True,
-    )
-
-    with pytest.raises(ValueError):
-        _extract_action_metadata(bound_action)
+    def test_complex_nested_namespace(self):
+        """Test deeply nested namespaces."""
+        result = denormalize_tool_name("tools__integrations__aws__s3__list_buckets")
+        assert result == "tools.integrations.aws.s3.list_buckets"

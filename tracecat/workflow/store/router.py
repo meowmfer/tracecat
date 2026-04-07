@@ -1,20 +1,27 @@
 from fastapi import APIRouter, HTTPException, Query, status
 
+from tracecat import config
 from tracecat.auth.dependencies import WorkspaceUserRole
+from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.dsl.common import DSLInput
+from tracecat.exceptions import (
+    TracecatCredentialsNotFoundError,
+    TracecatSettingsError,
+    TracecatValidationError,
+)
 from tracecat.git.utils import parse_git_url
 from tracecat.identifiers.workflow import AnyWorkflowIDPath
 from tracecat.logger import logger
-from tracecat.registry.repositories.models import GitCommitInfo
+from tracecat.registry.repositories.schemas import GitBranchInfo, GitCommitInfo
 from tracecat.sync import PullOptions, PullResult
-from tracecat.types.exceptions import (
-    TracecatCredentialsNotFoundError,
-    TracecatSettingsError,
-)
 from tracecat.vcs.github.app import GitHubAppError
 from tracecat.workflow.management.definitions import WorkflowDefinitionsService
-from tracecat.workflow.store.models import WorkflowDslPublish, WorkflowSyncPullRequest
+from tracecat.workflow.store.schemas import (
+    WorkflowDslPublish,
+    WorkflowDslPublishResult,
+    WorkflowSyncPullRequest,
+)
 from tracecat.workflow.store.service import WorkflowStoreService
 from tracecat.workflow.store.sync import WorkflowSyncService
 from tracecat.workspaces.service import WorkspaceService
@@ -22,13 +29,17 @@ from tracecat.workspaces.service import WorkspaceService
 router = APIRouter(prefix="/workflows", tags=["workflows"])
 
 
-@router.post("/{workflow_id}/publish", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/{workflow_id}/publish",
+    response_model=WorkflowDslPublishResult,
+)
+@require_scope("workflow:update", "workflow:sync")
 async def publish_workflow(
     role: WorkspaceUserRole,
     session: AsyncDBSession,
     workflow_id: AnyWorkflowIDPath,
     params: WorkflowDslPublish,
-):
+) -> WorkflowDslPublishResult:
     if role.workspace_id is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Workspace ID is required"
@@ -45,7 +56,7 @@ async def publish_workflow(
     dsl = DSLInput.model_validate(defn.content)
     store_svc = WorkflowStoreService(session=session)
     try:
-        await store_svc.publish_workflow_dsl(
+        return await store_svc.publish_workflow_dsl(
             workflow_id=workflow_id,
             dsl=dsl,
             params=params,
@@ -56,7 +67,17 @@ async def publish_workflow(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         ) from e
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
     except TracecatCredentialsNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except GitHubAppError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
@@ -64,6 +85,7 @@ async def publish_workflow(
 
 
 @router.get("/sync/commits", response_model=list[GitCommitInfo])
+@require_scope("workflow:sync")
 async def list_workflow_commits(
     role: WorkspaceUserRole,
     session: AsyncDBSession,
@@ -74,10 +96,10 @@ async def list_workflow_commits(
         max_length=255,
     ),
     limit: int = Query(
-        default=10,
+        default=config.TRACECAT__LIMIT_COMMITS_DEFAULT,
         description="Maximum number of commits to return",
-        ge=1,
-        le=100,
+        ge=config.TRACECAT__LIMIT_MIN,
+        le=config.TRACECAT__LIMIT_CURSOR_MAX,
     ),
 ) -> list[GitCommitInfo]:
     """Get commit list for workflow repository via GitHub App.
@@ -126,6 +148,8 @@ async def list_workflow_commits(
 
         return commits
 
+    except HTTPException:
+        raise
     except ValueError as e:
         logger.error(f"Invalid repository URL: {repository_url}", exc_info=True)
         raise HTTPException(
@@ -141,8 +165,10 @@ async def list_workflow_commits(
             detail=f"Unable to access repository: {str(e)}",
         ) from e
     except Exception as e:
-        logger.exception(
-            f"Error fetching commits from repository: {repository_url}", exc_info=True
+        logger.error(
+            "Error fetching commits from repository",
+            repository_url=repository_url,
+            error=str(e),
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -150,7 +176,78 @@ async def list_workflow_commits(
         ) from e
 
 
+@router.get("/sync/branches", response_model=list[GitBranchInfo])
+@require_scope("workflow:sync")
+async def list_workflow_branches(
+    role: WorkspaceUserRole,
+    session: AsyncDBSession,
+    limit: int = Query(
+        default=config.TRACECAT__LIMIT_COMMITS_DEFAULT,
+        description="Maximum number of branches to return",
+        ge=config.TRACECAT__LIMIT_MIN,
+        le=config.TRACECAT__LIMIT_CURSOR_MAX,
+    ),
+) -> list[GitBranchInfo]:
+    """Get branch list for workflow repository via GitHub App."""
+    if not role.workspace_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Workspace ID is required",
+        )
+
+    repository_url = None
+    try:
+        workspace_service = WorkspaceService(session=session, role=role)
+        workspace = await workspace_service.get_workspace(role.workspace_id)
+
+        if not workspace:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Workspace not found",
+            )
+
+        repository_url = workspace.settings.get("git_repo_url")
+
+        if not repository_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Git repository URL not configured in workspace settings",
+            )
+
+        git_url = parse_git_url(repository_url)
+        sync_service = WorkflowSyncService(session=session, role=role)
+        branches = await sync_service.list_branches(url=git_url, limit=limit)
+        return branches
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.error(f"Invalid repository URL: {repository_url}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid repository URL: {str(e)}",
+        ) from e
+    except GitHubAppError as e:
+        logger.error(
+            f"GitHub App error accessing repository: {repository_url}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unable to access repository: {str(e)}",
+        ) from e
+    except Exception as e:
+        logger.error(
+            "Error fetching branches from repository",
+            repository_url=repository_url,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch repository branches",
+        ) from e
+
+
 @router.post("/sync/pull", response_model=PullResult)
+@require_scope("workflow:update", "workflow:sync")
 async def pull_workflows(
     role: WorkspaceUserRole,
     session: AsyncDBSession,

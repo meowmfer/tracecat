@@ -1,6 +1,13 @@
 "use client"
 
-import { BracesIcon, SquareStackIcon, TagIcon } from "lucide-react"
+import {
+  BracesIcon,
+  Flag,
+  LayersIcon,
+  ListIcon,
+  TagIcon,
+  Timer,
+} from "lucide-react"
 import Link from "next/link"
 import {
   Tooltip,
@@ -14,6 +21,9 @@ export enum CasesViewMode {
   Cases = "cases",
   Tags = "tags",
   CustomFields = "custom-fields",
+  Dropdowns = "dropdowns",
+  ClosureRequirements = "closure-requirements",
+  Durations = "durations",
 }
 
 interface CasesViewToggleProps {
@@ -23,6 +33,9 @@ interface CasesViewToggleProps {
   casesHref?: string
   tagsHref?: string
   customFieldsHref?: string
+  dropdownsHref?: string
+  closureRequirementsHref?: string
+  durationsHref?: string
 }
 
 export function CasesViewToggle({
@@ -32,6 +45,9 @@ export function CasesViewToggle({
   casesHref,
   tagsHref,
   customFieldsHref,
+  dropdownsHref,
+  closureRequirementsHref,
+  durationsHref,
 }: CasesViewToggleProps) {
   const handleViewChange = (view: CasesViewMode) => {
     onViewChange?.(view)
@@ -40,7 +56,7 @@ export function CasesViewToggle({
   const toggleItems = [
     {
       mode: CasesViewMode.Cases,
-      icon: SquareStackIcon,
+      icon: LayersIcon,
       tooltip: "Cases table",
       href: casesHref,
       ariaLabel: "Cases view",
@@ -58,6 +74,27 @@ export function CasesViewToggle({
       tooltip: "Custom fields",
       href: customFieldsHref,
       ariaLabel: "Custom fields view",
+    },
+    {
+      mode: CasesViewMode.Dropdowns,
+      icon: ListIcon,
+      tooltip: "Dropdowns",
+      href: dropdownsHref,
+      ariaLabel: "Dropdowns view",
+    },
+    {
+      mode: CasesViewMode.ClosureRequirements,
+      icon: Flag,
+      tooltip: "Closure requirements",
+      href: closureRequirementsHref,
+      ariaLabel: "Closure requirements view",
+    },
+    {
+      mode: CasesViewMode.Durations,
+      icon: Timer,
+      tooltip: "Durations",
+      href: durationsHref,
+      ariaLabel: "Durations view",
     },
   ] as const
 

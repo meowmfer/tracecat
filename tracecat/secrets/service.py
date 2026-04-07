@@ -1,52 +1,59 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 
-from pydantic import SecretStr
+from cryptography.fernet import InvalidToken
+from pydantic import SecretStr, ValidationError
+from sqlalchemy import select
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
-from sqlmodel import col, select
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from tracecat import config
-from tracecat.db.schemas import BaseSecret, OrganizationSecret, Secret
-from tracecat.identifiers import SecretID
-from tracecat.logger import logger
-from tracecat.registry.constants import (
-    REGISTRY_GIT_SSH_KEY_SECRET_NAME,
-    STORE_GIT_SSH_KEY_SECRET_NAME,
+from tracecat.audit.logger import audit_log
+from tracecat.auth.secrets import get_db_encryption_key
+from tracecat.auth.types import Role
+from tracecat.authz.controls import require_scope
+from tracecat.db.models import BaseSecret, OrganizationSecret, Secret
+from tracecat.exceptions import (
+    TracecatAuthorizationError,
+    TracecatCredentialsNotFoundError,
+    TracecatNotFoundError,
 )
+from tracecat.identifiers import SecretID, WorkspaceID
+from tracecat.logger import logger
+from tracecat.registry.constants import REGISTRY_GIT_SSH_KEY_SECRET_NAME
 from tracecat.secrets.constants import DEFAULT_SECRETS_ENVIRONMENT
 from tracecat.secrets.encryption import decrypt_keyvalues, encrypt_keyvalues
 from tracecat.secrets.enums import SecretType
-from tracecat.secrets.models import (
+from tracecat.secrets.schemas import (
     SecretCreate,
     SecretKeyValue,
     SecretSearch,
     SecretUpdate,
     SSHKeyTarget,
+    validate_ca_cert_values,
+    validate_mtls_key_values,
+    validate_ssh_key_values,
 )
-from tracecat.service import BaseService
-from tracecat.types.auth import Role
-from tracecat.types.exceptions import (
-    TracecatAuthorizationError,
-    TracecatCredentialsError,
-    TracecatCredentialsNotFoundError,
-    TracecatNotFoundError,
-)
+from tracecat.service import BaseOrgService
 
 
-class SecretsService(BaseService):
+class SecretsService(BaseOrgService):
     """Secrets manager service."""
 
     service_name = "secrets"
+    _encryption_key: str
 
     def __init__(self, session: AsyncSession, role: Role | None = None):
         super().__init__(session, role=role)
-        try:
-            self._encryption_key = os.environ["TRACECAT__DB_ENCRYPTION_KEY"]
-        except KeyError as e:
-            raise KeyError("TRACECAT__DB_ENCRYPTION_KEY is not set") from e
+        self._encryption_key = get_db_encryption_key()
+
+    def _require_workspace_id(self) -> WorkspaceID:
+        """Get workspace_id, raising if role or workspace_id is None."""
+        if self.role is None or self.role.workspace_id is None:
+            raise TracecatAuthorizationError(
+                "Workspace context required for this operation"
+            )
+        return self.role.workspace_id
 
     def decrypt_keys(self, encrypted_keys: bytes) -> list[SecretKeyValue]:
         """Decrypt and return the keys for a secret."""
@@ -60,13 +67,74 @@ class SecretsService(BaseService):
 
     async def _update_secret(self, secret: BaseSecret, params: SecretUpdate) -> None:
         """Update a base secret."""
+        existing_type = SecretType(secret.type)
+        if existing_type == SecretType.SSH_KEY:
+            if params.type is not None and SecretType(params.type) != existing_type:
+                raise ValueError(
+                    "SSH key secrets cannot change type. Delete and recreate the secret."
+                )
+            if params.keys is not None:
+                raise ValueError(
+                    "SSH key secrets are write-once. Delete and recreate to rotate the key."
+                )
+        elif existing_type == SecretType.MTLS:
+            if params.type is not None and SecretType(params.type) != existing_type:
+                raise ValueError(
+                    "mTLS secrets cannot change type. Delete and recreate the secret."
+                )
+        elif existing_type == SecretType.CA_CERT:
+            if params.type is not None and SecretType(params.type) != existing_type:
+                raise ValueError(
+                    "CA certificate secrets cannot change type. Delete and recreate the secret."
+                )
+        elif params.type == SecretType.SSH_KEY:
+            raise ValueError(
+                "SSH key secrets must be created with their key value. Delete and recreate the secret instead."
+            )
+        elif params.type == SecretType.MTLS:
+            raise ValueError(
+                "mTLS secrets must be created with their key values. Delete and recreate the secret instead."
+            )
+        elif params.type == SecretType.CA_CERT:
+            raise ValueError(
+                "CA certificate secrets must be created with their key values. Delete and recreate the secret instead."
+            )
         set_fields = params.model_dump(exclude_unset=True)
+        keys = set_fields.pop("keys", None)
+
+        if keys is None:
+            try:
+                self.decrypt_keys(secret.encrypted_keys)
+            except (InvalidToken, ValidationError, ValueError) as e:
+                if existing_type == SecretType.SSH_KEY:
+                    raise ValueError(
+                        "Stored SSH key value cannot be decrypted. Delete and recreate this secret to recover it."
+                    ) from e
+                raise ValueError(
+                    "Stored secret values cannot be decrypted. Re-enter all key names and values to recover this secret."
+                ) from e
+
         # Handle keys separately
-        if keys := set_fields.pop("keys", None):
-            # Decrypt existing keys to a dictionary for easy lookup
-            existing_keys = {
-                kv.key: kv.value for kv in self.decrypt_keys(secret.encrypted_keys)
-            }
+        if keys:
+            existing_keys: dict[str, SecretStr] = {}
+            try:
+                # Decrypt existing keys to a dictionary for easy lookup.
+                existing_keys = {
+                    kv.key: kv.value for kv in self.decrypt_keys(secret.encrypted_keys)
+                }
+            except (InvalidToken, ValidationError, ValueError) as e:
+                # Allow recovery from a corrupted encryption key by requiring callers
+                # to provide all key values, rather than preserving blanks.
+                if any(not kv["value"] for kv in keys):
+                    raise ValueError(
+                        "Stored secret values cannot be decrypted. Re-enter all key values to recover this secret."
+                    ) from e
+                self.logger.warning(
+                    "Failed to decrypt existing secret keys during update; proceeding with full key replacement",
+                    secret_id=str(secret.id),
+                    secret_name=secret.name,
+                    error=str(e),
+                )
 
             # Create new key-value pairs, preserving existing values when the new value is empty
             merged_keyvalues = []
@@ -81,6 +149,11 @@ class SecretsService(BaseService):
                     )
                 else:
                     merged_keyvalues.append(SecretKeyValue(**kv))
+
+            if existing_type == SecretType.MTLS:
+                validate_mtls_key_values(merged_keyvalues)
+            elif existing_type == SecretType.CA_CERT:
+                validate_ca_cert_values(merged_keyvalues)
 
             secret.encrypted_keys = encrypt_keyvalues(
                 merged_keyvalues, key=self._encryption_key
@@ -102,28 +175,29 @@ class SecretsService(BaseService):
         self, *, types: set[SecretType] | None = None
     ) -> Sequence[Secret]:
         """List all workspace secrets."""
-
-        statement = select(Secret).where(Secret.owner_id == self.role.workspace_id)
+        workspace_id = self._require_workspace_id()
+        statement = select(Secret).where(Secret.workspace_id == workspace_id)
         if types:
-            statement = statement.where(col(Secret.type).in_(types))
-        result = await self.session.exec(statement)
-        return result.all()
+            statement = statement.where(Secret.type.in_(types))
+        result = await self.session.execute(statement)
+        return result.scalars().all()
 
+    @require_scope("secret:read")
     async def get_secret(self, secret_id: SecretID) -> Secret:
         """Get a workspace secret by ID."""
-
+        workspace_id = self._require_workspace_id()
         statement = select(Secret).where(
-            Secret.owner_id == self.role.workspace_id,
+            Secret.workspace_id == workspace_id,
             Secret.id == secret_id,
         )
-        result = await self.session.exec(statement)
+        result = await self.session.execute(statement)
         try:
-            return result.one()
+            return result.scalar_one()
         except MultipleResultsFound as e:
             logger.error(
                 "Multiple secrets found",
                 secret_id=secret_id,
-                owner_id=self.role.workspace_id,
+                workspace_id=workspace_id,
             )
             raise TracecatNotFoundError(
                 "Multiple secrets found when searching by ID"
@@ -132,12 +206,13 @@ class SecretsService(BaseService):
             logger.error(
                 "Secret not found",
                 secret_id=secret_id,
-                owner_id=self.role.workspace_id,
+                workspace_id=workspace_id,
             )
             raise TracecatNotFoundError(
                 "Secret not found when searching by ID. Please check that the ID was correctly input."
             ) from e
 
+    @require_scope("secret:read")
     async def get_secret_by_name(
         self,
         secret_name: str,
@@ -155,16 +230,16 @@ class SecretsService(BaseService):
         Raises:
             TracecatNotFoundError: If no secret is found with the given name/environment or if multiple secrets are found
         """
-
+        workspace_id = self._require_workspace_id()
         statement = select(Secret).where(
-            Secret.owner_id == self.role.workspace_id,
+            Secret.workspace_id == workspace_id,
             Secret.name == secret_name,
         )
         if environment:
             statement = statement.where(Secret.environment == environment)
-        result = await self.session.exec(statement)
+        result = await self.session.execute(statement)
         try:
-            return result.one()
+            return result.scalar_one()
         except MultipleResultsFound as e:
             raise TracecatNotFoundError(
                 "Multiple secrets found when searching by name."
@@ -176,15 +251,19 @@ class SecretsService(BaseService):
                 " Please double check that the name was correctly input."
             ) from e
 
+    @require_scope("secret:create")
+    @audit_log(resource_type="secret", action="create")
     async def create_secret(self, params: SecretCreate) -> None:
         """Create a workspace secret."""
-        owner_id = self.role.workspace_id
-        if owner_id is None:
-            raise TracecatAuthorizationError(
-                "Workspace ID is required to create a secret in a workspace"
-            )
+        workspace_id = self._require_workspace_id()
+        if params.type == SecretType.SSH_KEY:
+            validate_ssh_key_values(params.keys)
+        elif params.type == SecretType.MTLS:
+            validate_mtls_key_values(params.keys)
+        elif params.type == SecretType.CA_CERT:
+            validate_ca_cert_values(params.keys)
         secret = Secret(
-            owner_id=owner_id,
+            workspace_id=workspace_id,
             name=params.name,
             type=params.type,
             description=params.description,
@@ -195,11 +274,15 @@ class SecretsService(BaseService):
         self.session.add(secret)
         await self.session.commit()
 
+    @require_scope("secret:update")
+    @audit_log(resource_type="secret", action="update")
     async def update_secret(self, secret: Secret, params: SecretUpdate) -> None:
         """Update a workspace secret."""
 
         await self._update_secret(secret=secret, params=params)
 
+    @require_scope("secret:delete")
+    @audit_log(resource_type="secret", action="delete")
     async def delete_secret(self, secret: Secret) -> None:
         """Delete a workspace secret."""
 
@@ -210,24 +293,20 @@ class SecretsService(BaseService):
         if not any((params.ids, params.names, params.environment)):
             return []
 
-        owner_id = self.role.workspace_id
-        if owner_id is None:
-            raise TracecatAuthorizationError(
-                "Workspace ID is required to search secrets"
-            )
-        stmt = select(Secret).where(Secret.owner_id == owner_id)
+        workspace_id = self._require_workspace_id()
+        stmt = select(Secret).where(Secret.workspace_id == workspace_id)
         fields = params.model_dump(exclude_unset=True)
         self.logger.info("Searching secrets", set_fields=fields)
 
         if ids := fields.get("ids"):
-            stmt = stmt.where(col(Secret.id).in_(ids))
+            stmt = stmt.where(Secret.id.in_(ids))
         if names := fields.get("names"):
-            stmt = stmt.where(col(Secret.name).in_(names))
+            stmt = stmt.where(Secret.name.in_(names))
         if "environment" in fields:
             stmt = stmt.where(Secret.environment == fields["environment"])
 
-        result = await self.session.exec(stmt)
-        return result.all()
+        result = await self.session.execute(stmt)
+        return result.scalars().all()
 
     # === Organization secrets ===
 
@@ -237,24 +316,25 @@ class SecretsService(BaseService):
         """List all organization secrets."""
 
         stmt = select(OrganizationSecret).where(
-            OrganizationSecret.owner_id == config.TRACECAT__DEFAULT_ORG_ID
+            OrganizationSecret.organization_id == self.organization_id
         )
         if types:
-            stmt = stmt.where(col(OrganizationSecret.type).in_(types))
-        result = await self.session.exec(stmt)
-        return result.all()
+            stmt = stmt.where(OrganizationSecret.type.in_(types))
+        result = await self.session.execute(stmt)
+        return result.scalars().all()
 
+    @require_scope("org:secret:read")
     async def get_org_secret(self, secret_id: SecretID) -> OrganizationSecret:
         """Get an organization secret by ID."""
 
         statement = select(OrganizationSecret).where(
-            OrganizationSecret.owner_id == config.TRACECAT__DEFAULT_ORG_ID,
+            OrganizationSecret.organization_id == self.organization_id,
             OrganizationSecret.id == secret_id,
         )
-        result = await self.session.exec(statement)
-        return result.one()
+        result = await self.session.execute(statement)
+        return result.scalar_one()
 
-    async def get_org_secret_by_name(
+    async def _get_org_secret_by_name(
         self,
         secret_name: str,
         environment: str | None = None,
@@ -262,13 +342,13 @@ class SecretsService(BaseService):
         """Retrieve an organization-wide secret by its name."""
         environment = environment or DEFAULT_SECRETS_ENVIRONMENT
         statement = select(OrganizationSecret).where(
-            OrganizationSecret.owner_id == config.TRACECAT__DEFAULT_ORG_ID,
+            OrganizationSecret.organization_id == self.organization_id,
             OrganizationSecret.name == secret_name,
             OrganizationSecret.environment == environment,
         )
-        result = await self.session.exec(statement)
+        result = await self.session.execute(statement)
         try:
-            return result.one()
+            return result.scalar_one()
         except MultipleResultsFound as e:
             raise TracecatNotFoundError(
                 "Multiple organization secrets found when searching by name."
@@ -280,10 +360,32 @@ class SecretsService(BaseService):
                 " Please double check that the name was correctly input."
             ) from e
 
+    @require_scope("org:secret:read")
+    async def get_org_secret_by_name(
+        self,
+        secret_name: str,
+        environment: str | None = None,
+    ) -> OrganizationSecret:
+        """Retrieve an organization-wide secret by its name."""
+        return await self._get_org_secret_by_name(secret_name, environment)
+
+    @require_scope("workflow:sync")
+    async def get_github_app_org_secret(self) -> OrganizationSecret:
+        """Retrieve the GitHub App organization secret for workflow sync."""
+        return await self._get_org_secret_by_name("github-app-credentials")
+
+    @require_scope("org:secret:create")
+    @audit_log(resource_type="organization_secret", action="create")
     async def create_org_secret(self, params: SecretCreate) -> None:
         """Create a new organization secret."""
+        if params.type == SecretType.SSH_KEY:
+            validate_ssh_key_values(params.keys)
+        elif params.type == SecretType.MTLS:
+            validate_mtls_key_values(params.keys)
+        elif params.type == SecretType.CA_CERT:
+            validate_ca_cert_values(params.keys)
         secret = OrganizationSecret(
-            owner_id=config.TRACECAT__DEFAULT_ORG_ID,
+            organization_id=self.organization_id,
             name=params.name,
             type=params.type,
             description=params.description,
@@ -294,14 +396,22 @@ class SecretsService(BaseService):
         self.session.add(secret)
         await self.session.commit()
 
+    @require_scope("org:secret:update")
+    @audit_log(resource_type="organization_secret", action="update")
     async def update_org_secret(
         self, secret: OrganizationSecret, params: SecretUpdate
     ) -> None:
         await self._update_secret(secret=secret, params=params)
 
+    @require_scope("org:secret:delete")
+    @audit_log(
+        resource_type="organization_secret",
+        action="delete",
+    )
     async def delete_org_secret(self, org_secret: OrganizationSecret) -> None:
         await self._delete_secret(org_secret)
 
+    @require_scope("org:secret:read")
     async def get_ssh_key(
         self,
         key_name: str | None = None,
@@ -311,11 +421,10 @@ class SecretsService(BaseService):
         match target:
             case "registry":
                 return await self.get_registry_ssh_key(key_name, environment)
-            case "store":
-                return await self.get_store_ssh_key(key_name, environment)
             case _:
                 raise ValueError(f"Invalid target: {target}")
 
+    @require_scope("org:secret:read")
     async def get_registry_ssh_key(
         self, key_name: str | None = None, environment: str | None = None
     ) -> SecretStr:
@@ -335,30 +444,4 @@ class SecretsService(BaseService):
             raise TracecatCredentialsNotFoundError(
                 f"SSH key {key_name} not found. Please check whether this key exists.\n\n"
                 " If not, please create a key in your organization's credentials page and try again."
-            ) from e
-
-    async def get_store_ssh_key(
-        self, key_name: str | None = None, environment: str | None = None
-    ) -> SecretStr:
-        """Get the SSH key for the store."""
-        key_name = key_name or STORE_GIT_SSH_KEY_SECRET_NAME
-        try:
-            secret = await self.get_secret_by_name(key_name, environment)
-            if secret.type != SecretType.SSH_KEY:
-                raise TracecatCredentialsError(
-                    f"SSH key type mismatch. Expected SSH key, got {secret.type}."
-                )
-            [kv] = self.decrypt_keys(secret.encrypted_keys)
-            logger.debug("SSH key found", key_name=key_name, key_length=len(kv.value))
-            raw_value = kv.value.get_secret_value()
-            # SSH keys must end with a newline char otherwise we run into
-            # load key errors in librcrypto.
-            # https://github.com/openssl/openssl/discussions/21481
-            if not raw_value.endswith("\n"):
-                raw_value += "\n"
-            return SecretStr(raw_value)
-        except TracecatNotFoundError as e:
-            raise TracecatCredentialsNotFoundError(
-                f"SSH key {key_name} not found. Please check whether this key exists.\n\n"
-                " If not, please create a key in your workspace's credentials page and try again.",
             ) from e

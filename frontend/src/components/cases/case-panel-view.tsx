@@ -2,39 +2,42 @@
 
 import {
   Activity,
-  BoxIcon,
   Braces,
   MessageSquare,
   MoreHorizontal,
   Paperclip,
+  Table2,
+  X,
 } from "lucide-react"
-import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
-import { useCallback, useState } from "react"
+import { useCallback, useMemo, useState } from "react"
 import type {
+  CaseDropdownDefinitionRead,
+  CaseFieldRead,
   CasePriority,
   CaseSeverity,
   CaseStatus,
   CaseUpdate,
-  UserRead,
 } from "@/client"
-import { CaseActivityFeed } from "@/components/cases/case-activity-feed"
 import { CaseAttachmentsSection } from "@/components/cases/case-attachments-section"
+import { CaseClosureDialog } from "@/components/cases/case-closure-dialog"
 import { CommentSection } from "@/components/cases/case-comments-section"
+import { CaseLinkedRowsSection } from "@/components/cases/case-linked-rows-section"
 import { CustomField } from "@/components/cases/case-panel-custom-fields"
 import { CasePanelDescription } from "@/components/cases/case-panel-description"
-import { CasePanelSection } from "@/components/cases/case-panel-section"
 import {
+  type AssigneeInfo,
   AssigneeSelect,
+  CaseDropdownSelect,
   PrioritySelect,
   SeveritySelect,
   StatusSelect,
 } from "@/components/cases/case-panel-selectors"
 import { CasePanelSummary } from "@/components/cases/case-panel-summary"
 import { CasePayloadSection } from "@/components/cases/case-payload-section"
-import { CasePropertyRow } from "@/components/cases/case-property-row"
-import { CaseRecordsSection } from "@/components/cases/case-records-section"
+import { CaseTasksSection } from "@/components/cases/case-tasks-section"
 import { CaseWorkflowTrigger } from "@/components/cases/case-workflow-trigger"
+import { CaseFeed } from "@/components/cases/cases-feed"
 import { AlertNotification } from "@/components/notifications"
 import { TagBadge } from "@/components/tag-badge"
 import { Button } from "@/components/ui/button"
@@ -42,28 +45,49 @@ import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
-  DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import { Separator } from "@/components/ui/separator"
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+} from "@/components/ui/sidebar"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useToast } from "@/components/ui/use-toast"
+import { useEntitlements } from "@/hooks/use-entitlements"
 import { useWorkspaceMembers } from "@/hooks/use-workspace"
 import {
   useAddCaseTag,
+  useCaseDropdownDefinitions,
+  useCaseDurationDefinitions,
+  useCaseDurations,
+  useCaseFields,
   useCaseTagCatalog,
   useGetCase,
   useRemoveCaseTag,
+  useSetCaseDropdownValue,
   useUpdateCase,
 } from "@/lib/hooks"
+import { undoSlugify } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
-type CasePanelTab =
-  | "comments"
-  | "activity"
-  | "attachments"
-  | "records"
-  | "payload"
+type CasePanelTab = "comments" | "activity" | "attachments" | "rows" | "payload"
+
+function isCustomFieldValueEmpty(value: unknown): boolean {
+  if (value === null || value === undefined) return true
+  if (typeof value === "string") return value.trim().length === 0
+  if (typeof value === "number") return Number.isNaN(value)
+  if (typeof value === "boolean") return false
+  if (Array.isArray(value)) return value.length === 0
+  if (typeof value === "object")
+    return Object.keys(value as object).length === 0
+  return false
+}
 
 interface CasePanelContentProps {
   caseId: string
@@ -74,11 +98,19 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
   const { members } = useWorkspaceMembers(workspaceId)
   const router = useRouter()
   const searchParams = useSearchParams()
+  const { hasEntitlement } = useEntitlements()
+  const caseAddonsEnabled = hasEntitlement("case_addons")
 
   const { caseData, caseDataIsLoading, caseDataError } = useGetCase({
     caseId,
     workspaceId,
   })
+  useCaseDurations({
+    caseId,
+    workspaceId,
+    enabled: caseAddonsEnabled,
+  })
+  useCaseDurationDefinitions(workspaceId, caseAddonsEnabled)
   const { updateCase } = useUpdateCase({
     workspaceId,
     caseId,
@@ -86,14 +118,48 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
   const { addCaseTag } = useAddCaseTag({ caseId, workspaceId })
   const { removeCaseTag } = useRemoveCaseTag({ caseId, workspaceId })
   const { caseTags } = useCaseTagCatalog(workspaceId)
+  const { dropdownDefinitions } = useCaseDropdownDefinitions(
+    workspaceId,
+    caseAddonsEnabled
+  )
+  const setDropdownValue = useSetCaseDropdownValue(workspaceId)
+  const { caseFields: caseFieldDefinitions } = useCaseFields(workspaceId)
   const { toast } = useToast()
-  const [propertiesOpen, setPropertiesOpen] = useState(true)
-  const [workflowOpen, setWorkflowOpen] = useState(true)
+  const [closureDialog, setClosureDialog] = useState<{
+    open: boolean
+    targetStatus: CaseStatus
+  } | null>(null)
+  const customFields = useMemo(
+    () => (caseData?.fields ?? []).filter((field) => !field.reserved),
+    [caseData?.fields]
+  )
+  const [showAllCustomFields, setShowAllCustomFields] = useState(false)
+  const visibleCustomFields = useMemo(
+    () =>
+      showAllCustomFields
+        ? customFields
+        : customFields.filter((field) => !isCustomFieldValueEmpty(field.value)),
+    [customFields, showAllCustomFields]
+  )
+  const handleCustomFieldClear = useCallback(
+    async (field: CaseFieldRead) => {
+      try {
+        await updateCase({
+          fields: {
+            [field.id]: null,
+          },
+        })
+      } catch (error) {
+        console.error("Failed to clear custom field:", error)
+      }
+    },
+    [updateCase]
+  )
 
   // Get active tab from URL query params, default to "comments"
   const activeTab = (
     searchParams &&
-    ["comments", "activity", "attachments", "records", "payload"].includes(
+    ["comments", "activity", "attachments", "rows", "payload"].includes(
       searchParams.get("tab") || ""
     )
       ? (searchParams.get("tab") ?? "comments")
@@ -140,10 +206,37 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
   }
 
   const handleStatusChange = async (newStatus: CaseStatus) => {
-    const updateParams = {
-      status: newStatus,
-    } as Partial<CaseUpdate>
-    await updateCase(updateParams)
+    if (
+      caseAddonsEnabled &&
+      (newStatus === "closed" || newStatus === "resolved")
+    ) {
+      const reqFields =
+        caseFieldDefinitions?.filter(
+          (f) => !f.reserved && f.required_on_closure
+        ) ?? []
+      const reqDropdowns =
+        dropdownDefinitions?.filter((d) => d.required_on_closure) ?? []
+
+      if (reqFields.length > 0 || reqDropdowns.length > 0) {
+        // Check if any required field/dropdown is empty on the current case
+        const hasEmptyField = reqFields.some((f) => {
+          const field = caseData.fields.find((cf) => cf.id === f.id)
+          return isCustomFieldValueEmpty(field?.value)
+        })
+        const hasEmptyDropdown = reqDropdowns.some((d) => {
+          const dv = caseData.dropdown_values.find(
+            (v) => v.definition_id === d.id
+          )
+          return !dv?.option_id
+        })
+
+        if (hasEmptyField || hasEmptyDropdown) {
+          setClosureDialog({ open: true, targetStatus: newStatus })
+          return
+        }
+      }
+    }
+    await updateCase({ status: newStatus })
   }
 
   const handlePriorityChange = async (newPriority: CasePriority) => {
@@ -160,7 +253,7 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
     await updateCase(params)
   }
 
-  const handleAssigneeChange = async (newAssignee?: UserRead | null) => {
+  const handleAssigneeChange = async (newAssignee?: AssigneeInfo | null) => {
     const params: Partial<CaseUpdate> = {
       assignee_id: newAssignee?.id || null,
     }
@@ -186,112 +279,57 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
     }
   }
 
-  const customFields = caseData.fields.filter((field) => !field.reserved)
+  const panelFieldRowClassName =
+    "group -mx-2 flex h-7 w-full cursor-pointer items-center gap-2 rounded-sm px-2 transition-colors hover:bg-muted/70 focus-within:bg-muted/70"
+  const panelFieldRowInteractiveSelector =
+    "input:not([type='hidden']):not([disabled]), textarea:not([disabled]), [role='combobox']:not([aria-disabled='true']), button:not([disabled])"
+  const panelFieldRowTargetSelector =
+    "button:not([disabled]), input:not([type='hidden']):not([disabled]), textarea:not([disabled]), [role='combobox']:not([aria-disabled='true']), a[href]"
+  const handlePanelFieldRowClick = (
+    event: React.MouseEvent<HTMLDivElement>
+  ) => {
+    const target = event.target as HTMLElement | null
+    if (target?.closest(panelFieldRowTargetSelector)) {
+      return
+    }
+
+    const controlContainer = event.currentTarget.querySelector<HTMLElement>(
+      ".tc-panel-row-control"
+    )
+    const control = controlContainer?.querySelector<HTMLElement>(
+      panelFieldRowInteractiveSelector
+    )
+    if (!control) return
+
+    if (
+      control instanceof HTMLInputElement ||
+      control instanceof HTMLTextAreaElement
+    ) {
+      control.focus()
+      return
+    }
+
+    control.click()
+    control.focus()
+  }
 
   return (
-    <div className="h-full flex w-full">
-      <div className="h-full w-full min-w-0 flex">
-        {/* Case properties section */}
-        <div className="w-64 min-w-[200px] max-w-[300px] border-r">
-          <div className="h-full overflow-y-auto p-4 min-w-0">
-            <div className="space-y-10">
-              {/* Properties Section */}
-              <CasePanelSection
-                title="Properties"
-                isOpen={propertiesOpen}
-                onOpenChange={setPropertiesOpen}
-              >
-                <div className="space-y-4">
-                  {/* Assign */}
-                  <CasePropertyRow
-                    label="Assignee"
-                    value={
-                      <AssigneeSelect
-                        assignee={caseData.assignee}
-                        workspaceMembers={members ?? []}
-                        onValueChange={handleAssigneeChange}
-                      />
-                    }
-                  />
-
-                  {/* Status */}
-                  <CasePropertyRow
-                    label="Status"
-                    value={
-                      <StatusSelect
-                        status={caseData.status}
-                        onValueChange={handleStatusChange}
-                      />
-                    }
-                  />
-
-                  {/* Priority */}
-                  <CasePropertyRow
-                    label="Priority"
-                    value={
-                      <PrioritySelect
-                        priority={caseData.priority || "unknown"}
-                        onValueChange={handlePriorityChange}
-                      />
-                    }
-                  />
-
-                  {/* Severity */}
-                  <CasePropertyRow
-                    label="Severity"
-                    value={
-                      <SeveritySelect
-                        severity={caseData.severity || "unknown"}
-                        onValueChange={handleSeverityChange}
-                      />
-                    }
-                  />
-
-                  {/* Tags */}
-                  <div className="pt-2">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-xs">Tags</span>
-                      {caseTags && caseTags.length > 0 && (
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-5 w-5 p-0"
-                            >
-                              <MoreHorizontal className="h-3 w-3" />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" className="text-xs">
-                            {caseTags.map((tag) => {
-                              const hasTag = caseData.tags?.some(
-                                (t) => t.id === tag.id
-                              )
-                              return (
-                                <DropdownMenuCheckboxItem
-                                  key={tag.id}
-                                  className="text-xs"
-                                  checked={hasTag}
-                                  onClick={async (e) => {
-                                    e.stopPropagation()
-                                    await handleTagToggle(tag.id, !!hasTag)
-                                  }}
-                                >
-                                  <div
-                                    className="mr-2 flex size-2 rounded-full"
-                                    style={{
-                                      backgroundColor: tag.color || undefined,
-                                    }}
-                                  />
-                                  <span>{tag.name}</span>
-                                </DropdownMenuCheckboxItem>
-                              )
-                            })}
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      )}
-                    </div>
-                    <div className="flex flex-wrap gap-1">
+    <>
+      <CaseWorkflowTrigger caseData={caseData} />
+      <div className="flex h-full w-full min-w-0">
+        <div className="min-w-0 flex-1">
+          <ScrollArea className="h-full min-w-0 bg-muted/20">
+            <div className="mx-auto max-w-4xl px-6 py-8 pb-24">
+              <div className="mb-2">
+                <div className="flex flex-col">
+                  <div className="py-1.5 first:pt-0 last:pb-0">
+                    <CasePanelSummary
+                      caseData={caseData}
+                      updateCase={updateCase}
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center justify-between gap-3 py-1.5 first:pt-0 last:pb-0">
+                    <div className="flex flex-wrap items-center gap-1.5">
                       {caseData.tags?.length ? (
                         caseData.tags.map((tag) => (
                           <TagBadge key={tag.id} tag={tag} />
@@ -302,140 +340,117 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
                         </span>
                       )}
                     </div>
-                  </div>
-
-                  {/* Custom fields */}
-                  <div className="pt-2">
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-xs">Custom fields</span>
+                    {caseTags && caseTags.length > 0 && (
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                           <Button
                             variant="ghost"
                             size="sm"
-                            className="h-5 w-5 p-0"
+                            className="h-6 w-6 p-0"
                           >
-                            <MoreHorizontal className="h-3 w-3" />
+                            <MoreHorizontal className="h-4 w-4" />
+                            <span className="sr-only">Manage tags</span>
                           </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end" className="text-xs">
-                          <DropdownMenuItem asChild>
-                            <Link
-                              href={`/workspaces/${workspaceId}/cases/custom-fields`}
-                            >
-                              Manage fields
-                            </Link>
-                          </DropdownMenuItem>
+                          {caseTags.map((tag) => {
+                            const hasTag = caseData.tags?.some(
+                              (t) => t.id === tag.id
+                            )
+                            return (
+                              <DropdownMenuCheckboxItem
+                                key={tag.id}
+                                className="text-xs"
+                                checked={hasTag}
+                                onClick={async (e) => {
+                                  e.stopPropagation()
+                                  await handleTagToggle(tag.id, !!hasTag)
+                                }}
+                              >
+                                <div
+                                  className="mr-2 flex size-2 rounded-full"
+                                  style={{
+                                    backgroundColor: tag.color || undefined,
+                                  }}
+                                />
+                                <span>{tag.name}</span>
+                              </DropdownMenuCheckboxItem>
+                            )
+                          })}
                         </DropdownMenuContent>
                       </DropdownMenu>
-                    </div>
-                    {customFields.length === 0 ? (
-                      <div className="text-xs text-muted-foreground">
-                        No fields configured.
-                      </div>
-                    ) : (
-                      <div className="space-y-4">
-                        {customFields.map((field) => (
-                          <CasePropertyRow
-                            key={field.id}
-                            label={field.id}
-                            value={
-                              <CustomField
-                                customField={field}
-                                updateCase={updateCase}
-                              />
-                            }
-                          />
-                        ))}
-                      </div>
                     )}
                   </div>
                 </div>
-              </CasePanelSection>
-              {/* Workflow Triggers */}
-              <CasePanelSection
-                title="Workflows"
-                isOpen={workflowOpen}
-                onOpenChange={setWorkflowOpen}
-              >
-                <CaseWorkflowTrigger caseData={caseData} />
-              </CasePanelSection>
-            </div>
-          </div>
-        </div>
-        {/* Main section */}
-        <div className="flex-1 min-w-0">
-          <div className="h-full overflow-auto min-w-0">
-            <div className="py-8 pb-24 px-6 max-w-4xl mx-auto">
-              {/* Header with Chat Toggle */}
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex-1">
-                  {/* Case Summary */}
-                  <CasePanelSummary
-                    caseData={caseData}
-                    updateCase={updateCase}
-                  />
-                </div>
               </div>
 
-              {/* Description */}
-              <div className="mb-6">
+              <div className="mb-4">
                 <CasePanelDescription
                   caseData={caseData}
                   updateCase={updateCase}
                 />
               </div>
 
-              {/* Tabs using shadcn components */}
+              {caseAddonsEnabled && (
+                <div className="mb-6">
+                  <CaseTasksSection
+                    caseId={caseId}
+                    workspaceId={workspaceId}
+                    caseData={caseData}
+                  />
+                </div>
+              )}
+
               <Tabs
                 value={activeTab}
                 onValueChange={handleTabChange}
-                className="w-full"
+                className="mt-[4.5rem] w-full"
               >
-                <TabsList className="h-8 justify-start rounded-none bg-transparent p-0 border-b border-border w-full">
+                <TabsList className="h-8 w-full justify-start rounded-none bg-transparent p-0">
                   <TabsTrigger
-                    className="flex h-full items-center justify-center rounded-none border-b-2 border-transparent py-0 text-xs font-medium data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                    className="flex h-full items-center justify-center rounded-none py-0 text-xs font-medium data-[state=active]:bg-transparent data-[state=active]:shadow-none"
                     value="comments"
                   >
                     <MessageSquare className="mr-1.5 h-3.5 w-3.5" />
                     Comments
                   </TabsTrigger>
                   <TabsTrigger
-                    className="flex h-full items-center justify-center rounded-none border-b-2 border-transparent py-0 text-xs font-medium ml-6 data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                    className="ml-6 flex h-full items-center justify-center rounded-none py-0 text-xs font-medium data-[state=active]:bg-transparent data-[state=active]:shadow-none"
                     value="activity"
                   >
                     <Activity className="mr-1.5 h-3.5 w-3.5" />
                     Activity
                   </TabsTrigger>
                   <TabsTrigger
-                    className="flex h-full items-center justify-center rounded-none border-b-2 border-transparent py-0 text-xs font-medium ml-6 data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                    className="ml-6 flex h-full items-center justify-center rounded-none py-0 text-xs font-medium data-[state=active]:bg-transparent data-[state=active]:shadow-none"
                     value="attachments"
                   >
                     <Paperclip className="mr-1.5 h-3.5 w-3.5" />
                     Attachments
                   </TabsTrigger>
                   <TabsTrigger
-                    className="flex h-full items-center justify-center rounded-none border-b-2 border-transparent py-0 text-xs font-medium ml-6 data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none"
-                    value="records"
+                    className="ml-6 flex h-full items-center justify-center rounded-none py-0 text-xs font-medium data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                    value="rows"
                   >
-                    <BoxIcon className="mr-1.5 h-3.5 w-3.5" />
-                    Records
+                    <Table2 className="mr-1.5 h-3.5 w-3.5" />
+                    Tables
                   </TabsTrigger>
                   <TabsTrigger
-                    className="flex h-full items-center justify-center rounded-none border-b-2 border-transparent py-0 text-xs font-medium ml-6 data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                    className="ml-6 flex h-full items-center justify-center rounded-none py-0 text-xs font-medium data-[state=active]:bg-transparent data-[state=active]:shadow-none"
                     value="payload"
                   >
                     <Braces className="mr-1.5 h-3.5 w-3.5" />
                     Payload
                   </TabsTrigger>
                 </TabsList>
+                <Separator className="mt-0" />
 
                 <TabsContent value="comments" className="mt-4">
                   <CommentSection caseId={caseId} workspaceId={workspaceId} />
                 </TabsContent>
 
                 <TabsContent value="activity" className="mt-4">
-                  <CaseActivityFeed caseId={caseId} workspaceId={workspaceId} />
+                  <CaseFeed caseId={caseId} workspaceId={workspaceId} />
                 </TabsContent>
 
                 <TabsContent value="attachments" className="mt-4">
@@ -445,11 +460,8 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
                   />
                 </TabsContent>
 
-                <TabsContent value="records" className="mt-4">
-                  <CaseRecordsSection
-                    caseId={caseId}
-                    workspaceId={workspaceId}
-                  />
+                <TabsContent value="rows" className="mt-4">
+                  <CaseLinkedRowsSection caseData={caseData} />
                 </TabsContent>
 
                 <TabsContent value="payload" className="mt-4">
@@ -457,9 +469,231 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
                 </TabsContent>
               </Tabs>
             </div>
-          </div>
+          </ScrollArea>
         </div>
+        <Sidebar
+          side="right"
+          collapsible="none"
+          className="w-[22rem] shrink-0 border-l border-border bg-background text-foreground"
+        >
+          <SidebarContent className="h-full">
+            <SidebarGroup>
+              <SidebarGroupLabel>Properties</SidebarGroupLabel>
+              <SidebarGroupContent className="px-2">
+                <div className="space-y-2">
+                  <div
+                    className={panelFieldRowClassName}
+                    onClick={handlePanelFieldRowClick}
+                  >
+                    <span className="text-sm text-muted-foreground">
+                      Status
+                    </span>
+                    <div className="ml-auto min-w-0 flex-1 tc-panel-row-control">
+                      <StatusSelect
+                        status={caseData.status}
+                        onValueChange={handleStatusChange}
+                        showLabel={false}
+                        triggerClassName="h-7 w-full justify-end border-none px-2 text-sm hover:bg-transparent focus:ring-0 focus-visible:ring-0 focus-visible:ring-offset-0 data-[state=open]:border-none data-[state=open]:ring-0 [&>span]:w-full"
+                        valueClassName="text-sm"
+                      />
+                    </div>
+                  </div>
+                  <div
+                    className={panelFieldRowClassName}
+                    onClick={handlePanelFieldRowClick}
+                  >
+                    <span className="text-sm text-muted-foreground">
+                      Priority
+                    </span>
+                    <div className="ml-auto min-w-0 flex-1 tc-panel-row-control">
+                      <PrioritySelect
+                        priority={caseData.priority || "unknown"}
+                        onValueChange={handlePriorityChange}
+                        showLabel={false}
+                        triggerClassName="h-7 w-full justify-end border-none px-2 text-sm hover:bg-transparent focus:ring-0 focus-visible:ring-0 focus-visible:ring-offset-0 data-[state=open]:border-none data-[state=open]:ring-0 [&>span]:w-full"
+                        valueClassName="text-sm"
+                      />
+                    </div>
+                  </div>
+                  <div
+                    className={panelFieldRowClassName}
+                    onClick={handlePanelFieldRowClick}
+                  >
+                    <span className="text-sm text-muted-foreground">
+                      Severity
+                    </span>
+                    <div className="ml-auto min-w-0 flex-1 tc-panel-row-control">
+                      <SeveritySelect
+                        severity={caseData.severity || "unknown"}
+                        onValueChange={handleSeverityChange}
+                        showLabel={false}
+                        triggerClassName="h-7 w-full justify-end border-none px-2 text-sm hover:bg-transparent focus:ring-0 focus-visible:ring-0 focus-visible:ring-offset-0 data-[state=open]:border-none data-[state=open]:ring-0 [&>span]:w-full"
+                        valueClassName="text-sm"
+                      />
+                    </div>
+                  </div>
+                  <div
+                    className={panelFieldRowClassName}
+                    onClick={handlePanelFieldRowClick}
+                  >
+                    <span className="text-sm text-muted-foreground">
+                      Assignee
+                    </span>
+                    <div className="ml-auto min-w-0 flex-1 tc-panel-row-control">
+                      <AssigneeSelect
+                        assignee={caseData.assignee}
+                        workspaceMembers={members ?? []}
+                        onValueChange={handleAssigneeChange}
+                        showLabel={false}
+                        triggerClassName="h-7 w-full justify-end border-none px-2 text-sm hover:bg-transparent focus:ring-0 focus-visible:ring-0 focus-visible:ring-offset-0 data-[state=open]:border-none data-[state=open]:ring-0 [&>span]:w-full"
+                        valueClassName="text-sm"
+                      />
+                    </div>
+                  </div>
+                  {caseAddonsEnabled &&
+                    dropdownDefinitions?.map(
+                      (def: CaseDropdownDefinitionRead) => {
+                        const currentValue = caseData.dropdown_values?.find(
+                          (dv) => dv.definition_id === def.id
+                        )
+                        return (
+                          <div
+                            key={def.id}
+                            className={panelFieldRowClassName}
+                            onClick={handlePanelFieldRowClick}
+                          >
+                            <span
+                              className="truncate text-sm text-muted-foreground"
+                              title={def.name}
+                            >
+                              {def.name}
+                            </span>
+                            <div className="ml-auto min-w-0 flex-1 tc-panel-row-control">
+                              <CaseDropdownSelect
+                                definition={def}
+                                currentValue={currentValue}
+                                onValueChange={(optionId) =>
+                                  setDropdownValue.mutate({
+                                    caseId: caseData.id,
+                                    definitionId: def.id,
+                                    optionId,
+                                  })
+                                }
+                                showLabel={false}
+                                triggerClassName="h-7 w-full justify-end border-none px-2 text-sm hover:bg-transparent focus:ring-0 focus-visible:ring-0 focus-visible:ring-offset-0 data-[state=open]:border-none data-[state=open]:ring-0 [&>span]:w-full"
+                                valueClassName="text-sm"
+                              />
+                            </div>
+                          </div>
+                        )
+                      }
+                    )}
+                </div>
+              </SidebarGroupContent>
+            </SidebarGroup>
+            <SidebarGroup>
+              <SidebarGroupLabel>Fields</SidebarGroupLabel>
+              <SidebarGroupContent className="px-2">
+                <div className="space-y-2">
+                  {visibleCustomFields.length > 0 ? (
+                    visibleCustomFields.map((field) => {
+                      const label = undoSlugify(field.id)
+                      return (
+                        <div
+                          key={field.id}
+                          className={panelFieldRowClassName}
+                          onClick={handlePanelFieldRowClick}
+                        >
+                          {showAllCustomFields && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              type="button"
+                              className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
+                              onClick={() => handleCustomFieldClear(field)}
+                            >
+                              <X className="h-3.5 w-3.5" />
+                              <span className="sr-only">
+                                Clear {label} field
+                              </span>
+                            </Button>
+                          )}
+                          <span
+                            className="truncate text-sm text-muted-foreground"
+                            title={label}
+                          >
+                            {label}
+                          </span>
+                          <div className="ml-auto min-w-0 flex-1 tc-panel-row-control">
+                            <div className="flex h-7 w-full items-center gap-2">
+                              <div className="min-w-0 flex-1">
+                                <CustomField
+                                  customField={field}
+                                  updateCase={updateCase}
+                                  formClassName="w-full"
+                                  inputClassName="w-full min-w-0 border-none text-sm hover:bg-transparent focus:ring-0 focus-visible:ring-0 focus-visible:ring-offset-0"
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )
+                    })
+                  ) : customFields.length === 0 ? (
+                    <span className="text-sm text-muted-foreground">
+                      No custom fields configured
+                    </span>
+                  ) : null}
+                  {customFields.length > 0 && (
+                    <button
+                      type="button"
+                      className="h-7 text-sm text-muted-foreground underline-offset-4 hover:underline"
+                      onClick={() => setShowAllCustomFields((prev) => !prev)}
+                    >
+                      {showAllCustomFields
+                        ? "Hide empty fields"
+                        : "View all fields"}
+                    </button>
+                  )}
+                </div>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          </SidebarContent>
+        </Sidebar>
       </div>
-    </div>
+      {closureDialog && (
+        <CaseClosureDialog
+          open={closureDialog.open}
+          onOpenChange={(open) => {
+            if (!open) setClosureDialog(null)
+          }}
+          targetStatus={closureDialog.targetStatus as "closed" | "resolved"}
+          requiredFields={
+            caseFieldDefinitions?.filter(
+              (f) => !f.reserved && f.required_on_closure
+            ) ?? []
+          }
+          requiredDropdowns={
+            dropdownDefinitions?.filter((d) => d.required_on_closure) ?? []
+          }
+          currentFieldValues={Object.fromEntries(
+            caseData.fields
+              .filter((f) => !f.reserved)
+              .map((f) => [f.id, f.value])
+          )}
+          currentDropdownValues={caseData.dropdown_values}
+          onSubmit={async (data) => {
+            await updateCase({
+              status: closureDialog.targetStatus,
+              fields: data.fields,
+              dropdown_values: data.dropdown_values.map((dv) => ({
+                definition_id: dv.definition_id,
+                option_id: dv.option_id,
+              })),
+            })
+          }}
+        />
+      )}
+    </>
   )
 }

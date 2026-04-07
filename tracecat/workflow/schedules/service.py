@@ -1,32 +1,28 @@
 from __future__ import annotations
 
-from typing import Literal, cast
-
+from sqlalchemy import select
 from sqlalchemy.exc import NoResultFound
-from sqlmodel import select
 from temporalio import activity
 
-from tracecat.db.schemas import Schedule
+from tracecat.authz.controls import require_scope
+from tracecat.db.models import Schedule
 from tracecat.db.session_events import add_after_commit_callback
-from tracecat.identifiers import ScheduleID, WorkflowID
+from tracecat.exceptions import TracecatNotFoundError
+from tracecat.identifiers import ScheduleUUID, WorkflowID
+from tracecat.identifiers.schedules import AnyScheduleID
 from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.logger import logger
-from tracecat.service import BaseService
-from tracecat.types.auth import AccessLevel
-from tracecat.types.exceptions import (
-    TracecatAuthorizationError,
-    TracecatNotFoundError,
-)
+from tracecat.service import BaseWorkspaceService
+from tracecat.storage.object import InlineObject
 from tracecat.workflow.schedules import bridge
-from tracecat.workflow.schedules.models import (
+from tracecat.workflow.schedules.schemas import (
     GetScheduleActivityInputs,
     ScheduleCreate,
-    ScheduleRead,
     ScheduleUpdate,
 )
 
 
-class WorkflowSchedulesService(BaseService):
+class WorkflowSchedulesService(BaseWorkspaceService):
     """Manages schedules for Workflows."""
 
     service_name = "workflow_schedules"
@@ -47,13 +43,14 @@ class WorkflowSchedulesService(BaseService):
         list[Schedule]
             A list of Schedule objects representing the schedules for the specified workflow, or all schedules if no workflow ID is provided.
         """
-        statement = select(Schedule).where(Schedule.owner_id == self.role.workspace_id)
+        statement = select(Schedule).where(Schedule.workspace_id == self.workspace_id)
         if workflow_id is not None:
             statement = statement.where(Schedule.workflow_id == workflow_id)
-        result = await self.session.exec(statement)
-        schedules = result.all()
+        result = await self.session.execute(statement)
+        schedules = result.scalars().all()
         return list(schedules)
 
+    @require_scope("schedule:create")
     async def create_schedule(
         self, params: ScheduleCreate, commit: bool = True
     ) -> Schedule:
@@ -76,11 +73,8 @@ class WorkflowSchedulesService(BaseService):
             If there is an error creating the schedule.
 
         """
-        owner_id = self.role.workspace_id
-        if owner_id is None:
-            raise TracecatAuthorizationError("Workspace ID is required")
         schedule = Schedule(
-            owner_id=owner_id,
+            workspace_id=self.workspace_id,
             workflow_id=WorkflowUUID.new(params.workflow_id),
             inputs=params.inputs or {},
             every=params.every,
@@ -92,12 +86,12 @@ class WorkflowSchedulesService(BaseService):
             status="online",
         )
         self.session.add(schedule)
+        await self.session.flush()
 
-        role = self.role.model_copy(
+        role_copy = self.role.model_copy(
             update={
                 "type": "service",
                 "service_id": "tracecat-schedule-runner",
-                "access_level": AccessLevel.ADMIN,
                 "user_id": None,
             }
         )
@@ -116,14 +110,14 @@ class WorkflowSchedulesService(BaseService):
                     start_at=params.start_at,
                     end_at=params.end_at,
                     timeout=params.timeout,
-                    role=role,
+                    role=role_copy,
                 )
                 logger.info(
                     "Created schedule",
                     handle_id=handle.id,
                     workflow_id=params.workflow_id,
                     schedule_id=schedule_id,
-                    schedule_role=role,
+                    schedule_role=role_copy,
                 )
             except Exception as e:
                 # Log; optionally wire to a retry/outbox
@@ -132,7 +126,7 @@ class WorkflowSchedulesService(BaseService):
                     error=str(e),
                     workflow_id=params.workflow_id,
                     schedule_id=schedule_id,
-                    schedule_role=role,
+                    schedule_role=role_copy,
                 )
 
         add_after_commit_callback(self.session, _create_schedule)
@@ -147,13 +141,13 @@ class WorkflowSchedulesService(BaseService):
         await self.session.refresh(schedule)
         return schedule
 
-    async def get_schedule(self, schedule_id: ScheduleID) -> Schedule:
+    async def get_schedule(self, schedule_id: AnyScheduleID) -> Schedule:
         """
         Retrieve a schedule by its ID.
 
         Parameters
         ----------
-        schedule_id : ScheduleID
+        schedule_id : AnyScheduleID
             The ID of the schedule to retrieve.
 
         Returns
@@ -167,26 +161,28 @@ class WorkflowSchedulesService(BaseService):
             If the schedule is not found
 
         """
-        result = await self.session.exec(
+        schedule_uuid = ScheduleUUID.new(schedule_id)
+        result = await self.session.execute(
             select(Schedule).where(
-                Schedule.owner_id == self.role.workspace_id,
-                Schedule.id == schedule_id,
+                Schedule.workspace_id == self.workspace_id,
+                Schedule.id == schedule_uuid,
             )
         )
         try:
-            return result.one()
+            return result.scalar_one()
         except NoResultFound as e:
-            raise TracecatNotFoundError(f"Schedule {schedule_id} not found") from e
+            raise TracecatNotFoundError(f"Schedule {schedule_uuid} not found") from e
 
+    @require_scope("schedule:update")
     async def update_schedule(
-        self, schedule_id: ScheduleID, params: ScheduleUpdate
+        self, schedule_id: AnyScheduleID, params: ScheduleUpdate
     ) -> Schedule:
         """
         Update a schedule with the given schedule ID and parameters.
 
         Parameters
         ----------
-        schedule_id : ScheduleID
+        schedule_id : AnyScheduleID
             The ID of the schedule to be updated.
         params : ScheduleUpdate
             The updated parameters for the schedule.
@@ -231,15 +227,16 @@ class WorkflowSchedulesService(BaseService):
         await self.session.refresh(schedule)
         return schedule
 
+    @require_scope("schedule:delete")
     async def delete_schedule(
-        self, schedule_id: ScheduleID, commit: bool = True
+        self, schedule_id: AnyScheduleID, commit: bool = True
     ) -> None:
         """
         Delete a schedule.
 
         Parameters
         ----------
-        schedule_id : ScheduleID
+        schedule_id : AnyScheduleID
             The ID of the schedule to be deleted.
 
         Raises
@@ -283,8 +280,10 @@ class WorkflowSchedulesService(BaseService):
 
     @staticmethod
     @activity.defn
-    async def get_schedule_activity(input: GetScheduleActivityInputs) -> ScheduleRead:
-        """Temporal activity to get a schedule.
+    async def get_schedule_trigger_inputs_activity(
+        input: GetScheduleActivityInputs,
+    ) -> InlineObject | None:
+        """Temporal activity to get schedule trigger inputs.
 
         Parameters
         ----------
@@ -293,8 +292,8 @@ class WorkflowSchedulesService(BaseService):
 
         Returns
         -------
-        ScheduleRead
-            The schedule information.
+        InlineObject | None
+            The schedule trigger inputs wrapped in InlineObject, or None if no inputs.
 
         Raises
         ------
@@ -304,20 +303,8 @@ class WorkflowSchedulesService(BaseService):
         async with WorkflowSchedulesService.with_session(role=input.role) as service:
             try:
                 schedule = await service.get_schedule(input.schedule_id)
-                return ScheduleRead(
-                    id=schedule.id,
-                    owner_id=schedule.owner_id,
-                    created_at=schedule.created_at,
-                    updated_at=schedule.updated_at,
-                    workflow_id=WorkflowUUID.new(schedule.workflow_id),
-                    inputs=schedule.inputs,
-                    every=schedule.every,
-                    offset=schedule.offset,
-                    start_at=schedule.start_at,
-                    end_at=schedule.end_at,
-                    timeout=schedule.timeout,
-                    cron=schedule.cron,
-                    status=cast(Literal["online", "offline"], schedule.status),
-                )
+                if schedule.inputs is None:
+                    return None
+                return InlineObject(data=schedule.inputs)
             except TracecatNotFoundError:
                 raise

@@ -2,7 +2,10 @@ import textwrap
 from typing import Any
 
 import pytest
-from tracecat_registry.core.agent import action, agent
+from tracecat_registry import ActionIsInterfaceError
+from tracecat_registry.core.agent import action, agent, bedrock_secret
+
+from tracecat.auth.types import Role
 
 requires_openai_mocks = pytest.mark.usefixtures("mock_openai_secrets")
 
@@ -40,9 +43,10 @@ def _prompt_for_output_type(output_type: Any, base_prompt: str) -> str:
 
 
 @pytest.mark.anyio
+@pytest.mark.live_secret
 @requires_openai_mocks
 @pytest.mark.parametrize("output_type", PRIMITIVE_OUTPUT_TYPES)
-async def test_agent_primitives(output_type):
+async def test_agent_primitives(output_type: Any, test_role: Role) -> None:
     # Import here to avoid any accidental test-time patching/import shenanigans
 
     user_prompt = _prompt_for_output_type(
@@ -59,36 +63,24 @@ async def test_agent_primitives(output_type):
         """),
     )
 
-    result = await agent(
-        user_prompt=user_prompt,
-        model_name="gpt-4o-mini",
-        model_provider="openai",
-        actions=[],
-        instructions="Be concise and factual.",
-        output_type=output_type,
-        max_tools_calls=0,
-        max_requests=3,
-    )
-
-    assert isinstance(result, dict)
-    assert "output" in result
-    assert "message_history" in result
-    assert isinstance(result["message_history"], list)
-
-    output = result["output"]
-    if output_type is None:
-        assert isinstance(output, str)
-        assert len(output) > 0
-    elif output_type == "list[str]":
-        assert isinstance(output, list)
-        assert len(output) >= 1
-        assert all(isinstance(x, str) and x for x in output)
+    with pytest.raises(ActionIsInterfaceError):
+        await agent(
+            user_prompt=user_prompt,
+            model_name="gpt-4o-mini",
+            model_provider="openai",
+            actions=[],
+            instructions="Be concise and factual.",
+            output_type=output_type,
+            max_tool_calls=0,
+            max_requests=3,
+        )
 
 
 @pytest.mark.anyio
+@pytest.mark.live_secret
 @requires_openai_mocks
 @pytest.mark.parametrize("output_type", JSON_SCHEMA_OUTPUT_TYPES)
-async def test_agent_json_schema(output_type):
+async def test_agent_json_schema(output_type: Any, test_role: Role) -> None:
     # Import here to avoid any accidental test-time patching/import shenanigans
 
     user_prompt = _prompt_for_output_type(
@@ -107,84 +99,57 @@ async def test_agent_json_schema(output_type):
         ),
     )
 
-    result = await agent(
-        user_prompt=user_prompt,
-        model_name="gpt-4o-mini",
-        model_provider="openai",
-        actions=[],
-        instructions="Be concise and factual.",
-        output_type=output_type,
-        max_tools_calls=0,
-        max_requests=3,
-    )
-
-    assert isinstance(result, dict)
-    assert "output" in result
-    assert "message_history" in result
-    assert isinstance(result["message_history"], list)
-
-    output = result["output"]
-    assert isinstance(output, dict)
-    # At minimum, the schema requires 'summary'
-    assert "summary" in output and isinstance(output["summary"], str)
+    with pytest.raises(ActionIsInterfaceError):
+        await agent(
+            user_prompt=user_prompt,
+            model_name="gpt-4o-mini",
+            model_provider="openai",
+            actions=[],
+            instructions="Be concise and factual.",
+            output_type=output_type,
+            max_tool_calls=0,
+            max_requests=3,
+        )
 
 
 @pytest.mark.anyio
-@requires_openai_mocks
 @pytest.mark.parametrize("output_type", PRIMITIVE_OUTPUT_TYPES)
-async def test_action_primitives(output_type):
+async def test_action_primitives(output_type: Any) -> None:
     user_prompt = _prompt_for_output_type(
         output_type,
         "Draft a brief, empathetic customer update about a resolved incident.",
     )
 
-    result = await action(
-        user_prompt=user_prompt,
-        model_name="gpt-4o-mini",
-        model_provider="openai",
-        instructions="Be empathetic and concise.",
-        output_type=output_type,
-        max_requests=3,
-    )
-
-    assert isinstance(result, dict)
-    assert "output" in result
-    assert "message_history" in result
-    assert isinstance(result["message_history"], list)
-
-    output = result["output"]
-    if output_type is None:
-        assert isinstance(output, str)
-        assert len(output) > 0
-    elif output_type == "list[str]":
-        assert isinstance(output, list)
-        assert len(output) >= 1
-        assert all(isinstance(x, str) and x for x in output)
+    with pytest.raises(ActionIsInterfaceError):
+        await action(
+            user_prompt=user_prompt,
+            model_name="gpt-4o-mini",
+            model_provider="openai",
+            instructions="Be empathetic and concise.",
+            output_type=output_type,
+            max_requests=3,
+        )
 
 
 @pytest.mark.anyio
-@requires_openai_mocks
 @pytest.mark.parametrize("output_type", JSON_SCHEMA_OUTPUT_TYPES)
-async def test_action_json_schema(output_type):
+async def test_action_json_schema(output_type: Any) -> None:
     user_prompt = _prompt_for_output_type(
         output_type,
         "Draft a brief, empathetic customer update about a resolved incident.",
     )
 
-    result = await action(
-        user_prompt=user_prompt,
-        model_name="gpt-4o-mini",
-        model_provider="openai",
-        instructions="Be empathetic and concise.",
-        output_type=output_type,
-        max_requests=3,
-    )
+    with pytest.raises(ActionIsInterfaceError):
+        await action(
+            user_prompt=user_prompt,
+            model_name="gpt-4o-mini",
+            model_provider="openai",
+            instructions="Be empathetic and concise.",
+            output_type=output_type,
+            max_requests=3,
+        )
 
-    assert isinstance(result, dict)
-    assert "output" in result
-    assert "message_history" in result
-    assert isinstance(result["message_history"], list)
 
-    output = result["output"]
-    assert isinstance(output, dict)
-    assert "summary" in output and isinstance(output["summary"], str)
+def test_bedrock_secret_does_not_advertise_aws_profile() -> None:
+    assert bedrock_secret.optional_keys is not None
+    assert "AWS_PROFILE" not in bedrock_secret.optional_keys

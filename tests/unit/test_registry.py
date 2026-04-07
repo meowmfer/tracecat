@@ -1,26 +1,105 @@
 """Tests for registry UDFs, template actions, and git repository sync."""
 
 import os
+import sys
+import tempfile
 import textwrap
+from datetime import datetime
+from importlib.machinery import ModuleSpec
+from types import ModuleType
+from uuid import UUID
 
 import pytest
 
+from tracecat.exceptions import RegistryValidationError
 from tracecat.git.utils import GitUrl, parse_git_url
 from tracecat.registry.actions.service import RegistryActionsService
 from tracecat.registry.repository import Repository
-from tracecat.types.exceptions import RegistryValidationError
 
 
 @pytest.mark.anyio
 async def test_list_registry_actions(test_role):
-    """Test that the list_registry_actions endpoint returns the correct number of actions."""
+    """Test that list_actions_from_index returns actions."""
     async with RegistryActionsService.with_session(test_role) as service:
-        actions = await service.list_actions()
-        results = []
-        # Call serially instead of calling in parallel to avoid hiding exceptions
-        for action in actions:
-            results.append(await service.read_action_with_implicit_secrets(action))
-        assert len(results) == len(actions)
+        entries = await service.list_actions_from_index()
+        assert len(entries) > 0
+        # Verify each entry is a tuple of (IndexEntry, origin)
+        for entry, origin in entries:
+            assert entry.namespace
+            assert entry.name
+            assert isinstance(origin, str)
+
+
+@pytest.mark.anyio
+async def test_registry_actions_filtered_by_entitlements(test_role, monkeypatch):
+    """Ensure registry listings respect entitlement-gated UDFs."""
+    from tracecat.tiers import defaults as tier_defaults
+
+    monkeypatch.setattr(
+        tier_defaults,
+        "DEFAULT_ENTITLEMENTS",
+        tier_defaults.DEFAULT_ENTITLEMENTS.model_copy(update={"case_addons": False}),
+    )
+
+    async with RegistryActionsService.with_session(test_role) as service:
+        entries = await service.list_actions_from_index(namespace="core.cases")
+        actions = {f"{entry.namespace}.{entry.name}" for entry, _ in entries}
+
+        assert "core.cases.create_task" not in actions
+        assert "core.cases.get_case_metrics" not in actions
+
+        result = await service.get_action_from_index("core.cases.create_task")
+        assert result is None
+
+
+@pytest.mark.anyio
+async def test_registry_actions_include_locked_marks_missing_entitlements(
+    test_role, monkeypatch
+):
+    """Ensure include_locked returns locked actions with availability metadata."""
+    from tracecat.tiers import defaults as tier_defaults
+
+    monkeypatch.setattr(
+        tier_defaults,
+        "DEFAULT_ENTITLEMENTS",
+        tier_defaults.DEFAULT_ENTITLEMENTS.model_copy(update={"case_addons": False}),
+    )
+
+    async with RegistryActionsService.with_session(test_role) as service:
+        entries = await service.list_actions_from_index(
+            namespace="core.cases", include_locked=True
+        )
+
+    actions = {f"{entry.namespace}.{entry.name}": entry for entry, _ in entries}
+    locked_action = actions["core.cases.create_task"]
+    assert locked_action.missing_entitlements == ("case_addons",)
+
+
+@pytest.mark.anyio
+async def test_registry_actions_include_locked_shows_agent_preset_crud(
+    test_role,
+    monkeypatch,
+) -> None:
+    """Ensure agent preset CRUD actions show as locked when agent add-ons are disabled."""
+    from tracecat.tiers import defaults as tier_defaults
+
+    monkeypatch.setattr(
+        tier_defaults,
+        "DEFAULT_ENTITLEMENTS",
+        tier_defaults.DEFAULT_ENTITLEMENTS.model_copy(update={"agent_addons": False}),
+    )
+
+    async with RegistryActionsService.with_session(test_role) as service:
+        entries = await service.list_actions_from_index(
+            namespace="ai.agent", include_locked=True
+        )
+
+    actions = {f"{entry.namespace}.{entry.name}": entry for entry, _ in entries}
+    assert actions["ai.agent.create_preset"].missing_entitlements == ("agent_addons",)
+    assert actions["ai.agent.get_preset"].missing_entitlements == ("agent_addons",)
+    assert actions["ai.agent.list_presets"].missing_entitlements == ("agent_addons",)
+    assert actions["ai.agent.update_preset"].missing_entitlements == ("agent_addons",)
+    assert actions["ai.agent.delete_preset"].missing_entitlements == ("agent_addons",)
 
 
 @pytest.fixture
@@ -130,10 +209,10 @@ def test_udf_validate_args(mock_package):
     assert udf.author == "Tracecat"
 
     # Test the UDF
-    udf.validate_args(num="${{ path.to.number }}")
-    udf.validate_args(num=1)
+    udf.validate_args(args={"num": "${{ path.to.number }}"})
+    udf.validate_args(args={"num": 1})
     with pytest.raises(RegistryValidationError):
-        udf.validate_args(num="not a number")
+        udf.validate_args(args={"num": "not a number"})
 
 
 def test_deprecated_function_can_be_registered(mock_package):
@@ -168,6 +247,106 @@ async def test_registry_async_function_can_be_called(mock_package):
     udf = repo.get("test.async_test_function")
     for i in range(10):
         assert await udf.fn(num=i) == i
+
+
+def test_validate_args_mode_parameter(tmp_path):
+    """Test that validate_args mode parameter works correctly with default and explicit values."""
+
+    # Create a new test module with datetime/UUID UDFs
+    test_module = ModuleType("test_mode_module")
+    module_spec = ModuleSpec("test_mode_module", None)
+    test_module.__spec__ = module_spec
+    test_module.__path__ = [str(tmp_path)]
+
+    try:
+        sys.modules["test_mode_module"] = test_module
+
+        # Create a file with UDF that accepts datetime
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", dir=tmp_path, delete=False
+        ) as f:
+            f.write(
+                textwrap.dedent(
+                    """
+                from datetime import datetime
+                from uuid import UUID
+                from tracecat_registry import registry
+
+                @registry.register(
+                    description="Test function with datetime",
+                    namespace="test",
+                    doc_url="https://example.com/docs",
+                    author="Tracecat",
+                )
+                def datetime_test(dt: datetime, uid: UUID) -> dict:
+                    return {"dt": dt, "uid": uid}
+            """
+                )
+            )
+
+        # Register the UDF
+        repo = Repository()
+        repo._register_udfs_from_package(test_module)
+        udf = repo.get("test.datetime_test")
+
+        # Test data
+        test_datetime = datetime(2024, 1, 15, 10, 30, 0)
+        test_uuid = UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+        # TEST 1: Default mode should be "json"
+        result_default = udf.validate_args(args={"dt": test_datetime, "uid": test_uuid})
+        assert isinstance(result_default["dt"], str), (
+            "Default mode should serialize datetime to string"
+        )
+        assert isinstance(result_default["uid"], str), (
+            "Default mode should serialize UUID to string"
+        )
+        assert result_default["dt"] == "2024-01-15T10:30:00"
+        assert result_default["uid"] == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+        # TEST 2: Explicit mode="json"
+        result_json = udf.validate_args(
+            args={"dt": test_datetime, "uid": test_uuid}, mode="json"
+        )
+        assert isinstance(result_json["dt"], str), (
+            "JSON mode should serialize datetime to string"
+        )
+        assert isinstance(result_json["uid"], str), (
+            "JSON mode should serialize UUID to string"
+        )
+        assert result_json["dt"] == "2024-01-15T10:30:00"
+        assert result_json["uid"] == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+        # TEST 3: Explicit mode="python"
+        result_python = udf.validate_args(
+            args={"dt": test_datetime, "uid": test_uuid}, mode="python"
+        )
+        assert isinstance(result_python["dt"], datetime), (
+            "Python mode should preserve datetime type"
+        )
+        assert isinstance(result_python["uid"], UUID), (
+            "Python mode should preserve UUID type"
+        )
+        assert result_python["dt"] == test_datetime
+        assert result_python["uid"] == test_uuid
+
+        # TEST 4: Template expressions work in both modes
+        # Should not raise RegistryValidationError
+        udf.validate_args(
+            args={"dt": "${{ INPUTS.timestamp }}", "uid": "${{ INPUTS.id }}"}
+        )
+        udf.validate_args(
+            args={"dt": "${{ INPUTS.timestamp }}", "uid": "${{ INPUTS.id }}"},
+            mode="json",
+        )
+        udf.validate_args(
+            args={"dt": "${{ INPUTS.timestamp }}", "uid": "${{ INPUTS.id }}"},
+            mode="python",
+        )
+
+    finally:
+        # Clean up
+        del sys.modules["test_mode_module"]
 
 
 @pytest.mark.parametrize(
@@ -223,6 +402,27 @@ async def test_registry_async_function_can_be_called(mock_package):
                 ref=None,
             ),
         ),
+        # GitHub Enterprise with a scoped SSH user
+        (
+            "git+ssh://someuser@git.example.com/org/repo",
+            GitUrl(
+                host="git.example.com",
+                org="org",
+                repo="repo",
+                user="someuser",
+                ref=None,
+            ),
+        ),
+        # Branch names may include slashes
+        (
+            "git+ssh://git@github.com/org/repo@feature/custom-branch",
+            GitUrl(
+                host="github.com",
+                org="org",
+                repo="repo",
+                ref="feature/custom-branch",
+            ),
+        ),
         # # Private GitLab nested in a subdirectory
         # (
         #     "git+ssh://git@internal.tracecat/org/group/repo",
@@ -258,14 +458,10 @@ def test_parse_git_url(url: str, expected: GitUrl):
             "git+ssh://git@github.com/org",
             id="Missing repository name",
         ),
-        pytest.param(
-            "git+ssh://git@github.com/org/repo@branch/extra",
-            id="Invalid branch format with extra path component",
-        ),
     ],
 )
 def test_parse_git_url_invalid(url: str):
-    allowed_domains = {"github.com", "gitlab.com"}
+    allowed_domains = {"github.com", "gitlab.com", "git.example.com"}
     with pytest.raises(ValueError):
         parse_git_url(url, allowed_domains=allowed_domains)
 

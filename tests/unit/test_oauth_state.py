@@ -6,23 +6,23 @@ from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
-import sqlalchemy as sa
 from cryptography.fernet import Fernet
 from pydantic import BaseModel, SecretStr
-from sqlmodel import col, select
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracecat import config
-from tracecat.db.schemas import OAuthStateDB, User, Workspace
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import ADMIN_SCOPES
+from tracecat.db.models import OAuthStateDB, User, Workspace
 from tracecat.integrations.enums import OAuthGrantType
-from tracecat.integrations.models import (
+from tracecat.integrations.providers.base import AuthorizationCodeOAuthProvider
+from tracecat.integrations.schemas import (
     ProviderKey,
     ProviderMetadata,
     ProviderScopes,
 )
-from tracecat.integrations.providers.base import AuthorizationCodeOAuthProvider
 from tracecat.integrations.service import IntegrationService
-from tracecat.types.auth import AccessLevel, Role
 
 pytestmark = pytest.mark.usefixtures("db")
 
@@ -38,9 +38,9 @@ class MockOAuthProvider(AuthorizationCodeOAuthProvider):
     """Mock OAuth provider for testing."""
 
     id: ClassVar[str] = "mock_oauth_state_provider"
-    _authorization_endpoint: ClassVar[str] = "https://mock.provider/oauth/authorize"
-    _token_endpoint: ClassVar[str] = "https://mock.provider/oauth/token"
-    config_model: ClassVar[type[BaseModel]] = MockProviderConfig
+    _authorization_endpoint: ClassVar[str] = "https://mock.provider/oauth/authorize"  # type: ignore[assignment]
+    _token_endpoint: ClassVar[str] = "https://mock.provider/oauth/token"  # type: ignore[assignment]
+    config_model: ClassVar[type[BaseModel]] = MockProviderConfig  # type: ignore[assignment]
     scopes: ClassVar[ProviderScopes] = ProviderScopes(
         default=["read", "write"],
     )
@@ -57,7 +57,7 @@ class MockOAuthProvider(AuthorizationCodeOAuthProvider):
 def encryption_key(monkeypatch: pytest.MonkeyPatch) -> str:
     """Set up encryption key for testing."""
     key = Fernet.generate_key().decode()
-    monkeypatch.setenv("TRACECAT__DB_ENCRYPTION_KEY", key)
+    monkeypatch.setattr(config, "TRACECAT__DB_ENCRYPTION_KEY", key)
     return key
 
 
@@ -86,10 +86,11 @@ async def integration_service(
     """Create an integration service instance for testing."""
     role = Role(
         type="user",
-        access_level=AccessLevel.BASIC,
         workspace_id=svc_workspace.id,
+        organization_id=svc_workspace.organization_id,
         user_id=test_user.id,
         service_id="tracecat-api",
+        scopes=ADMIN_SCOPES,
     )
     return IntegrationService(session=session, role=role)
 
@@ -100,8 +101,10 @@ async def test_role_with_user(svc_workspace, test_user: User) -> Role:
     return Role(
         type="user",
         workspace_id=svc_workspace.id,
+        organization_id=svc_workspace.organization_id,
         user_id=test_user.id,
         service_id="tracecat-api",
+        scopes=ADMIN_SCOPES,
     )
 
 
@@ -184,19 +187,17 @@ class TestOAuthState:
         await session.commit()
 
         # Perform cleanup
-        stmt = sa.delete(OAuthStateDB).where(
-            col(OAuthStateDB.expires_at) < current_time
-        )
-        await session.exec(stmt)  # type: ignore
+        stmt = delete(OAuthStateDB).where(OAuthStateDB.expires_at < current_time)
+        await session.execute(stmt)
         await session.commit()
 
         # Verify only valid state remains
-        stmt = select(OAuthStateDB).where(col(OAuthStateDB.state) == valid_state.state)
-        result = await session.exec(stmt)
-        remaining_states = result.all()
+        stmt = select(OAuthStateDB).where(OAuthStateDB.state == valid_state.state)
+        result = await session.execute(stmt)
+        remaining_states = result.scalars().all()
 
         assert len(remaining_states) == 1
-        assert remaining_states[0].state == valid_state.state  # type: ignore
+        assert remaining_states[0].state == valid_state.state
 
     async def test_oauth_state_with_for_update_lock(
         self,
@@ -231,9 +232,9 @@ class TestOAuthState:
         await session.commit()
 
         # Verify it's deleted
-        stmt = select(OAuthStateDB).where(col(OAuthStateDB.state) == state_id)
-        result = await session.exec(stmt)
-        assert result.first() is None
+        stmt = select(OAuthStateDB).where(OAuthStateDB.state == state_id)
+        result = await session.execute(stmt)
+        assert result.scalars().first() is None
 
     async def test_oauth_state_validation(
         self,
@@ -271,9 +272,10 @@ class TestOAuthState:
         session.add(expired_state)
 
         # Create a second workspace for the "wrong workspace" test
+        # Use the same organization as the test workspace to satisfy FK constraint
         wrong_workspace = Workspace(
             name="wrong-test-workspace",
-            owner_id=config.TRACECAT__DEFAULT_ORG_ID,
+            organization_id=test_role_with_user.organization_id,
         )
         session.add(wrong_workspace)
         await session.commit()
@@ -327,7 +329,8 @@ class TestOAuthState:
             provider_key=provider_key,
             client_id="test_client_id",
             client_secret=SecretStr("test_client_secret"),
-            provider_config={"redirect_uri": "http://localhost:8000/callback"},
+            authorization_endpoint="https://login.example.com/oauth2/v2.0/authorize",
+            token_endpoint="https://login.example.com/oauth2/v2.0/token",
         )
 
         # Ensure role has required fields

@@ -1,9 +1,9 @@
 """Sentry MCP OAuth integration using Model Context Protocol."""
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
-from tracecat.integrations.models import ProviderMetadata, ProviderScopes
 from tracecat.integrations.providers.base import MCPAuthProvider
+from tracecat.integrations.schemas import ProviderMetadata, ProviderScopes
 
 
 class SentryMCPProvider(MCPAuthProvider):
@@ -21,7 +21,7 @@ class SentryMCPProvider(MCPAuthProvider):
     id: ClassVar[str] = "sentry_mcp"
 
     # MCP server endpoint - OAuth endpoints discovered automatically
-    _mcp_server_uri: ClassVar[str] = "https://mcp.sentry.dev/mcp"
+    mcp_server_uri: ClassVar[str] = "https://mcp.sentry.dev/mcp"
 
     # No default scopes - authorization server determines based on user permissions
     scopes: ClassVar[ProviderScopes] = ProviderScopes(default=[])
@@ -37,12 +37,19 @@ class SentryMCPProvider(MCPAuthProvider):
             "Connect to Sentry MCP to access issues and performance monitoring. "
             "Permissions are automatically determined based on your Sentry organization access."
         ),
-        setup_steps=[
-            "Click 'Connect' to begin OAuth authorization",
-            "Authenticate with your Sentry account",
-            "Select your Sentry organization if prompted",
-            "Review and approve the OAuth client permissions",
-            "Complete authorization to enable MCP integration",
-        ],
         api_docs_url="https://docs.sentry.io/product/sentry-mcp/",
     )
+
+    def _get_additional_authorize_params(self) -> dict[str, Any]:
+        """Use the MCP endpoint as the OAuth resource for Sentry."""
+
+        params = super()._get_additional_authorize_params()
+        params["resource"] = self.mcp_server_uri
+        return params
+
+    def _get_additional_token_params(self) -> dict[str, Any]:
+        """Use the same MCP endpoint resource during token exchange."""
+
+        params = super()._get_additional_token_params()
+        params["resource"] = self.mcp_server_uri
+        return params

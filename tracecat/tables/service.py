@@ -1,7 +1,10 @@
+import csv
 from collections import defaultdict
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Any
+from io import StringIO
+from pathlib import Path
+from typing import Any, Literal
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -10,10 +13,11 @@ from asyncpg.exceptions import (
     InvalidCachedStatementError,
     UndefinedTableError,
 )
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.exc import DBAPIError, IntegrityError, NoResultFound, ProgrammingError
-from sqlmodel import select
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+from sqlalchemy.orm import selectinload
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -21,50 +25,117 @@ from tenacity import (
     wait_exponential,
 )
 
-from tracecat.authz.controls import require_access_level
-from tracecat.db.schemas import Table, TableColumn
+from tracecat import config
+from tracecat.audit.logger import audit_log
+from tracecat.auth.types import Role
+from tracecat.authz.controls import require_scope
+from tracecat.db.models import Table, TableColumn
+from tracecat.exceptions import (
+    TracecatImportError,
+    TracecatNotFoundError,
+)
 from tracecat.identifiers import TableColumnID, TableID
 from tracecat.identifiers.workflow import WorkspaceUUID
-from tracecat.service import BaseService
+from tracecat.logger import logger
+from tracecat.pagination import (
+    BaseCursorPaginator,
+    CursorPaginatedResponse,
+    CursorPaginationParams,
+)
+from tracecat.service import BaseWorkspaceService
 from tracecat.tables.common import (
-    handle_default_value,
+    coerce_multi_select_value,
+    coerce_select_value,
+    coerce_to_date,
+    coerce_to_utc_datetime,
+    convert_value,
     is_valid_sql_type,
+    normalize_column_options,
+    prepare_default_value,
     to_sql_clause,
 )
 from tracecat.tables.enums import SqlType
-from tracecat.tables.models import (
+from tracecat.tables.importer import (
+    CSVSchemaInferer,
+    InferredCSVColumn,
+    generate_table_name,
+)
+from tracecat.tables.schemas import (
     TableColumnCreate,
     TableColumnUpdate,
     TableCreate,
     TableRowInsert,
     TableUpdate,
 )
-from tracecat.types.auth import AccessLevel, Role
-from tracecat.types.exceptions import TracecatAuthorizationError, TracecatNotFoundError
-from tracecat.types.pagination import (
-    BaseCursorPaginator,
-    CursorPaginatedResponse,
-    CursorPaginationParams,
-)
 
 _RETRYABLE_DB_EXCEPTIONS = (
     InvalidCachedStatementError,
     InFailedSQLTransactionError,
 )
+_TABLE_SYSTEM_COLUMNS = frozenset({"id", "created_at", "updated_at"})
+
+DYNAMIC_WORKSPACE_TENANT_COLUMN = "__tc_workspace_id"
+DYNAMIC_WORKSPACE_RLS_POLICY = "rls_policy_dynamic_workspace"
+RLS_WORKSPACE_VAR = "app.current_workspace_id"
+RLS_BYPASS_VAR = "app.rls_bypass"
+RLS_BYPASS_ON = "on"
+INTERNAL_COLUMN_PREFIX = "__tc_"
+SYSTEM_VISIBLE_COLUMN_NAMES: tuple[str, ...] = ("id", "created_at", "updated_at")
 
 
-class BaseTablesService(BaseService):
+def visible_column_names(column_names: Sequence[str]) -> list[str]:
+    """Build the API-facing column order for dynamic table row payloads."""
+    visible_names: list[str] = list(SYSTEM_VISIBLE_COLUMN_NAMES)
+    seen_lower: set[str] = {
+        column_name.lower() for column_name in SYSTEM_VISIBLE_COLUMN_NAMES
+    }
+    for column_name in column_names:
+        if is_internal_column_name(column_name):
+            continue
+        if (normalized_name := column_name.lower()) in seen_lower:
+            continue
+        visible_names.append(column_name)
+        seen_lower.add(normalized_name)
+    return visible_names
+
+
+def visible_column_clauses(column_names: Sequence[str]) -> list[sa.ColumnClause]:
+    """Return SQLAlchemy column clauses for API-facing row payloads."""
+    return [
+        sa.column(column_name) for column_name in visible_column_names(column_names)
+    ]
+
+
+class BaseTablesService(BaseWorkspaceService):
     """Service for managing user-defined tables."""
 
     service_name = "tables"
 
+    def __init__(self, session: AsyncSession, role: Role | None = None):
+        super().__init__(session, role)
+        self.ws_uuid = WorkspaceUUID.new(self.workspace_id)
+
     def _sanitize_identifier(self, identifier: str) -> str:
-        """Sanitize table/column names to prevent SQL injection."""
+        """Normalize a stored identifier to its physical SQL name."""
         return sanitize_identifier(identifier)
+
+    def _resolve_external_column_name(self, table: Table, column_name: str) -> str:
+        """Resolve an external column name against metadata without aliasing invalid names."""
+        column_names = {column.name for column in table.columns} | _TABLE_SYSTEM_COLUMNS
+        if column_name in column_names:
+            return column_name
+
+        normalized_name = validate_identifier(column_name)
+        if normalized_name in column_names:
+            return normalized_name
+
+        raise ValueError(
+            f"Column '{column_name}' does not exist in table '{table.name}'"
+        )
 
     def _get_schema_name(self, workspace_id: WorkspaceUUID | None = None) -> str:
         """Generate the schema name for a workspace."""
-        ws_id = workspace_id or self._workspace_id()
+        ws_id = workspace_id or self.ws_uuid
         # Using double quotes to allow dots in schema name
         return f"tables_{ws_id.short()}"
 
@@ -74,14 +145,148 @@ class BaseTablesService(BaseService):
         """Get the full table name for a table."""
         schema_name = self._get_schema_name(workspace_id)
         sanitized_table_name = self._sanitize_identifier(table_name)
-        return f'"{schema_name}".{sanitized_table_name}'
+        return f'"{schema_name}"."{sanitized_table_name}"'
 
-    def _workspace_id(self) -> WorkspaceUUID:
-        """Get the workspace ID for the current role."""
-        workspace_id = self.role.workspace_id
-        if workspace_id is None:
-            raise TracecatAuthorizationError("Workspace ID is required")
-        return WorkspaceUUID.new(workspace_id)
+    def _workspace_tenant_default_sql(self) -> sa.TextClause:
+        """Build the server default expression for the tenant column."""
+        return sa.text(f"'{self.ws_uuid}'::uuid")
+
+    def _visible_columns(self, table: Table) -> list[sa.ColumnClause]:
+        """Column list for API-facing queries, excluding internal columns."""
+        return visible_column_clauses([c.name for c in table.columns])
+
+    def _assert_user_column_name_allowed(self, column_name: str) -> None:
+        """Reject operations on internal/system-managed column names."""
+        if is_internal_column_name(column_name):
+            raise ValueError(f"Column {column_name} is reserved for internal use")
+
+    async def _enable_workspace_rls_for_physical_table(
+        self, conn: AsyncConnection, full_table_name: str
+    ) -> None:
+        """Enable workspace RLS policy on a dynamic physical table."""
+        policy_expr = (
+            f"current_setting('{RLS_BYPASS_VAR}', true) = '{RLS_BYPASS_ON}' "
+            f'OR "{DYNAMIC_WORKSPACE_TENANT_COLUMN}" = '
+            f"NULLIF(current_setting('{RLS_WORKSPACE_VAR}', true), '')::uuid"
+        )
+        await conn.execute(
+            sa.DDL("ALTER TABLE %s ENABLE ROW LEVEL SECURITY", full_table_name)
+        )
+        await conn.execute(
+            sa.DDL(
+                f"DROP POLICY IF EXISTS {DYNAMIC_WORKSPACE_RLS_POLICY} ON %s",
+                full_table_name,
+            )
+        )
+        await conn.execute(
+            sa.DDL(
+                f"""
+                CREATE POLICY {DYNAMIC_WORKSPACE_RLS_POLICY} ON %s
+                    FOR ALL
+                    USING ({policy_expr})
+                    WITH CHECK ({policy_expr})
+                """,
+                full_table_name,
+            )
+        )
+
+    async def _find_unique_table_name(self, base_name: str) -> str:
+        """Find a unique table name by appending numeric suffixes if required."""
+        candidate = base_name
+        suffix = 1
+        while True:
+            try:
+                await self.get_table_by_name(candidate)
+            except TracecatNotFoundError:
+                return candidate
+            candidate = f"{base_name}_{suffix}"
+            suffix += 1
+
+    def _normalize_options_for_type(
+        self, sql_type: SqlType, options: list[str] | None
+    ) -> list[str] | None:
+        # Only SELECT and MULTI_SELECT types support options
+        if sql_type not in (SqlType.SELECT, SqlType.MULTI_SELECT):
+            if options:
+                raise ValueError(
+                    "Options are only supported for SELECT or MULTI_SELECT"
+                )
+            return None
+
+        # For SELECT/MULTI_SELECT, normalize and validate options
+        normalized = normalize_column_options(options)
+        if not normalized:
+            raise ValueError(
+                "SELECT and MULTI_SELECT columns must define at least one option"
+            )
+        return normalized
+
+    def _coerce_value_for_column(
+        self, sql_type: SqlType, value: Any, options: list[str] | None
+    ) -> Any:
+        if value is None:
+            return None
+        if sql_type is SqlType.SELECT:
+            return coerce_select_value(value, options=options)
+        if sql_type is SqlType.MULTI_SELECT:
+            return coerce_multi_select_value(value, options=options)
+        return value
+
+    def _normalize_row_inputs(
+        self, table: Table, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Coerce row inputs to the expected SQL types."""
+        if not data:
+            return {}
+
+        column_index = {column.name: column for column in table.columns}
+        normalised: dict[str, Any] = {}
+        for column_name, value in data.items():
+            column = column_index.get(column_name)
+            if column is None:
+                raise ValueError(
+                    f"Column '{column_name}' does not exist in table '{table.name}'"
+                )
+
+            sql_type = SqlType(column.type)
+            if value is None:
+                normalised[column_name] = None
+                continue
+
+            if sql_type in (SqlType.SELECT, SqlType.MULTI_SELECT):
+                normalised[column_name] = self._coerce_value_for_column(
+                    sql_type, value, column.options
+                )
+                continue
+
+            if sql_type is SqlType.TIMESTAMPTZ:
+                normalised[column_name] = coerce_to_utc_datetime(value)
+            elif sql_type is SqlType.DATE and value is not None:
+                normalised[column_name] = coerce_to_date(value)
+            else:
+                normalised[column_name] = value
+
+        return normalised
+
+    def _sa_type_for_column(self, sql_type: SqlType) -> sa.types.TypeEngine:
+        """Map SqlType to SQLAlchemy column types for safe binding."""
+        match sql_type:
+            case SqlType.TEXT | SqlType.SELECT:
+                return sa.String()
+            case SqlType.INTEGER:
+                return sa.BigInteger()
+            case SqlType.NUMERIC:
+                return sa.Numeric()
+            case SqlType.DATE:
+                return sa.Date()
+            case SqlType.BOOLEAN:
+                return sa.Boolean()
+            case SqlType.TIMESTAMPTZ:
+                return sa.TIMESTAMP(timezone=True)
+            case SqlType.JSONB | SqlType.MULTI_SELECT:
+                return JSONB()
+            case _:
+                return sa.String()
 
     async def list_tables(self) -> Sequence[Table]:
         """List all lookup tables for a workspace.
@@ -95,20 +300,18 @@ class BaseTablesService(BaseService):
         Raises:
             ValueError: If the workspace ID is invalid
         """
-        ws_id = self._workspace_id()
-        statement = select(Table).where(Table.owner_id == ws_id)
-        result = await self.session.exec(statement)
-        return result.all()
+        statement = select(Table).where(Table.workspace_id == self.ws_uuid)
+        result = await self.session.execute(statement)
+        return result.scalars().all()
 
     async def get_table(self, table_id: TableID) -> Table:
         """Get a lookup table by ID."""
-        ws_id = self._workspace_id()
         statement = select(Table).where(
-            Table.owner_id == ws_id,
+            Table.workspace_id == self.ws_uuid,
             Table.id == table_id,
         )
-        result = await self.session.exec(statement)
-        table = result.first()
+        result = await self.session.execute(statement)
+        table = result.scalars().first()
         if table is None:
             raise TracecatNotFoundError("Table not found")
 
@@ -147,21 +350,33 @@ class BaseTablesService(BaseService):
             The requested Table
 
         Raises:
+            ValueError: If the provided table name is not a valid external identifier
             TracecatNotFoundError: If the table does not exist
         """
-        ws_id = self._workspace_id()
-        sanitized_name = self._sanitize_identifier(table_name)
         statement = select(Table).where(
-            Table.owner_id == ws_id,
-            Table.name == sanitized_name,
+            Table.workspace_id == self.ws_uuid,
+            Table.name == table_name,
         )
-        result = await self.session.exec(statement)
-        table = result.first()
+        result = await self.session.execute(statement)
+        table = result.scalars().first()
+        if table is not None:
+            return table
+
+        normalized_name = validate_identifier(table_name)
+        if normalized_name == table_name:
+            raise TracecatNotFoundError(f"Table '{table_name}' not found")
+
+        statement = select(Table).where(
+            Table.workspace_id == self.ws_uuid,
+            Table.name == normalized_name,
+        )
+        result = await self.session.execute(statement)
+        table = result.scalars().first()
         if table is None:
             raise TracecatNotFoundError(f"Table '{table_name}' not found")
         return table
 
-    @require_access_level(AccessLevel.ADMIN)
+    @audit_log(resource_type="table", action="create")
     async def create_table(self, params: TableCreate) -> Table:
         """Create a new lookup table.
 
@@ -175,9 +390,8 @@ class BaseTablesService(BaseService):
             TracecatAuthorizationError: If user lacks required permissions
             ValueError: If table name is invalid
         """
-        ws_id = self._workspace_id()
-        schema_name = self._get_schema_name(ws_id)
-        table_name = self._sanitize_identifier(params.name)
+        schema_name = self._get_schema_name(self.ws_uuid)
+        table_name = validate_identifier(params.name)
 
         # Create schema if it doesn't exist
         conn = await self.session.connection()
@@ -205,6 +419,12 @@ class BaseTablesService(BaseService):
                 nullable=False,
                 server_default=sa.text("now()"),
             ),
+            sa.Column(
+                DYNAMIC_WORKSPACE_TENANT_COLUMN,
+                sa.UUID,
+                nullable=False,
+                server_default=self._workspace_tenant_default_sql(),
+            ),
             schema=schema_name,
         )
 
@@ -214,9 +434,12 @@ class BaseTablesService(BaseService):
 
         # Create the physical table
         await conn.run_sync(new_table.create)
+        await self._enable_workspace_rls_for_physical_table(
+            conn, self._full_table_name(table_name)
+        )
 
         # Create metadata entry
-        table = Table(owner_id=ws_id, name=table_name)
+        table = Table(workspace_id=self.ws_uuid, name=table_name)
         self.session.add(table)
         await self.session.flush()
 
@@ -227,7 +450,7 @@ class BaseTablesService(BaseService):
 
         return table
 
-    @require_access_level(AccessLevel.ADMIN)
+    @audit_log(resource_type="table", action="update")
     async def update_table(self, table: Table, params: TableUpdate) -> Table:
         """Update a lookup table."""
         # We need to update the table name in the physical table
@@ -236,7 +459,7 @@ class BaseTablesService(BaseService):
             try:
                 conn = await self.session.connection()
                 old_full_table_name = self._full_table_name(table.name)
-                sanitized_new_name = self._sanitize_identifier(new_name)
+                sanitized_new_name = validate_identifier(new_name)
                 await conn.execute(
                     sa.DDL(
                         "ALTER TABLE %s RENAME TO %s",
@@ -251,6 +474,7 @@ class BaseTablesService(BaseService):
                     new_name=params.name,
                 )
                 raise
+            set_fields["name"] = sanitized_new_name
         # Update DB Table
         for key, value in set_fields.items():
             setattr(table, key, value)
@@ -258,7 +482,7 @@ class BaseTablesService(BaseService):
         await self.session.flush()
         return table
 
-    @require_access_level(AccessLevel.ADMIN)
+    @audit_log(resource_type="table", action="delete")
     async def delete_table(self, table: Table) -> None:
         """Delete a lookup table."""
         # Delete the metadata first
@@ -276,17 +500,25 @@ class BaseTablesService(BaseService):
         self, table_id: TableID, column_id: TableColumnID
     ) -> TableColumn:
         """Get a column by ID."""
-        statement = select(TableColumn).where(
-            TableColumn.table_id == table_id,
-            TableColumn.id == column_id,
+        statement = (
+            select(TableColumn)
+            .join(Table, Table.id == TableColumn.table_id)
+            .options(
+                selectinload(TableColumn.table).selectinload(Table.columns),
+            )
+            .where(
+                TableColumn.table_id == table_id,
+                TableColumn.id == column_id,
+                Table.workspace_id == self.workspace_id,
+            )
         )
-        result = await self.session.exec(statement)
-        column = result.first()
+        result = await self.session.execute(statement)
+        column = result.scalars().first()
         if column is None:
             raise TracecatNotFoundError("Column not found")
         return column
 
-    @require_access_level(AccessLevel.ADMIN)
+    @audit_log(resource_type="table_column", action="create")
     async def create_column(
         self, table: Table, params: TableColumnCreate
     ) -> TableColumn:
@@ -302,34 +534,50 @@ class BaseTablesService(BaseService):
         Raises:
             ValueError: If the column type is invalid
         """
-        column_name = self._sanitize_identifier(params.name)
+        self._assert_user_column_name_allowed(params.name)
+        column_name = validate_identifier(params.name)
         full_table_name = self._full_table_name(table.name)
 
         # Validate SQL type first
         if not is_valid_sql_type(params.type):
             raise ValueError(f"Invalid type: {params.type}")
         sql_type = SqlType(params.type)
+        normalized_options = self._normalize_options_for_type(sql_type, params.options)
 
         # Handle default value based on type
         default_value = params.default
+        rendered_default = None
         if default_value is not None:
-            default_value = handle_default_value(sql_type, default_value)
+            default_value, rendered_default = prepare_default_value(
+                sql_type, default_value
+            )
         # Create the column metadata first
         column = TableColumn(
             table_id=table.id,
             name=column_name,
             type=sql_type.value,
             nullable=params.nullable,
-            default=default_value,  # Store original default in metadata
+            default=default_value,
+            options=normalized_options,
         )
         self.session.add(column)
 
         # Build the column definition string
-        column_def = [f"{column_name} {sql_type.value}"]
+        # Map SELECT -> TEXT, MULTI_SELECT -> JSONB for physical storage
+        if sql_type is SqlType.SELECT:
+            column_type_sql = SqlType.TEXT.value
+        elif sql_type is SqlType.MULTI_SELECT:
+            column_type_sql = SqlType.JSONB.value
+        else:
+            # Map INTEGER to BIGINT for larger integer support
+            column_type_sql = (
+                "BIGINT" if sql_type == SqlType.INTEGER else sql_type.value
+            )
+        column_def = [f"{quote_identifier(column_name)} {column_type_sql}"]
         if not params.nullable:
             column_def.append("NOT NULL")
-        if default_value is not None:
-            column_def.append(f"DEFAULT {default_value}")
+        if rendered_default is not None:
+            column_def.append(f"DEFAULT {rendered_default}")
 
         column_def_str = " ".join(column_def)
 
@@ -345,7 +593,7 @@ class BaseTablesService(BaseService):
         await self.session.flush()
         return column
 
-    @require_access_level(AccessLevel.ADMIN)
+    @audit_log(resource_type="table_column", action="update")
     async def update_column(
         self,
         column: TableColumn,
@@ -365,20 +613,51 @@ class BaseTablesService(BaseService):
             ProgrammingError: If the database operation fails
         """
         set_fields = params.model_dump(exclude_unset=True)
+        self._assert_user_column_name_allowed(column.name)
+        if "name" in set_fields:
+            if (requested_name := set_fields["name"]) is None:
+                set_fields.pop("name")
+            else:
+                self._assert_user_column_name_allowed(requested_name)
         full_table_name = self._full_table_name(column.table.name)
         conn = await self.session.connection()
         is_index = set_fields.pop("is_index", False)
+        requested_options = set_fields.pop("options", None)
 
         # Create index if requested
         if is_index:
             await self.create_unique_index(column.table, column.name)
 
+        # Handle options for SELECT/MULTI_SELECT columns
+        target_type = (
+            SqlType(set_fields["type"])
+            if "type" in set_fields
+            else SqlType(column.type)
+        )
+        if requested_options is not None:
+            normalized_options = self._normalize_options_for_type(
+                target_type, requested_options
+            )
+            set_fields["options"] = normalized_options
+        elif "type" in set_fields:
+            if (
+                target_type in (SqlType.SELECT, SqlType.MULTI_SELECT)
+                and not column.options
+            ):
+                raise ValueError(
+                    "SELECT and MULTI_SELECT columns must define at least one option"
+                )
+            elif target_type not in (SqlType.SELECT, SqlType.MULTI_SELECT):
+                set_fields["options"] = None
+
+        old_name = self._sanitize_identifier(column.name)
+        new_name = self._sanitize_identifier(
+            set_fields["name"] if "name" in set_fields else column.name
+        )
+        new_type = set_fields.get("type", column.type)
+
         # Handle physical column changes if name or type is being updated
         if "name" in set_fields or "type" in set_fields:
-            old_name = self._sanitize_identifier(column.name)
-            new_name = self._sanitize_identifier(set_fields.get("name", column.name))
-            new_type = set_fields.get("type", column.type)
-
             if not is_valid_sql_type(new_type):
                 raise ValueError(f"Invalid type: {new_type}")
 
@@ -387,65 +666,71 @@ class BaseTablesService(BaseService):
                 await conn.execute(
                     sa.DDL(
                         "ALTER TABLE %s RENAME COLUMN %s TO %s",
-                        (full_table_name, old_name, new_name),
+                        (
+                            full_table_name,
+                            quote_identifier(old_name),
+                            quote_identifier(new_name),
+                        ),
                     )
                 )
             if "type" in set_fields:
+                # Map SELECT -> TEXT, MULTI_SELECT -> JSONB for physical storage
+                if target_type is SqlType.SELECT:
+                    physical_type = SqlType.TEXT.value
+                elif target_type is SqlType.MULTI_SELECT:
+                    physical_type = SqlType.JSONB.value
+                else:
+                    physical_type = (
+                        "BIGINT" if SqlType(new_type) == SqlType.INTEGER else new_type
+                    )
                 await conn.execute(
                     sa.DDL(
                         "ALTER TABLE %s ALTER COLUMN %s TYPE %s",
-                        (full_table_name, new_name, new_type),
+                        (full_table_name, quote_identifier(new_name), physical_type),
                     )
                 )
-            if "nullable" in set_fields:
-                constraint = (
-                    "DROP NOT NULL" if set_fields["nullable"] else "SET NOT NULL"
+        if "nullable" in set_fields:
+            constraint = "DROP NOT NULL" if set_fields["nullable"] else "SET NOT NULL"
+            await conn.execute(
+                sa.DDL(
+                    # SAFE f-string: constraint is a controlled literal string ("DROP NOT NULL" or "SET NOT NULL")
+                    # No user input is interpolated here - only predefined SQL keywords
+                    f"ALTER TABLE %s ALTER COLUMN %s {constraint}",
+                    (full_table_name, quote_identifier(new_name)),
                 )
+            )
+        if "default" in set_fields:
+            updated_default = set_fields["default"]
+            if updated_default is None:
                 await conn.execute(
                     sa.DDL(
-                        # SAFE f-string: constraint is a controlled literal string ("DROP NOT NULL" or "SET NOT NULL")
-                        # No user input is interpolated here - only predefined SQL keywords
-                        f"ALTER TABLE %s ALTER COLUMN %s {constraint}",
-                        (full_table_name, new_name),
+                        "ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
+                        (full_table_name, quote_identifier(new_name)),
                     )
                 )
-            if "default" in set_fields:
-                updated_default = set_fields["default"]
-                if updated_default is None:
-                    await conn.execute(
-                        sa.DDL(
-                            "ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
-                            (full_table_name, new_name),
-                        )
+            else:
+                normalized_default, formatted_default = prepare_default_value(
+                    SqlType(new_type if "type" in set_fields else column.type),
+                    updated_default,
+                )
+                set_fields["default"] = normalized_default
+                await conn.execute(
+                    sa.DDL(
+                        # SAFE f-string: formatted_default is compiler-rendered from a typed value.
+                        f"ALTER TABLE %s ALTER COLUMN %s SET DEFAULT {formatted_default}",
+                        (full_table_name, quote_identifier(new_name)),
                     )
-                else:
-                    # SECURITY NOTE: PostgreSQL DDL does not support parameter binding for DEFAULT clauses.
-                    # We must use string interpolation here, but it's SAFE because:
-                    # 1. handle_default_value() sanitizes and properly formats the value based on SQL type
-                    # 2. It applies proper quoting, escaping, and type casting (e.g., 'value'::text, 123, true)
-                    # 3. The function validates the SQL type and rejects invalid inputs
-                    # 4. This is the ONLY way to set DEFAULT values in PostgreSQL DDL statements
-                    formatted_default = handle_default_value(
-                        SqlType(new_type if "type" in set_fields else column.type),
-                        updated_default,
-                    )
-                    await conn.execute(
-                        sa.DDL(
-                            # SAFE f-string: formatted_default is pre-sanitized by handle_default_value()
-                            # Other parameters (table/column names) still use secure parameter binding
-                            f"ALTER TABLE %s ALTER COLUMN %s SET DEFAULT {formatted_default}",
-                            (full_table_name, new_name),
-                        )
-                    )
+                )
 
         # Update the column metadata
+        if "name" in set_fields:
+            set_fields["name"] = new_name
         for key, value in set_fields.items():
             setattr(column, key, value)
 
         await self.session.flush()
         return column
 
-    @require_access_level(AccessLevel.ADMIN)
     async def create_unique_index(self, table: Table, column_name: str) -> None:
         """Create a unique index on specified columns."""
 
@@ -458,7 +743,8 @@ class BaseTablesService(BaseService):
         full_table_name = self._full_table_name(table.name)
 
         # Sanitize column names to prevent SQL injection
-        sanitized_column = self._sanitize_identifier(column_name)
+        resolved_column_name = self._resolve_external_column_name(table, column_name)
+        sanitized_column = self._sanitize_identifier(resolved_column_name)
 
         # Create a descriptive name for the index
         # Format: uq_[table_name]_[col1]_[col2]_etc
@@ -474,7 +760,7 @@ class BaseTablesService(BaseService):
                 (
                     index_name,  # Name of the index
                     full_table_name,  # Table to create index on
-                    sanitized_column,  # Column to index
+                    quote_identifier(sanitized_column),  # Column to index
                 ),
             )
         )
@@ -482,9 +768,10 @@ class BaseTablesService(BaseService):
         # Commit the transaction
         await self.session.flush()
 
-    @require_access_level(AccessLevel.ADMIN)
+    @audit_log(resource_type="table_column", action="delete")
     async def delete_column(self, column: TableColumn) -> None:
         """Remove a column from an existing table."""
+        self._assert_user_column_name_allowed(column.name)
         full_table_name = self._full_table_name(column.table.name)
         sanitized_column = self._sanitize_identifier(column.name)
 
@@ -496,7 +783,7 @@ class BaseTablesService(BaseService):
         await conn.execute(
             sa.DDL(
                 "ALTER TABLE %s DROP COLUMN %s",
-                (full_table_name, sanitized_column),
+                (full_table_name, quote_identifier(sanitized_column)),
             )
         )
 
@@ -504,29 +791,13 @@ class BaseTablesService(BaseService):
 
     """Rows"""
 
-    async def list_rows(
-        self, table: Table, *, limit: int = 100, offset: int = 0
-    ) -> list[dict[str, Any]]:
-        """List all rows in a table."""
-        schema_name = self._get_schema_name()
-        sanitized_table_name = self._sanitize_identifier(table.name)
-        conn = await self.session.connection()
-        stmt = (
-            sa.select("*")
-            .select_from(sa.table(sanitized_table_name, schema=schema_name))
-            .limit(limit)
-            .offset(offset)
-        )
-        result = await conn.execute(stmt)
-        return [dict(row) for row in result.mappings().all()]
-
     async def get_row(self, table: Table, row_id: UUID) -> Any:
         """Get a row by ID."""
         schema_name = self._get_schema_name()
         sanitized_table_name = self._sanitize_identifier(table.name)
         conn = await self.session.connection()
         stmt = (
-            sa.select("*")
+            sa.select(*self._visible_columns(table))
             .select_from(sa.table(sanitized_table_name, schema=schema_name))
             .where(sa.column("id") == row_id)
         )
@@ -534,7 +805,7 @@ class BaseTablesService(BaseService):
         row = result.mappings().first()
         if row is None:
             raise TracecatNotFoundError(f"Row {row_id} not found in table {table.name}")
-        return row
+        return dict(row)
 
     async def insert_row(
         self,
@@ -557,7 +828,7 @@ class BaseTablesService(BaseService):
         schema_name = self._get_schema_name()
         conn = await self.session.connection()
 
-        row_data = params.data
+        row_data = self._normalize_row_inputs(table, params.data)
         col_map = {c.name: c for c in table.columns}
         upsert = params.upsert
 
@@ -577,7 +848,7 @@ class BaseTablesService(BaseService):
             stmt = (
                 sa.insert(sa.table(sanitized_table_name, *cols, schema=schema_name))
                 .values(**value_clauses)
-                .returning(sa.text("*"))
+                .returning(*self._visible_columns(table))
             )
         else:
             # For upsert operations
@@ -612,7 +883,7 @@ class BaseTablesService(BaseService):
                 # Complete the statement with on_conflict_do_update
                 stmt = pg_stmt.on_conflict_do_update(
                     index_elements=index, set_=update_dict
-                ).returning(sa.text("*"))
+                ).returning(*self._visible_columns(table))
 
                 result = await conn.execute(stmt)
                 await self.session.flush()
@@ -686,14 +957,23 @@ class BaseTablesService(BaseService):
         schema_name = self._get_schema_name()
         conn = await self.session.connection()
 
-        # Build update statement using SQLAlchemy
+        # Normalise inputs and build update statement using SQLAlchemy
+        normalised_data = self._normalize_row_inputs(table, data)
+        col_map = {c.name: c for c in table.columns}
         sanitized_table_name = self._sanitize_identifier(table.name)
-        cols = [sa.column(self._sanitize_identifier(k)) for k in data.keys()]
+        value_clauses: dict[str, sa.BindParameter] = {}
+        cols = []
+        for column_name, value in normalised_data.items():
+            cols.append(sa.column(self._sanitize_identifier(column_name)))
+            value_clauses[column_name] = to_sql_clause(
+                value, col_map[column_name].name, SqlType(col_map[column_name].type)
+            )
+
         stmt = (
             sa.update(sa.table(sanitized_table_name, *cols, schema=schema_name))
             .where(sa.column("id") == row_id)
-            .values(**data)
-            .returning(sa.text("*"))
+            .values(**value_clauses)
+            .returning(*self._visible_columns(table))
         )
 
         result = await conn.execute(stmt)
@@ -708,7 +988,6 @@ class BaseTablesService(BaseService):
 
         return dict(row)
 
-    @require_access_level(AccessLevel.ADMIN)
     async def delete_row(self, table: Table, row_id: UUID) -> None:
         """Delete a row from the table."""
         schema_name = self._get_schema_name()
@@ -718,6 +997,62 @@ class BaseTablesService(BaseService):
         stmt = sa.delete(table_clause).where(sa.column("id") == row_id)
         await conn.execute(stmt)
         await self.session.flush()
+
+    async def batch_delete_rows(self, table: Table, row_ids: list[UUID]) -> int:
+        """Delete multiple rows from the table.
+
+        Args:
+            table: The table containing the rows to delete
+            row_ids: List of row IDs to delete
+
+        Returns:
+            Number of rows deleted
+        """
+        schema_name = self._get_schema_name()
+        sanitized_table_name = self._sanitize_identifier(table.name)
+        conn = await self.session.connection()
+        table_clause = sa.table(sanitized_table_name, schema=schema_name)
+        stmt = sa.delete(table_clause).where(sa.column("id").in_(row_ids))
+        result = await conn.execute(stmt)
+        await self.session.flush()
+        return result.rowcount
+
+    async def batch_update_rows(
+        self, table: Table, row_ids: list[UUID], data: dict[str, Any]
+    ) -> int:
+        """Update multiple rows in the table with the same data.
+
+        Args:
+            table: The table containing the rows to update
+            row_ids: List of row IDs to update
+            data: Dictionary of column names and values to set
+
+        Returns:
+            Number of rows updated
+        """
+        schema_name = self._get_schema_name()
+        conn = await self.session.connection()
+
+        normalised_data = self._normalize_row_inputs(table, data)
+        col_map = {c.name: c for c in table.columns}
+        sanitized_table_name = self._sanitize_identifier(table.name)
+        value_clauses: dict[str, sa.BindParameter] = {}
+        cols = []
+        for column_name, value in normalised_data.items():
+            cols.append(sa.column(self._sanitize_identifier(column_name)))
+            value_clauses[column_name] = to_sql_clause(
+                value, col_map[column_name].name, SqlType(col_map[column_name].type)
+            )
+
+        stmt = (
+            sa.update(sa.table(sanitized_table_name, *cols, schema=schema_name))
+            .where(sa.column("id").in_(row_ids))
+            .values(**value_clauses)
+        )
+
+        result = await conn.execute(stmt)
+        await self.session.flush()
+        return result.rowcount
 
     @retry(
         retry=retry_if_exception_type(_RETRYABLE_DB_EXCEPTIONS),
@@ -737,12 +1072,21 @@ class BaseTablesService(BaseService):
         if len(values) != len(columns):
             raise ValueError("Values and column names must have the same length")
 
+        table = await self.get_table_by_name(table_name)
         schema_name = self._get_schema_name()
-        sanitized_table_name = self._sanitize_identifier(table_name)
+        table = await self.get_table_by_name(table_name)
+        sanitized_table_name = self._sanitize_identifier(table.name)
 
-        cols = [sa.column(self._sanitize_identifier(c)) for c in columns]
+        resolved_columns = [
+            self._resolve_external_column_name(table, column_name)
+            for column_name in columns
+        ]
+        cols = [
+            sa.column(self._sanitize_identifier(column_name))
+            for column_name in resolved_columns
+        ]
         stmt = (
-            sa.select(sa.text("*"))
+            sa.select(*self._visible_columns(table))
             .select_from(sa.table(sanitized_table_name, schema=schema_name))
             .where(
                 sa.and_(
@@ -752,7 +1096,12 @@ class BaseTablesService(BaseService):
         )
         if limit is not None:
             stmt = stmt.limit(limit)
-        async with self.session.begin() as txn:
+        txn_cm = (
+            self.session.begin_nested()
+            if self.session.in_transaction()
+            else self.session.begin()
+        )
+        async with txn_cm as txn:
             conn = await txn.session.connection()
             try:
                 result = await conn.execute(
@@ -764,6 +1113,7 @@ class BaseTablesService(BaseService):
                 return [dict(row) for row in result.mappings().all()]
             except _RETRYABLE_DB_EXCEPTIONS as e:
                 # Log the error for debugging
+                # Note: Context manager handles rollback (savepoint or full) automatically
                 self.logger.warning(
                     "Retryable DB exception occurred",
                     kind=type(e).__name__,
@@ -771,8 +1121,6 @@ class BaseTablesService(BaseService):
                     table=table_name,
                     schema=schema_name,
                 )
-                # Ensure transaction is rolled back
-                await conn.rollback()
                 raise
             except ProgrammingError as e:
                 while (cause := e.__cause__) is not None:
@@ -792,6 +1140,90 @@ class BaseTablesService(BaseService):
                 )
                 raise
 
+    @retry(
+        retry=retry_if_exception_type(_RETRYABLE_DB_EXCEPTIONS),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.1, min=0.2, max=2),
+        reraise=True,
+    )
+    async def exists_rows(
+        self,
+        table_name: str,
+        *,
+        columns: Sequence[str],
+        values: Sequence[Any],
+    ) -> bool:
+        """Efficient existence check for rows matching column/value pairs.
+
+        Uses a SQL EXISTS query so the database can short-circuit at the first match.
+        """
+        if len(values) != len(columns):
+            raise ValueError("Values and column names must have the same length")
+
+        schema_name = self._get_schema_name()
+        table = await self.get_table_by_name(table_name)
+        sanitized_table_name = self._sanitize_identifier(table.name)
+
+        table_clause = sa.table(sanitized_table_name, schema=schema_name)
+        resolved_columns = [
+            self._resolve_external_column_name(table, column_name)
+            for column_name in columns
+        ]
+        cols = [
+            sa.column(self._sanitize_identifier(column_name))
+            for column_name in resolved_columns
+        ]
+        condition = sa.and_(
+            *[col == value for col, value in zip(cols, values, strict=True)]
+        )
+
+        exists_stmt = sa.exists(sa.select(1).select_from(table_clause).where(condition))
+        stmt = sa.select(exists_stmt)
+
+        txn_cm = (
+            self.session.begin_nested()
+            if self.session.in_transaction()
+            else self.session.begin()
+        )
+        async with txn_cm as txn:
+            conn = await txn.session.connection()
+            try:
+                result = await conn.execute(
+                    stmt,
+                    execution_options={
+                        "isolation_level": "READ COMMITTED",
+                    },
+                )
+                exists_val = result.scalar()
+                return bool(exists_val)
+            except _RETRYABLE_DB_EXCEPTIONS as e:
+                # Note: Context manager handles rollback (savepoint or full) automatically
+                self.logger.warning(
+                    "Retryable DB exception occurred during exists_rows",
+                    kind=type(e).__name__,
+                    error=str(e),
+                    table=table_name,
+                    schema=schema_name,
+                )
+                raise
+            except ProgrammingError as e:
+                while (cause := e.__cause__) is not None:
+                    e = cause
+                if isinstance(e, UndefinedTableError):
+                    raise TracecatNotFoundError(
+                        f"Table '{table_name}' does not exist"
+                    ) from e
+                raise ValueError(str(e)) from e
+            except Exception as e:
+                self.logger.error(
+                    "Unexpected DB exception occurred during exists_rows",
+                    kind=type(e).__name__,
+                    error=str(e),
+                    table=table_name,
+                    schema=schema_name,
+                )
+                raise
+
     async def search_rows(
         self,
         table: Table,
@@ -802,125 +1234,33 @@ class BaseTablesService(BaseService):
         updated_before: datetime | None = None,
         updated_after: datetime | None = None,
         limit: int | None = None,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        """Search rows in a table with optional text search and filtering.
-
-        Args:
-            table: The table to search in
-            search_term: Text to search for across all text and JSONB columns
-            start_time: Filter records created after this time
-            end_time: Filter records created before this time
-            updated_before: Filter records updated before this time
-            updated_after: Filter records updated after this time
-            limit: Maximum number of rows to return
-            offset: Number of rows to skip
-
-        Returns:
-            List of matching rows as dictionaries
-
-        Raises:
-            TracecatNotFoundError: If the table does not exist
-            ValueError: If search parameters are invalid
-        """
-        schema_name = self._get_schema_name()
-        sanitized_table_name = self._sanitize_identifier(table.name)
-        conn = await self.session.connection()
-
-        # Build the base query
-        stmt = sa.select(sa.text("*")).select_from(
-            sa.table(sanitized_table_name, schema=schema_name)
+        cursor: str | None = None,
+        reverse: bool = False,
+        order_by: str | None = None,
+        sort: Literal["asc", "desc"] | None = None,
+    ) -> CursorPaginatedResponse[dict[str, Any]]:
+        """Search rows in a table using cursor-based pagination."""
+        page_limit = (
+            limit if limit is not None else config.TRACECAT__LIMIT_TABLE_SEARCH_DEFAULT
+        )
+        params = CursorPaginationParams(
+            limit=page_limit,
+            cursor=cursor,
+            reverse=reverse,
+        )
+        return await self.list_rows(
+            table=table,
+            params=params,
+            search_term=search_term,
+            start_time=start_time,
+            end_time=end_time,
+            updated_before=updated_before,
+            updated_after=updated_after,
+            order_by=order_by,
+            sort=sort,
         )
 
-        # Build WHERE conditions
-        where_conditions = []
-
-        # Add text search conditions
-        if search_term:
-            # Validate search term to prevent abuse
-            if len(search_term) > 1000:
-                raise ValueError("Search term cannot exceed 1000 characters")
-            if "\x00" in search_term:
-                raise ValueError("Search term cannot contain null bytes")
-
-            # Get all text-searchable columns (TEXT and JSONB types)
-            searchable_columns = [
-                col.name
-                for col in table.columns
-                if col.type in (SqlType.TEXT.value, SqlType.JSONB.value)
-            ]
-
-            if searchable_columns:
-                # Use SQLAlchemy's concat function for proper parameter binding
-                search_pattern = sa.func.concat("%", search_term, "%")
-                search_conditions = []
-                for col_name in searchable_columns:
-                    sanitized_col = self._sanitize_identifier(col_name)
-                    if col_name in [
-                        c.name for c in table.columns if c.type == SqlType.JSONB.value
-                    ]:
-                        # For JSONB columns, convert to text for searching
-                        search_conditions.append(
-                            sa.func.cast(sa.column(sanitized_col), sa.TEXT).ilike(
-                                search_pattern
-                            )
-                        )
-                    else:
-                        # For TEXT columns, search directly
-                        search_conditions.append(
-                            sa.column(sanitized_col).ilike(search_pattern)
-                        )
-                where_conditions.append(sa.or_(*search_conditions))
-            else:
-                # No searchable columns found, search_term will have no effect
-                self.logger.warning(
-                    "No searchable columns found for text search",
-                    table=table.name,
-                    search_term=search_term,
-                )
-
-        # Add date filters
-        if start_time:
-            where_conditions.append(sa.column("created_at") >= start_time)
-        if end_time:
-            where_conditions.append(sa.column("created_at") <= end_time)
-        if updated_after:
-            where_conditions.append(sa.column("updated_at") >= updated_after)
-        if updated_before:
-            where_conditions.append(sa.column("updated_at") <= updated_before)
-
-        # Apply WHERE conditions if any
-        if where_conditions:
-            stmt = stmt.where(sa.and_(*where_conditions))
-
-        # Apply limit and offset
-        if limit is not None:
-            stmt = stmt.limit(limit)
-        if offset > 0:
-            stmt = stmt.offset(offset)
-
-        try:
-            result = await conn.execute(stmt)
-            return [dict(row) for row in result.mappings().all()]
-        except ProgrammingError as e:
-            while (cause := e.__cause__) is not None:
-                e = cause
-            if isinstance(e, UndefinedTableError):
-                raise TracecatNotFoundError(
-                    f"Table '{table.name}' does not exist"
-                ) from e
-            raise ValueError(str(e)) from e
-        except Exception as e:
-            self.logger.error(
-                "Unexpected DB exception occurred during search",
-                kind=type(e).__name__,
-                error=str(e),
-                table=table.name,
-                schema=schema_name,
-            )
-            raise
-
-    async def list_rows_paginated(
+    async def list_rows(
         self,
         table: Table,
         params: CursorPaginationParams,
@@ -929,6 +1269,8 @@ class BaseTablesService(BaseService):
         end_time: datetime | None = None,
         updated_before: datetime | None = None,
         updated_after: datetime | None = None,
+        order_by: str | None = None,
+        sort: Literal["asc", "desc"] | None = None,
     ) -> CursorPaginatedResponse[dict[str, Any]]:
         """List rows in a table with cursor-based pagination.
 
@@ -940,20 +1282,22 @@ class BaseTablesService(BaseService):
             end_time: Filter records created before this time
             updated_before: Filter records updated before this time
             updated_after: Filter records updated after this time
+            order_by: Column name to order by (defaults to created_at)
+            sort: Sort direction, "asc" or "desc" (defaults to desc)
 
         Returns:
             Cursor paginated response with matching rows
 
         Raises:
             TracecatNotFoundError: If the table does not exist
-            ValueError: If search parameters are invalid
+            ValueError: If search parameters are invalid or order_by column doesn't exist
         """
         schema_name = self._get_schema_name()
         sanitized_table_name = self._sanitize_identifier(table.name)
         conn = await self.session.connection()
 
         # Build the base query
-        stmt = sa.select(sa.text("*")).select_from(
+        stmt = sa.select(*self._visible_columns(table)).select_from(
             sa.table(sanitized_table_name, schema=schema_name)
         )
 
@@ -972,7 +1316,13 @@ class BaseTablesService(BaseService):
             searchable_columns = [
                 col.name
                 for col in table.columns
-                if col.type in (SqlType.TEXT.value, SqlType.JSONB.value)
+                if col.type
+                in (
+                    SqlType.TEXT.value,
+                    SqlType.JSONB.value,
+                    SqlType.SELECT.value,
+                    SqlType.MULTI_SELECT.value,
+                )
             ]
 
             if searchable_columns:
@@ -982,7 +1332,9 @@ class BaseTablesService(BaseService):
                 for col_name in searchable_columns:
                     sanitized_col = self._sanitize_identifier(col_name)
                     if col_name in [
-                        c.name for c in table.columns if c.type == SqlType.JSONB.value
+                        c.name
+                        for c in table.columns
+                        if c.type in (SqlType.JSONB.value, SqlType.MULTI_SELECT.value)
                     ]:
                         # For JSONB columns, convert to text for searching
                         search_conditions.append(
@@ -1005,62 +1357,116 @@ class BaseTablesService(BaseService):
                 )
 
         # Add date filters
-        if start_time:
+        if start_time is not None:
             where_conditions.append(sa.column("created_at") >= start_time)
-        if end_time:
+
+        if end_time is not None:
             where_conditions.append(sa.column("created_at") <= end_time)
-        if updated_after:
+
+        if updated_after is not None:
             where_conditions.append(sa.column("updated_at") >= updated_after)
-        if updated_before:
+
+        if updated_before is not None:
             where_conditions.append(sa.column("updated_at") <= updated_before)
 
         # Apply WHERE conditions if any
         if where_conditions:
             stmt = stmt.where(sa.and_(*where_conditions))
 
-        # Apply cursor-based pagination
-        # Decode cursor if provided
-        cursor_data = None
+        # Determine sort column and direction
+        sort_column = order_by or "created_at"
+        sort_direction = sort or "desc"
+
+        # Validate the sort column exists in the table
+        valid_columns = {col.name for col in table.columns}
+        valid_columns.update(["id", "created_at", "updated_at"])  # Always available
+        if sort_column not in valid_columns:
+            raise ValueError(f"Invalid order_by column: {sort_column}")
+
+        sort_col = sa.column(self._sanitize_identifier(sort_column))
+
+        # Apply cursor-based pagination with sort-column-aware filtering
         if params.cursor:
             try:
                 cursor_data = BaseCursorPaginator.decode_cursor(params.cursor)
             except Exception as e:
                 raise ValueError(f"Invalid cursor: {e}") from e
 
-            # Apply cursor filtering for table rows
-            cursor_time = cursor_data.created_at
             cursor_id = UUID(cursor_data.id)
 
-            if params.reverse:
-                # For reverse pagination (going backwards)
-                stmt = stmt.where(
-                    sa.or_(
-                        sa.column("created_at") > cursor_time,
-                        sa.and_(
-                            sa.column("created_at") == cursor_time,
-                            sa.column("id") > cursor_id,
-                        ),
-                    )
-                )
-            else:
-                # For forward pagination (going forwards)
-                stmt = stmt.where(
-                    sa.or_(
-                        sa.column("created_at") < cursor_time,
-                        sa.and_(
-                            sa.column("created_at") == cursor_time,
-                            sa.column("id") < cursor_id,
-                        ),
-                    )
-                )
+            # Check if cursor was created with the same sort column
+            cursor_sort_value = cursor_data.sort_value
+            cursor_has_sort_value = (
+                cursor_data.sort_column == sort_column and cursor_sort_value is not None
+            )
 
-        # Apply consistent ordering for cursor pagination
-        if params.reverse:
-            # For reverse pagination, use ASC ordering
-            stmt = stmt.order_by(sa.column("created_at").asc(), sa.column("id").asc())
+            if cursor_has_sort_value:
+                # Use sort column value for cursor filtering
+                sort_cursor_value = cursor_sort_value
+
+                # Composite filtering: (sort_col, id) matches ORDER BY
+                if sort_direction == "asc":
+                    if params.reverse:
+                        # Going backward: get records before cursor in sort order
+                        stmt = stmt.where(
+                            sa.or_(
+                                sort_col < sort_cursor_value,
+                                sa.and_(
+                                    sort_col == sort_cursor_value,
+                                    sa.column("id") < cursor_id,
+                                ),
+                            )
+                        )
+                    else:
+                        # Going forward: get records after cursor in sort order
+                        stmt = stmt.where(
+                            sa.or_(
+                                sort_col > sort_cursor_value,
+                                sa.and_(
+                                    sort_col == sort_cursor_value,
+                                    sa.column("id") > cursor_id,
+                                ),
+                            )
+                        )
+                else:
+                    # Descending order
+                    if params.reverse:
+                        # Going backward: get records after cursor in sort order
+                        stmt = stmt.where(
+                            sa.or_(
+                                sort_col > sort_cursor_value,
+                                sa.and_(
+                                    sort_col == sort_cursor_value,
+                                    sa.column("id") > cursor_id,
+                                ),
+                            )
+                        )
+                    else:
+                        # Going forward: get records before cursor in sort order
+                        stmt = stmt.where(
+                            sa.or_(
+                                sort_col < sort_cursor_value,
+                                sa.and_(
+                                    sort_col == sort_cursor_value,
+                                    sa.column("id") < cursor_id,
+                                ),
+                            )
+                        )
+
+        # Apply sorting: (sort_col, id) for stable pagination
+        # Use id as tie-breaker unless we're already sorting by id
+        if sort_column == "id":
+            # No tie-breaker needed when sorting by id (already unique)
+            if sort_direction == "asc":
+                stmt = stmt.order_by(sort_col.asc())
+            else:
+                stmt = stmt.order_by(sort_col.desc())
         else:
-            # For forward pagination, use DESC ordering (newest first)
-            stmt = stmt.order_by(sa.column("created_at").desc(), sa.column("id").desc())
+            # Add id as tie-breaker for non-unique columns
+            if sort_direction == "asc":
+                stmt = stmt.order_by(sort_col.asc(), sa.column("id").asc())
+            else:
+                stmt = stmt.order_by(sort_col.desc(), sa.column("id").desc())
 
         # Fetch limit + 1 to determine if there are more items
         stmt = stmt.limit(params.limit + 1)
@@ -1090,8 +1496,9 @@ class BaseTablesService(BaseService):
         has_more = len(rows) > params.limit
         if has_more:
             rows = rows[: params.limit]
+        has_previous = params.cursor is not None
 
-        # Generate cursors
+        # Generate cursors with sort column info for proper pagination
         next_cursor = None
         prev_cursor = None
 
@@ -1100,27 +1507,32 @@ class BaseTablesService(BaseService):
                 # Generate next cursor from the last item
                 last_item = rows[-1]
                 next_cursor = BaseCursorPaginator.encode_cursor(
-                    last_item["created_at"], last_item["id"]
+                    last_item["id"],
+                    sort_column=sort_column,
+                    sort_value=last_item.get(sort_column),
                 )
 
             if params.cursor:
                 # If we used a cursor to get here, we can go back
                 first_item = rows[0]
                 prev_cursor = BaseCursorPaginator.encode_cursor(
-                    first_item["created_at"], first_item["id"]
+                    first_item["id"],
+                    sort_column=sort_column,
+                    sort_value=first_item.get(sort_column),
                 )
 
         # If we were doing reverse pagination, swap the cursors and reverse items
         if params.reverse:
             rows = list(reversed(rows))
             next_cursor, prev_cursor = prev_cursor, next_cursor
+            has_more, has_previous = has_previous, has_more
 
         return CursorPaginatedResponse(
             items=rows,
             next_cursor=next_cursor,
             prev_cursor=prev_cursor,
             has_more=has_more,
-            has_previous=params.cursor is not None,
+            has_previous=has_previous,
         )
 
     async def batch_insert_rows(
@@ -1162,7 +1574,13 @@ class BaseTablesService(BaseService):
         # Group rows by their column sets to avoid inserting NULL into missing columns.
         rows_by_columns: dict[frozenset[str], list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
-            rows_by_columns[frozenset(row.keys())].append(row)
+            normalised_row = self._normalize_row_inputs(table, row)
+            rows_by_columns[frozenset(normalised_row.keys())].append(normalised_row)
+
+        column_type_map = {
+            column.name: self._sa_type_for_column(SqlType(column.type))
+            for column in table.columns
+        }
 
         conn = await self.session.connection()
 
@@ -1183,7 +1601,13 @@ class BaseTablesService(BaseService):
         # Iterate over groups and execute separate INSERT/UPSERT statements.
         for col_set, group_rows in rows_by_columns.items():
             # Sanitize column identifiers for this group
-            cols = [sa.column(self._sanitize_identifier(col)) for col in col_set]
+            cols = [
+                sa.column(
+                    self._sanitize_identifier(col),
+                    type_=column_type_map.get(col),
+                )
+                for col in col_set
+            ]
             table_obj = sa.table(sanitized_table_name, *cols, schema=schema_name)
 
             if not upsert:
@@ -1246,27 +1670,161 @@ class BaseTablesService(BaseService):
 class TablesService(BaseTablesService):
     """Transactional tables service."""
 
+    @require_scope("table:create")
     async def create_table(self, params: TableCreate) -> Table:
         result = await super().create_table(params)
         await self.session.commit()
         await self.session.refresh(result)
         return result
 
+    @require_scope("table:create")
+    async def import_table_from_csv(
+        self,
+        *,
+        contents: bytes,
+        filename: str | None = None,
+        table_name: str | None = None,
+        chunk_size: int = 1000,
+    ) -> tuple[Table, int, list[InferredCSVColumn]]:
+        """Create a new table by inferring schema and rows from a CSV file."""
+        try:
+            csv_text = contents.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise TracecatImportError(
+                "CSV import requires UTF-8 encoded files"
+            ) from exc
+
+        first_pass = StringIO(csv_text)
+        reader = csv.DictReader(first_pass)
+        headers = reader.fieldnames
+
+        inferer = CSVSchemaInferer.initialise(headers or [])
+        for row in reader:
+            inferer.observe(row)
+        first_pass.close()
+
+        inferred_columns = inferer.result()
+
+        if not inferred_columns:
+            raise TracecatImportError("CSV file does not contain any columns")
+
+        raw_table_name = table_name
+        if not raw_table_name and filename:
+            raw_table_name = Path(filename).stem
+        base_table_name = generate_table_name(raw_table_name)
+        unique_table_name = await self._find_unique_table_name(base_table_name)
+
+        column_defs = [
+            TableColumnCreate(name=column.name, type=column.type)
+            for column in inferred_columns
+        ]
+        table = await self.create_table(
+            TableCreate(name=unique_table_name, columns=column_defs)
+        )
+
+        second_pass = StringIO(csv_text)
+        reader = csv.DictReader(second_pass)
+
+        chunk: list[dict[str, Any]] = []
+        rows_inserted = 0
+        try:
+            for row in reader:
+                mapped_row: dict[str, Any] = {}
+                for column in inferred_columns:
+                    raw_value = row.get(column.original_name)
+                    if raw_value is None:
+                        mapped_row[column.name] = None
+                        continue
+                    if isinstance(raw_value, str) and raw_value.strip() == "":
+                        if column.type is SqlType.TEXT:
+                            mapped_row[column.name] = ""
+                        else:
+                            mapped_row[column.name] = None
+                        continue
+                    value_to_convert = raw_value
+                    if isinstance(raw_value, str) and column.type is not SqlType.TEXT:
+                        value_to_convert = raw_value.strip()
+                    try:
+                        mapped_row[column.name] = convert_value(
+                            value_to_convert, column.type
+                        )
+                    except TypeError as exc:
+                        raise TracecatImportError(
+                            f"Cannot convert value {raw_value!r} in column "
+                            f"{column.original_name!r} to type {column.type}"
+                        ) from exc
+                if mapped_row:
+                    chunk.append(mapped_row)
+                if len(chunk) >= chunk_size:
+                    rows_inserted += await self._insert_import_chunk(
+                        table, chunk, chunk_size=chunk_size
+                    )
+                    chunk = []
+
+            if chunk:
+                rows_inserted += await self._insert_import_chunk(
+                    table, chunk, chunk_size=chunk_size
+                )
+        except Exception:
+            await self._cleanup_failed_import(table)
+            raise
+        finally:
+            second_pass.close()
+
+        await self.session.refresh(table)
+        return table, rows_inserted, inferred_columns
+
+    async def _insert_import_chunk(
+        self, table: Table, chunk: list[dict[str, Any]], *, chunk_size: int
+    ) -> int:
+        if not chunk:
+            return 0
+        try:
+            return await self.batch_insert_rows(table, chunk, chunk_size=chunk_size)
+        except DBAPIError as exc:
+            # Get error message, removing SQL queries that may contain sensitive data
+            cause = exc.__cause__ or exc
+            message = str(cause).strip()
+            if "[SQL:" in message:
+                message = message.split("[SQL:", 1)[0].strip()
+            if not message:
+                message = cause.__class__.__name__
+            raise TracecatImportError(
+                f"Failed to insert rows into table '{table.name}': {message}"
+            ) from exc
+
+    async def _cleanup_failed_import(self, table: Table) -> None:
+        try:
+            # Use base implementation for internal rollback cleanup so import
+            # failure handling does not depend on external delete scope grants.
+            await super().delete_table(table)
+            await self.session.commit()
+        except Exception as cleanup_error:
+            logger.error(
+                "Failed to clean up table after import failure",
+                table_id=str(table.id),
+                error=cleanup_error,
+            )
+
+    @require_scope("table:update")
     async def update_table(self, table: Table, params: TableUpdate) -> Table:
         result = await super().update_table(table, params)
         await self.session.commit()
         await self.session.refresh(result)
         return result
 
+    @require_scope("table:delete")
     async def delete_table(self, table: Table) -> None:
         await super().delete_table(table)
         await self.session.commit()
 
+    @require_scope("table:create")
     async def insert_row(self, table: Table, params: TableRowInsert) -> dict[str, Any]:
         result = await super().insert_row(table, params)
         await self.session.commit()
         return result
 
+    @require_scope("table:update")
     async def update_row(
         self, table: Table, row_id: UUID, data: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1274,10 +1832,26 @@ class TablesService(BaseTablesService):
         await self.session.commit()
         return result
 
+    @require_scope("table:delete")
     async def delete_row(self, table: Table, row_id: UUID) -> None:
         await super().delete_row(table, row_id)
         await self.session.commit()
 
+    @require_scope("table:delete")
+    async def batch_delete_rows(self, table: Table, row_ids: list[UUID]) -> int:
+        result = await super().batch_delete_rows(table, row_ids)
+        await self.session.commit()
+        return result
+
+    @require_scope("table:update")
+    async def batch_update_rows(
+        self, table: Table, row_ids: list[UUID], data: dict[str, Any]
+    ) -> int:
+        result = await super().batch_update_rows(table, row_ids, data)
+        await self.session.commit()
+        return result
+
+    @require_scope("table:create")
     async def create_column(
         self, table: Table, params: TableColumnCreate
     ) -> TableColumn:
@@ -1287,6 +1861,7 @@ class TablesService(BaseTablesService):
         await self.session.refresh(table)
         return column
 
+    @require_scope("table:update")
     async def update_column(
         self, column: TableColumn, params: TableColumnUpdate
     ) -> TableColumn:
@@ -1295,10 +1870,12 @@ class TablesService(BaseTablesService):
         await self.session.refresh(column)
         return column
 
+    @require_scope("table:delete")
     async def delete_column(self, column: TableColumn) -> None:
         await super().delete_column(column)
         await self.session.commit()
 
+    @require_scope("table:create")
     async def batch_insert_rows(
         self,
         table: Table,
@@ -1314,29 +1891,58 @@ class TablesService(BaseTablesService):
         return result
 
 
-class TableEditorService(BaseService):
-    """Service for editing tables."""
+class TableEditorService(BaseWorkspaceService):
+    """Service for editing workspace-scoped tables.
+
+    This is a utility service for DDL operations (add/update/delete columns, rows)
+    on tables within a workspace schema.
+
+    The role represents the operator (the user/service performing the action).
+    """
 
     service_name = "table_editor"
 
     def __init__(
         self,
+        session: AsyncSession,
+        role: Role | None = None,
         *,
         table_name: str,
         schema_name: str,
-        session: AsyncSession,
-        role: Role | None = None,
     ):
         super().__init__(session, role)
         self.table_name = sanitize_identifier(table_name)
         self.schema_name = schema_name
+        self._visible_columns_cache: list[sa.ColumnClause] | None = None
 
     def _full_table_name(self) -> str:
         """Get the full table name for the current role."""
-        return f'"{self.schema_name}".{self.table_name}'
+        return f'"{self.schema_name}"."{self.table_name}"'
 
-    async def get_columns(self) -> Sequence[sa.engine.interfaces.ReflectedColumn]:
-        """Get all columns for a table."""
+    def _assert_user_column_name_allowed(self, column_name: str) -> None:
+        """Reject operations on internal/system-managed column names."""
+        if is_internal_column_name(column_name):
+            raise ValueError(f"Column {column_name} is reserved for internal use")
+
+    def _invalidate_visible_columns_cache(self) -> None:
+        self._visible_columns_cache = None
+
+    async def _visible_columns(self) -> list[sa.ColumnClause]:
+        if self._visible_columns_cache is None:
+            reflected_columns = await self.get_columns()
+            self._visible_columns_cache = visible_column_clauses(
+                [
+                    column_name
+                    for column in reflected_columns
+                    if isinstance((column_name := column.get("name")), str)
+                ]
+            )
+        return self._visible_columns_cache
+
+    async def _get_physical_columns(
+        self,
+    ) -> Sequence[sa.engine.interfaces.ReflectedColumn]:
+        """Get all physical columns for a table, including internal columns."""
 
         def inspect_columns(
             sync_conn: sa.Connection,
@@ -1348,7 +1954,15 @@ class TableEditorService(BaseService):
         columns = await conn.run_sync(inspect_columns)
         return columns
 
-    @require_access_level(AccessLevel.ADMIN)
+    async def get_columns(self) -> Sequence[sa.engine.interfaces.ReflectedColumn]:
+        """Get user-visible columns for a table."""
+        reflected_columns = await self._get_physical_columns()
+        return [
+            column
+            for column in reflected_columns
+            if not is_internal_column_name(column.get("name"))
+        ]
+
     async def create_column(self, params: TableColumnCreate) -> None:
         """Add a new column to an existing table.
 
@@ -1362,21 +1976,34 @@ class TableEditorService(BaseService):
             ValueError: If the column type is invalid
         """
 
+        self._assert_user_column_name_allowed(params.name)
+        column_name = validate_identifier(params.name)
+
         # Validate SQL type first
         if not is_valid_sql_type(params.type):
             raise ValueError(f"Invalid type: {params.type}")
 
         # Handle default value based on type
         default_value = params.default
+        rendered_default = None
         if default_value is not None:
-            default_value = handle_default_value(params.type, default_value)
+            default_value, rendered_default = prepare_default_value(
+                params.type, default_value
+            )
 
         # Build the column definition string
-        column_def = [f"{params.name} {params.type.value}"]
+        # Map SELECT -> TEXT, MULTI_SELECT -> JSONB for physical storage
+        if params.type is SqlType.SELECT:
+            column_type_sql = SqlType.TEXT.value
+        elif params.type is SqlType.MULTI_SELECT:
+            column_type_sql = SqlType.JSONB.value
+        else:
+            column_type_sql = params.type.value
+        column_def = [f"{quote_identifier(column_name)} {column_type_sql}"]
         if not params.nullable:
             column_def.append("NOT NULL")
-        if default_value is not None:
-            column_def.append(f"DEFAULT {default_value}")
+        if rendered_default is not None:
+            column_def.append(f"DEFAULT {rendered_default}")
 
         column_def_str = " ".join(column_def)
 
@@ -1390,8 +2017,8 @@ class TableEditorService(BaseService):
         )
 
         await self.session.flush()
+        self._invalidate_visible_columns_cache()
 
-    @require_access_level(AccessLevel.ADMIN)
     async def update_column(self, column_name: str, params: TableColumnUpdate) -> None:
         """Update a column in an existing table.
 
@@ -1405,27 +2032,46 @@ class TableEditorService(BaseService):
             ValueError: If the column type is invalid
             ProgrammingError: If the database operation fails
         """
+        self._assert_user_column_name_allowed(column_name)
         set_fields = params.model_dump(exclude_unset=True)
         conn = await self.session.connection()
 
-        new_name = column_name
+        sanitized_column_name = validate_identifier(column_name)
+        new_name = sanitized_column_name
         full_table_name = self._full_table_name()
 
         # Execute ALTER statements using safe DDL construction
         if "name" in set_fields:
-            new_name = sanitize_identifier(set_fields["name"])
-            await conn.execute(
-                sa.DDL(
-                    "ALTER TABLE %s RENAME COLUMN %s TO %s",
-                    (full_table_name, column_name, new_name),
+            if (requested_name := set_fields["name"]) is None:
+                set_fields.pop("name")
+            else:
+                self._assert_user_column_name_allowed(requested_name)
+                new_name = validate_identifier(requested_name)
+                await conn.execute(
+                    sa.DDL(
+                        "ALTER TABLE %s RENAME COLUMN %s TO %s",
+                        (
+                            full_table_name,
+                            quote_identifier(sanitized_column_name),
+                            quote_identifier(new_name),
+                        ),
+                    )
                 )
-            )
         if "type" in set_fields:
-            new_type = set_fields["type"]
+            new_type = SqlType(set_fields["type"])
+            # Map SELECT -> TEXT, MULTI_SELECT -> JSONB for physical storage
+            if new_type is SqlType.SELECT:
+                column_type_sql = SqlType.TEXT.value
+            elif new_type is SqlType.MULTI_SELECT:
+                column_type_sql = SqlType.JSONB.value
+            else:
+                column_type_sql = (
+                    "BIGINT" if SqlType(new_type) == SqlType.INTEGER else new_type
+                )
             await conn.execute(
                 sa.DDL(
                     "ALTER TABLE %s ALTER COLUMN %s TYPE %s",
-                    (full_table_name, new_name, new_type),
+                    (full_table_name, quote_identifier(new_name), column_type_sql),
                 )
             )
         if "nullable" in set_fields:
@@ -1435,7 +2081,7 @@ class TableEditorService(BaseService):
                     # SAFE f-string: constraint is a controlled literal string ("DROP NOT NULL" or "SET NOT NULL")
                     # No user input is interpolated here - only predefined SQL keywords
                     f"ALTER TABLE %s ALTER COLUMN %s {constraint}",
-                    (full_table_name, new_name),
+                    (full_table_name, quote_identifier(new_name)),
                 )
             )
         if "default" in set_fields:
@@ -1444,65 +2090,103 @@ class TableEditorService(BaseService):
                 await conn.execute(
                     sa.DDL(
                         "ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
-                        (full_table_name, new_name),
+                        (full_table_name, quote_identifier(new_name)),
                     )
                 )
             else:
-                # SECURITY NOTE: PostgreSQL DDL does not support parameter binding for DEFAULT clauses.
-                # We must use string interpolation here, but it's SAFE because:
-                # 1. handle_default_value() sanitizes and properly formats the value based on SQL type
-                # 2. It applies proper quoting, escaping, and type casting (e.g., 'value'::text, 123, true)
-                # 3. The function validates the SQL type and rejects invalid inputs
-                # 4. This is the ONLY way to set DEFAULT values in PostgreSQL DDL statements
-                formatted_default = handle_default_value(
+                normalized_default, formatted_default = prepare_default_value(
                     SqlType(set_fields.get("type", "TEXT")), updated_default
                 )
+                set_fields["default"] = normalized_default
                 await conn.execute(
                     sa.DDL(
-                        # SAFE f-string: formatted_default is pre-sanitized by handle_default_value()
-                        # Other parameters (table/column names) still use secure parameter binding
+                        # SAFE f-string: formatted_default is compiler-rendered from a typed value.
                         f"ALTER TABLE %s ALTER COLUMN %s SET DEFAULT {formatted_default}",
-                        (full_table_name, new_name),
+                        (full_table_name, quote_identifier(new_name)),
                     )
                 )
 
         await self.session.flush()
+        self._invalidate_visible_columns_cache()
 
-    @require_access_level(AccessLevel.ADMIN)
     async def delete_column(self, column_name: str) -> None:
         """Remove a column from an existing table."""
-        sanitized_column = sanitize_identifier(column_name)
+        self._assert_user_column_name_allowed(column_name)
+        sanitized_column = validate_identifier(column_name)
 
         # Drop the column from the physical table using DDL
         conn = await self.session.connection()
         await conn.execute(
             sa.DDL(
                 "ALTER TABLE %s DROP COLUMN %s",
-                (self._full_table_name(), sanitized_column),
+                (self._full_table_name(), quote_identifier(sanitized_column)),
             )
         )
 
         await self.session.flush()
+        self._invalidate_visible_columns_cache()
 
     async def list_rows(
-        self, *, limit: int = 100, offset: int = 0
-    ) -> list[dict[str, Any]]:
-        """List all rows in a table."""
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        reverse: bool = False,
+    ) -> CursorPaginatedResponse[dict[str, Any]]:
+        """List rows with cursor-based pagination ordered by row ID."""
         conn = await self.session.connection()
-        stmt = (
-            sa.select("*")
-            .select_from(sa.table(self.table_name, schema=self.schema_name))
-            .limit(limit)
-            .offset(offset)
+        stmt = sa.select(*await self._visible_columns()).select_from(
+            sa.table(self.table_name, schema=self.schema_name)
         )
+
+        if cursor:
+            cursor_data = BaseCursorPaginator.decode_cursor(cursor)
+            cursor_id = UUID(cursor_data.id)
+            if reverse:
+                stmt = stmt.where(sa.column("id") < cursor_id)
+            else:
+                stmt = stmt.where(sa.column("id") > cursor_id)
+
+        if reverse:
+            stmt = stmt.order_by(sa.column("id").desc())
+        else:
+            stmt = stmt.order_by(sa.column("id").asc())
+
+        stmt = stmt.limit(limit + 1)
         result = await conn.execute(stmt)
-        return [dict(row) for row in result.mappings().all()]
+        rows = [dict(row) for row in result.mappings().all()]
+
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+        has_previous = cursor is not None
+
+        next_cursor: str | None = None
+        prev_cursor: str | None = None
+        if rows:
+            if has_more:
+                next_cursor = BaseCursorPaginator.encode_cursor(rows[-1]["id"])
+            if cursor:
+                prev_cursor = BaseCursorPaginator.encode_cursor(rows[0]["id"])
+
+        if reverse:
+            rows = list(reversed(rows))
+            next_cursor, prev_cursor = prev_cursor, next_cursor
+            has_more, has_previous = has_previous, has_more
+
+        return CursorPaginatedResponse(
+            items=rows,
+            next_cursor=next_cursor,
+            prev_cursor=prev_cursor,
+            has_more=has_more,
+            has_previous=has_previous,
+        )
 
     async def get_row(self, row_id: UUID) -> dict[str, Any]:
         """Get a row by ID."""
         conn = await self.session.connection()
         stmt = (
-            sa.select("*")
+            sa.select(*await self._visible_columns())
             .select_from(sa.table(self.table_name, schema=self.schema_name))
             .where(sa.column("id") == row_id)
         )
@@ -1526,18 +2210,36 @@ class TableEditorService(BaseService):
         conn = await self.session.connection()
 
         row_data = params.data
-        col_map = {c["name"]: c for c in await self.get_columns()}
+        for column_name in row_data:
+            self._assert_user_column_name_allowed(column_name)
+        reflected_columns = await self.get_columns()
+        col_map = {c["name"]: c for c in reflected_columns}
+        visible_columns = visible_column_clauses(list(col_map))
 
         value_clauses: dict[str, sa.BindParameter] = {}
         cols = []
         for col, value in row_data.items():
-            value_clauses[col] = sa.bindparam(col, value, type_=col_map[col]["type"])
+            column_info = col_map.get(col)
+            if column_info is None:
+                raise ValueError(
+                    f"Column '{col}' does not exist in table {self.table_name}"
+                )
+            column_type = column_info["type"]
+            if value is None:
+                coerced_value = None
+            elif isinstance(column_type, sa.Date):
+                coerced_value = coerce_to_date(value)
+            elif getattr(column_type, "timezone", False):
+                coerced_value = coerce_to_utc_datetime(value)
+            else:
+                coerced_value = value
+            value_clauses[col] = sa.bindparam(col, coerced_value, type_=column_type)
             cols.append(sa.column(sanitize_identifier(col)))
 
         stmt = (
             sa.insert(sa.table(self.table_name, *cols, schema=self.schema_name))
             .values(**value_clauses)
-            .returning(sa.text("*"))
+            .returning(*visible_columns)
         )
         result = await conn.execute(stmt)
         await self.session.flush()
@@ -1558,14 +2260,40 @@ class TableEditorService(BaseService):
             TracecatNotFoundError: If the row does not exist
         """
         conn = await self.session.connection()
+        for column_name in data:
+            self._assert_user_column_name_allowed(column_name)
+        reflected_columns = await self.get_columns()
+        col_map = {c["name"]: c for c in reflected_columns}
+        visible_columns = visible_column_clauses(list(col_map))
 
         # Build update statement using SQLAlchemy
-        cols = [sa.column(sanitize_identifier(k)) for k in data.keys()]
+        value_clauses: dict[str, sa.BindParameter] = {}
+        cols = []
+        for column_name, value in data.items():
+            column_info = col_map.get(column_name)
+            if column_info is None:
+                raise ValueError(
+                    f"Column '{column_name}' does not exist in table {self.table_name}"
+                )
+            column_type = column_info["type"]
+            if value is None:
+                coerced_value = None
+            elif isinstance(column_type, sa.Date):
+                coerced_value = coerce_to_date(value)
+            elif getattr(column_type, "timezone", False):
+                coerced_value = coerce_to_utc_datetime(value)
+            else:
+                coerced_value = value
+            cols.append(sa.column(sanitize_identifier(column_name)))
+            value_clauses[column_name] = sa.bindparam(
+                column_name, coerced_value, type_=column_type
+            )
+
         stmt = (
             sa.update(sa.table(self.table_name, *cols, schema=self.schema_name))
             .where(sa.column("id") == row_id)
-            .values(**data)
-            .returning(sa.text("*"))
+            .values(**value_clauses)
+            .returning(*visible_columns)
         )
 
         result = await conn.execute(stmt)
@@ -1580,7 +2308,6 @@ class TableEditorService(BaseService):
 
         return dict(row)
 
-    @require_access_level(AccessLevel.ADMIN)
     async def delete_row(self, row_id: UUID) -> None:
         """Delete a row from the table."""
         conn = await self.session.connection()
@@ -1591,9 +2318,39 @@ class TableEditorService(BaseService):
 
 
 def sanitize_identifier(identifier: str) -> str:
-    """Sanitize table/column names to prevent SQL injection."""
-    # Remove any non-alphanumeric characters except underscores
+    """Normalize a stored identifier to its physical SQL name."""
     sanitized = "".join(c for c in identifier if c.isalnum() or c == "_")
-    if not sanitized[0].isalpha():
-        raise ValueError("Identifier must start with a letter")
+    if not sanitized:
+        raise ValueError("Identifier must contain at least one letter")
+    if not (sanitized[0].isalpha() or sanitized[0] == "_"):
+        raise ValueError("Identifier must start with a letter or underscore")
     return sanitized.lower()
+
+
+def quote_identifier(identifier: str) -> str:
+    """Double-quote a SQL identifier for safe use in DDL statements.
+
+    Prevents syntax errors when identifier names collide with SQL reserved
+    keywords (e.g. ``select``, ``order``, ``group``).  Safe to use because
+    all callers pass values already restricted to ``[a-zA-Z0-9_]`` by
+    ``validate_identifier`` / ``sanitize_identifier``.
+    """
+    return f'"{identifier}"'
+
+
+def is_internal_column_name(column_name: str) -> bool:
+    """Check whether a column is internal/system-managed for dynamic schemas."""
+    return column_name.lower().startswith(INTERNAL_COLUMN_PREFIX)
+
+
+def validate_identifier(identifier: str) -> str:
+    """Validate an external identifier before using it in DDL operations."""
+    if not identifier:
+        raise ValueError("Identifier must contain at least one letter")
+    if not all(c.isalnum() or c == "_" for c in identifier):
+        raise ValueError(
+            "Identifier must contain only letters, numbers, and underscores"
+        )
+    if not (identifier[0].isalpha() or identifier[0] == "_"):
+        raise ValueError("Identifier must start with a letter or underscore")
+    return identifier.lower()

@@ -6,16 +6,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import temporalio.client
 
-from tracecat.identifiers.resource import ResourcePrefix
+from tracecat.identifiers import ScheduleUUID
 from tracecat.workflow.schedules import bridge
-from tracecat.workflow.schedules.models import ScheduleUpdate
+from tracecat.workflow.schedules.schemas import ScheduleUpdate
 
 
 @pytest.mark.anyio
 async def test_update_schedule_from_cron_to_interval_clears_cron():
     """Test that updating a schedule from cron to interval clears existing cron expressions."""
 
-    schedule_id = ResourcePrefix.SCHEDULE.factory()()
+    schedule_id = ScheduleUUID.new_uuid4()
 
     # Mock the Temporal handle
     mock_handle = MagicMock()
@@ -82,7 +82,7 @@ async def test_update_schedule_from_cron_to_interval_clears_cron():
 async def test_update_schedule_with_explicit_cron_clears_interval():
     """Test that updating a schedule with explicit cron clears intervals."""
 
-    schedule_id = ResourcePrefix.SCHEDULE.factory()()
+    schedule_id = ScheduleUUID.new_uuid4()
 
     # Mock the Temporal handle
     mock_handle = MagicMock()
@@ -147,7 +147,7 @@ async def test_update_schedule_with_explicit_cron_clears_interval():
 async def test_update_schedule_preserves_existing_when_neither_provided():
     """Test that not providing cron or interval preserves existing schedule type."""
 
-    schedule_id = ResourcePrefix.SCHEDULE.factory()()
+    schedule_id = ScheduleUUID.new_uuid4()
 
     # Mock the Temporal handle
     mock_handle = MagicMock()

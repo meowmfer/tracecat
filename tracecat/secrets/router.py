@@ -1,24 +1,37 @@
 from typing import Annotated, Any
 
+from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, HTTPException, Query, status
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
 from tracecat.auth.credentials import RoleACL
-from tracecat.authz.models import WorkspaceRole
+from tracecat.auth.dependencies import OrgUserRole
+from tracecat.auth.types import Role
+from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
+from tracecat.exceptions import TracecatNotFoundError
 from tracecat.identifiers import SecretID
+from tracecat.integrations.aws_assume_role import (
+    build_workspace_external_id,
+    get_tracecat_aws_account_id,
+    get_tracecat_aws_principal_arn,
+)
 from tracecat.logger import logger
+from tracecat.registry.actions.service import RegistryActionsService
+from tracecat.secrets.dependencies import AnySecretIDPath
 from tracecat.secrets.enums import SecretType
-from tracecat.secrets.models import (
+from tracecat.secrets.schemas import (
+    AwsAssumeRoleAccessRead,
+    OrganizationSecretRead,
     SecretCreate,
+    SecretDefinition,
     SecretRead,
     SecretReadMinimal,
     SecretSearch,
     SecretUpdate,
 )
 from tracecat.secrets.service import SecretsService
-from tracecat.types.auth import AccessLevel, Role
-from tracecat.types.exceptions import TracecatNotFoundError
 
 router = APIRouter(prefix="/secrets", tags=["secrets"])
 org_router = APIRouter(prefix="/organization/secrets", tags=["organization-secrets"])
@@ -29,32 +42,42 @@ WorkspaceUser = Annotated[
         allow_user=True,
         allow_service=False,
         require_workspace="yes",
-        require_workspace_roles=[WorkspaceRole.EDITOR, WorkspaceRole.ADMIN],
     ),
 ]
 
-WorkspaceAdminUser = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="yes",
-        require_workspace_roles=WorkspaceRole.ADMIN,
-    ),
-]
 
-OrgAdminUser = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="no",
-        min_access_level=AccessLevel.ADMIN,
-    ),
-]
+def _serialize_secret_read_minimal(
+    *,
+    service: SecretsService,
+    secret: Any,
+) -> SecretReadMinimal:
+    try:
+        keys = [kv.key for kv in service.decrypt_keys(secret.encrypted_keys)]
+        is_corrupted = False
+    except (InvalidToken, ValidationError, ValueError) as e:
+        keys = []
+        is_corrupted = True
+        logger.warning(
+            "Failed to decrypt secret keys; returning secret without keys",
+            secret_id=str(secret.id),
+            secret_name=secret.name,
+            secret_type=secret.type,
+            error=str(e),
+        )
+
+    return SecretReadMinimal(
+        id=secret.id,
+        type=SecretType(secret.type),
+        name=secret.name,
+        description=secret.description,
+        keys=keys,
+        environment=secret.environment,
+        is_corrupted=is_corrupted,
+    )
 
 
 @router.get("/search", response_model=list[SecretRead])
+@require_scope("secret:read")
 async def search_secrets(
     *,
     role: WorkspaceUser,
@@ -87,6 +110,7 @@ async def search_secrets(
 
 
 @router.get("")
+@require_scope("secret:read")
 async def list_secrets(
     *,
     role: WorkspaceUser,
@@ -99,22 +123,55 @@ async def list_secrets(
     service = SecretsService(session, role=role)
     secrets = await service.list_secrets(types=types)
     return [
-        SecretReadMinimal(
-            id=secret.id,
-            type=SecretType(secret.type),
-            name=secret.name,
-            description=secret.description,
-            keys=[kv.key for kv in service.decrypt_keys(secret.encrypted_keys)],
-            environment=secret.environment,
-        )
+        _serialize_secret_read_minimal(service=service, secret=secret)
         for secret in secrets
     ]
 
 
+@router.get("/definitions", response_model=list[SecretDefinition])
+@require_scope("secret:read")
+async def list_secret_definitions(
+    *,
+    role: WorkspaceUser,
+    session: AsyncDBSession,
+) -> list[SecretDefinition]:
+    """List registry secret definitions."""
+    service = RegistryActionsService(session, role=role)
+    return await service.get_aggregated_secrets()
+
+
+@router.get("/aws-assume-role", response_model=AwsAssumeRoleAccessRead)
+@require_scope("secret:read")
+async def get_aws_assume_role_access(
+    *,
+    role: WorkspaceUser,
+) -> AwsAssumeRoleAccessRead:
+    """Get workspace-scoped AWS AssumeRole details for credential setup."""
+    workspace_id = role.workspace_id
+    if workspace_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Workspace context is required",
+        )
+
+    try:
+        return AwsAssumeRoleAccessRead(
+            tracecat_aws_account_id=get_tracecat_aws_account_id(),
+            tracecat_aws_principal_arn=get_tracecat_aws_principal_arn(),
+            external_id=build_workspace_external_id(workspace_id),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AWS AssumeRole access is not available right now.",
+        ) from exc
+
+
 @router.get("/{secret_name}")
+@require_scope("secret:read")
 async def get_secret_by_name(
     *,
-    role: WorkspaceAdminUser,
+    role: WorkspaceUser,
     session: AsyncDBSession,
     secret_name: str,
 ) -> SecretRead:
@@ -131,9 +188,10 @@ async def get_secret_by_name(
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
+@require_scope("secret:create")
 async def create_secret(
     *,
-    role: WorkspaceAdminUser,
+    role: WorkspaceUser,
     session: AsyncDBSession,
     params: SecretCreate,
 ) -> None:
@@ -141,6 +199,10 @@ async def create_secret(
     service = SecretsService(session, role=role)
     try:
         await service.create_secret(params)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)
+        ) from e
     except IntegrityError as e:
         logger.error("Secret integrity error", e=str(e))
         raise HTTPException(
@@ -150,11 +212,12 @@ async def create_secret(
 
 
 @router.post("/{secret_id}", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("secret:update")
 async def update_secret_by_id(
     *,
-    role: WorkspaceAdminUser,
+    role: WorkspaceUser,
     session: AsyncDBSession,
-    secret_id: SecretID,
+    secret_id: AnySecretIDPath,
     params: SecretUpdate,
 ) -> None:
     """Update a secret by ID."""
@@ -162,6 +225,10 @@ async def update_secret_by_id(
     try:
         secret = await service.get_secret(secret_id)
         await service.update_secret(secret, params)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)
+        ) from e
     except TracecatNotFoundError as e:
         logger.error("Secret not found", secret_id=secret_id)
         raise HTTPException(
@@ -175,11 +242,12 @@ async def update_secret_by_id(
 
 
 @router.delete("/{secret_id}", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("secret:delete")
 async def delete_secret_by_id(
     *,
-    role: WorkspaceAdminUser,
+    role: WorkspaceUser,
     session: AsyncDBSession,
-    secret_id: SecretID,
+    secret_id: AnySecretIDPath,
 ) -> None:
     """Delete a secret by ID."""
     service = SecretsService(session, role=role)
@@ -194,9 +262,10 @@ async def delete_secret_by_id(
 
 
 @org_router.get("")
+@require_scope("org:secret:read")
 async def list_org_secrets(
     *,
-    role: OrgAdminUser,
+    role: OrgUserRole,
     session: AsyncDBSession,
     types: set[SecretType] | None = Query(
         None, alias="type", description="Filter by secret type"
@@ -206,26 +275,20 @@ async def list_org_secrets(
     service = SecretsService(session, role=role)
     secrets = await service.list_org_secrets(types=types)
     return [
-        SecretReadMinimal(
-            id=secret.id,
-            type=SecretType(secret.type),
-            name=secret.name,
-            description=secret.description,
-            keys=[kv.key for kv in service.decrypt_keys(secret.encrypted_keys)],
-            environment=secret.environment,
-        )
+        _serialize_secret_read_minimal(service=service, secret=secret)
         for secret in secrets
     ]
 
 
 @org_router.get("/{secret_name}")
+@require_scope("org:secret:read")
 async def get_org_secret_by_name(
     *,
-    role: OrgAdminUser,
+    role: OrgUserRole,
     session: AsyncDBSession,
     secret_name: str,
     environment: str | None = Query(None),
-) -> SecretRead:
+) -> OrganizationSecretRead:
     """Get an organization secret by name."""
     service = SecretsService(session, role=role)
     try:
@@ -235,13 +298,14 @@ async def get_org_secret_by_name(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Organization secret not found",
         ) from e
-    return SecretRead.from_database(secret)
+    return OrganizationSecretRead.from_database(secret)
 
 
 @org_router.post("", status_code=status.HTTP_201_CREATED)
+@require_scope("org:secret:create")
 async def create_org_secret(
     *,
-    role: OrgAdminUser,
+    role: OrgUserRole,
     session: AsyncDBSession,
     params: SecretCreate,
 ) -> None:
@@ -249,6 +313,10 @@ async def create_org_secret(
     service = SecretsService(session, role=role)
     try:
         await service.create_org_secret(params)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)
+        ) from e
     except IntegrityError as e:
         logger.error("Organization secret integrity error", e=str(e))
         raise HTTPException(
@@ -261,11 +329,12 @@ async def create_org_secret(
     "/{secret_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
+@require_scope("org:secret:update")
 async def update_org_secret_by_id(
     *,
-    role: OrgAdminUser,
+    role: OrgUserRole,
     session: AsyncDBSession,
-    secret_id: SecretID,
+    secret_id: AnySecretIDPath,
     params: SecretUpdate,
 ) -> None:
     """Update an organization secret by ID."""
@@ -273,6 +342,10 @@ async def update_org_secret_by_id(
     try:
         secret = await service.get_org_secret(secret_id)
         await service.update_org_secret(secret, params)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)
+        ) from e
     except TracecatNotFoundError as e:
         logger.error("Organization secret not found", secret_id=secret_id)
         raise HTTPException(
@@ -291,11 +364,12 @@ async def update_org_secret_by_id(
     "/{secret_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
+@require_scope("org:secret:delete")
 async def delete_org_secret_by_id(
     *,
-    role: OrgAdminUser,
+    role: OrgUserRole,
     session: AsyncDBSession,
-    secret_id: SecretID,
+    secret_id: AnySecretIDPath,
 ) -> None:
     """Delete an organization secret by ID."""
     service = SecretsService(session, role=role)

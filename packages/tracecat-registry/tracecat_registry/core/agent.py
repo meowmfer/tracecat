@@ -1,11 +1,17 @@
 """AI agent with tool calling capabilities. Returns the output and full message history."""
 
-from typing import Annotated, Any, Literal
-from tracecat_registry import registry, RegistrySecret
-from tracecat.agent.runtime import build_agent, run_agent_sync
+from typing import Annotated, Any
 
-from tracecat.registry.fields import ActionType, TextArea
 from typing_extensions import Doc
+
+from tracecat_registry import (
+    RegistrySecret,
+    RegistrySecretType,
+    registry,
+)
+from tracecat_registry._internal.exceptions import ActionIsInterfaceError
+from tracecat_registry.fields import ActionType, AgentPreset, TextArea
+from tracecat_registry.sdk.agents import OutputType
 
 anthropic_secret = RegistrySecret(
     name="anthropic",
@@ -50,28 +56,30 @@ bedrock_secret = RegistrySecret(
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_REGION",
-        "AWS_PROFILE",
         "AWS_ROLE_ARN",
-        "AWS_ROLE_SESSION_NAME",
         "AWS_SESSION_TOKEN",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_MODEL_ID",
+        "AWS_INFERENCE_PROFILE_ID",
     ],
     optional=True,
 )
-"""AWS credentials.
+"""AWS Bedrock credentials.
 
 - name: `amazon_bedrock`
 - optional_keys:
-    Either:
-        - `AWS_ACCESS_KEY_ID`
-        - `AWS_SECRET_ACCESS_KEY`
-        - `AWS_REGION`
-    Or:
-        - `AWS_PROFILE`
-    Or:
+    Authentication (one of):
+        - `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`
+        - `AWS_BEARER_TOKEN_BEDROCK`
         - `AWS_ROLE_ARN`
-        - `AWS_ROLE_SESSION_NAME` (optional)
-    Or:
         - `AWS_SESSION_TOKEN`
+    Model configuration (one of):
+        - `AWS_INFERENCE_PROFILE_ID`: Required for newer models (Claude 4, etc.).
+          Use system profile ID like 'us.anthropic.claude-sonnet-4-20250514-v1:0'
+          or custom inference profile ARN for cost tracking.
+        - `AWS_MODEL_ID`: Direct model ID for older models that support on-demand throughput.
+    Region:
+        - `AWS_REGION`: AWS region (e.g., us-east-1)
 """
 
 
@@ -108,30 +116,54 @@ custom_model_provider_secret = RegistrySecret(
     - `CUSTOM_MODEL_PROVIDER_BASE_URL`: Optional custom model provider base URL.
 """
 
-langfuse_secret = RegistrySecret(
-    name="langfuse",
+azure_openai_secret = RegistrySecret(
+    name="azure_openai",
     optional_keys=[
-        "LANGFUSE_HOST",
-        "LANGFUSE_PUBLIC_KEY",
-        "LANGFUSE_SECRET_KEY",
+        "AZURE_API_BASE",
+        "AZURE_API_VERSION",
+        "AZURE_DEPLOYMENT_NAME",
+        "AZURE_API_KEY",
+        "AZURE_AD_TOKEN",
     ],
     optional=True,
 )
-"""Langfuse observability configuration.
+"""Azure OpenAI credentials.
 
-- name: `langfuse`
+- name: `azure_openai`
 - optional_keys:
-    - `LANGFUSE_HOST`: Optional Langfuse host URL.
-    - `LANGFUSE_PUBLIC_KEY`: Optional Langfuse public key.
-    - `LANGFUSE_SECRET_KEY`: Optional Langfuse secret key.
+    - `AZURE_API_BASE`: Azure OpenAI endpoint (e.g., https://<resource>.openai.azure.com).
+    - `AZURE_API_VERSION`: Azure OpenAI API version.
+    - `AZURE_DEPLOYMENT_NAME`: Azure OpenAI deployment name.
+    - `AZURE_API_KEY`: Azure OpenAI API key. Required if not using Entra token.
+    - `AZURE_AD_TOKEN`: Azure Entra (AD) token. Required if not using API key.
 """
 
-PYDANTIC_AI_REGISTRY_SECRETS = [
+azure_ai_secret = RegistrySecret(
+    name="azure_ai",
+    optional_keys=[
+        "AZURE_API_BASE",
+        "AZURE_API_KEY",
+        "AZURE_AI_MODEL_NAME",
+    ],
+    optional=True,
+)
+"""Azure AI credentials.
+
+- name: `azure_ai`
+- optional_keys:
+    - `AZURE_API_BASE`: Azure AI endpoint (e.g., https://<resource>.services.ai.azure.com/anthropic).
+    - `AZURE_API_KEY`: Azure AI API key.
+    - `AZURE_AI_MODEL_NAME`: Model name to use (e.g., claude-sonnet-4-5).
+"""
+
+PYDANTIC_AI_REGISTRY_SECRETS: list[RegistrySecretType] = [
     anthropic_secret,
     openai_secret,
     gemini_secret,
     bedrock_secret,
     custom_model_provider_secret,
+    azure_openai_secret,
+    azure_ai_secret,
 ]
 
 
@@ -140,7 +172,7 @@ PYDANTIC_AI_REGISTRY_SECRETS = [
     description="AI agent with tool calling capabilities. Returns the output and full message history.",
     display_group="AI",
     doc_url="https://ai.pydantic.dev/agents/",
-    secrets=[*PYDANTIC_AI_REGISTRY_SECRETS, langfuse_secret],
+    secrets=[*PYDANTIC_AI_REGISTRY_SECRETS],
     namespace="ai",
 )
 async def agent(
@@ -152,33 +184,15 @@ async def agent(
     model_name: Annotated[str, Doc("Name of the model to use.")],
     model_provider: Annotated[str, Doc("Provider of the model to use.")],
     actions: Annotated[
-        list[str],
+        list[str] | None,
         Doc("Actions (e.g. 'tools.slack.post_message') to include in the agent."),
         ActionType(multiple=True),
-    ],
-    fixed_arguments: Annotated[
-        dict[str, dict[str, Any]] | None,
-        Doc(
-            "Fixed action arguments: keys are action names, values are keyword arguments. "
-            "E.g. {'tools.slack.post_message': {'channel_id': 'C123456789', 'text': 'Hello, world!'}}"
-        ),
     ] = None,
     instructions: Annotated[
         str | None, Doc("Instructions for the agent."), TextArea()
     ] = None,
     output_type: Annotated[
-        Literal[
-            "bool",
-            "float",
-            "int",
-            "str",
-            "list[bool]",
-            "list[float]",
-            "list[int]",
-            "list[str]",
-        ]
-        | dict[str, Any]
-        | None,
+        OutputType | None,
         Doc(
             "Output type for agent responses. Select from a list of supported types or provide a JSONSchema."
         ),
@@ -186,31 +200,66 @@ async def agent(
     model_settings: Annotated[
         dict[str, Any] | None, Doc("Model settings for the agent.")
     ] = None,
-    max_tools_calls: Annotated[
+    max_tool_calls: Annotated[
         int, Doc("Maximum number of tool calls for the agent.")
     ] = 15,
     max_requests: Annotated[int, Doc("Maximum number of requests for the agent.")] = 45,
     retries: Annotated[int, Doc("Number of retries for the agent.")] = 3,
     base_url: Annotated[str | None, Doc("Base URL of the model to use.")] = None,
+    # Paid feature
+    tool_approvals: Annotated[
+        dict[str, bool] | None,
+        Doc(
+            "Per-tool approval overrides keyed by action name (e.g. 'core.cases.create_case'). Use true to require approval, false to allow auto-execution."
+        ),
+    ] = None,
 ) -> dict[str, Any]:
-    agent = await build_agent(
-        model_name=model_name,
-        model_provider=model_provider,
-        actions=actions,
-        fixed_arguments=fixed_arguments,
-        instructions=instructions,
-        output_type=output_type,
-        model_settings=model_settings,
-        retries=retries,
-        base_url=base_url,
-    )
-    result = await run_agent_sync(
-        agent,
-        user_prompt,
-        max_tools_calls=max_tools_calls,
-        max_requests=max_requests,
-    )
-    return result.model_dump()
+    raise ActionIsInterfaceError()
+
+
+@registry.register(
+    default_title="Run agent preset",
+    description="Run an AI agent using a saved agent preset.",
+    display_group="AI",
+    secrets=[*PYDANTIC_AI_REGISTRY_SECRETS],
+    namespace="ai",
+    required_entitlements=["agent_addons"],
+)
+async def preset_agent(
+    preset: Annotated[
+        str,
+        Doc("Preset of the agent to run (e.g. 'security-analyst')."),
+        AgentPreset(),
+    ],
+    user_prompt: Annotated[
+        str,
+        Doc("User prompt to the agent."),
+        TextArea(),
+    ],
+    preset_version: Annotated[
+        int | None,
+        Doc("Optional preset version number to pin for this run."),
+    ] = None,
+    actions: Annotated[
+        list[str] | None,
+        Doc(
+            "Optional override for the actions (e.g. 'tools.slack.post_message') that the agent should be allowed to call."
+        ),
+        ActionType(multiple=True),
+    ] = None,
+    instructions: Annotated[
+        str | None,
+        Doc(
+            "Additional instructions to append to the preset instructions for this run."
+        ),
+        TextArea(),
+    ] = None,
+    max_tool_calls: Annotated[
+        int, Doc("Maximum number of tool calls for the agent.")
+    ] = 15,
+    max_requests: Annotated[int, Doc("Maximum number of requests for the agent.")] = 45,
+) -> dict[str, Any]:
+    raise ActionIsInterfaceError()
 
 
 @registry.register(
@@ -233,18 +282,7 @@ async def action(
         str | None, Doc("Instructions for the agent."), TextArea()
     ] = None,
     output_type: Annotated[
-        Literal[
-            "bool",
-            "float",
-            "int",
-            "str",
-            "list[bool]",
-            "list[float]",
-            "list[int]",
-            "list[str]",
-        ]
-        | dict[str, Any]
-        | None,
+        OutputType | None,
         Doc(
             "Output type for agent responses. Select from a list of supported types or provide a JSONSchema."
         ),
@@ -252,18 +290,9 @@ async def action(
     model_settings: Annotated[
         dict[str, Any] | None, Doc("Model settings for the agent.")
     ] = None,
-    max_requests: Annotated[int, Doc("Maximum number of requests for the agent.")] = 20,
-    retries: Annotated[int, Doc("Number of retries for the agent.")] = 6,
+    max_requests: Annotated[int, Doc("Maximum number of requests for the agent.")] = 45,
+    retries: Annotated[int, Doc("Number of retries for the agent.")] = 3,
     base_url: Annotated[str | None, Doc("Base URL of the model to use.")] = None,
-) -> Any:
-    agent = await build_agent(
-        model_name=model_name,
-        model_provider=model_provider,
-        instructions=instructions,
-        output_type=output_type,
-        model_settings=model_settings,
-        retries=retries,
-        base_url=base_url,
-    )
-    result = await run_agent_sync(agent, user_prompt, max_requests=max_requests)
-    return result.model_dump()
+) -> dict[str, Any]:
+    """Call an LLM with a given prompt and model (no tools)."""
+    raise ActionIsInterfaceError()

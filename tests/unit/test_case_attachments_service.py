@@ -3,14 +3,18 @@ import uuid
 from io import BytesIO
 
 import pytest
-from sqlmodel.ext.asyncio.session import AsyncSession
+from dotenv import dotenv_values
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracecat import config
-from tracecat.cases.attachments.models import CaseAttachmentCreate
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import ADMIN_SCOPES
+from tracecat.cases.attachments.schemas import CaseAttachmentCreate
 from tracecat.cases.attachments.service import CaseAttachmentService
 from tracecat.cases.enums import CaseEventType, CasePriority, CaseSeverity, CaseStatus
-from tracecat.cases.models import CaseCreate
+from tracecat.cases.schemas import CaseCreate
 from tracecat.cases.service import CaseEventsService, CasesService
+from tracecat.exceptions import TracecatAuthorizationError, TracecatException
 from tracecat.storage.blob import ensure_bucket_exists
 from tracecat.storage.exceptions import (
     FileExtensionError,
@@ -18,8 +22,6 @@ from tracecat.storage.exceptions import (
     MaxAttachmentsExceededError,
     StorageLimitExceededError,
 )
-from tracecat.types.auth import AccessLevel, Role
-from tracecat.types.exceptions import TracecatAuthorizationError, TracecatException
 
 pytestmark = pytest.mark.usefixtures("db")
 
@@ -28,38 +30,32 @@ pytestmark = pytest.mark.usefixtures("db")
 def sync_minio_credentials(monkeysession: pytest.MonkeyPatch):
     """Ensure MinIO server and S3 client use same creds from .env.
 
-    Reads MINIO_ROOT_USER and MINIO_ROOT_PASSWORD via python-dotenv, then:
-    - sets env vars for the storage client, and
-    - patches tests.conftest MinIO constants so the Docker container uses them.
+    Reads credentials via python-dotenv using the same fallback chain as
+    ``tests.conftest._minio_credentials`` so the test client authenticates
+    with the same identity the MinIO container was started with.
     """
     try:
-        from dotenv import dotenv_values
-
         env = dotenv_values()
     except Exception:
         env = {}
 
     access_key = (
-        env.get("MINIO_ROOT_USER") or os.environ.get("MINIO_ROOT_USER") or "minioadmin"
+        env.get("AWS_ACCESS_KEY_ID")
+        or env.get("MINIO_ROOT_USER")
+        or os.environ.get("AWS_ACCESS_KEY_ID")
+        or os.environ.get("MINIO_ROOT_USER")
+        or "minio"
     )
     secret_key = (
-        env.get("MINIO_ROOT_PASSWORD")
+        env.get("AWS_SECRET_ACCESS_KEY")
+        or env.get("MINIO_ROOT_PASSWORD")
+        or os.environ.get("AWS_SECRET_ACCESS_KEY")
         or os.environ.get("MINIO_ROOT_PASSWORD")
-        or "minioadmin"
+        or "password"
     )
 
-    # Env for storage client
-    monkeysession.setenv("MINIO_ROOT_USER", access_key)
-    monkeysession.setenv("MINIO_ROOT_PASSWORD", secret_key)
-
-    # Patch tests.conftest constants used to start MinIO
-    try:
-        import tests.conftest as conf
-
-        monkeysession.setattr(conf, "MINIO_ACCESS_KEY", access_key, raising=False)
-        monkeysession.setattr(conf, "MINIO_SECRET_KEY", secret_key, raising=False)
-    except Exception:
-        pass
+    monkeysession.setenv("AWS_ACCESS_KEY_ID", access_key)
+    monkeysession.setenv("AWS_SECRET_ACCESS_KEY", secret_key)
 
 
 @pytest.fixture
@@ -115,12 +111,9 @@ async def configure_minio_for_attachments(
 ):
     # Point storage at the test MinIO instance and bucket
     monkeypatch.setattr(
-        config, "TRACECAT__BLOB_STORAGE_PROTOCOL", "minio", raising=False
-    )
-    monkeypatch.setattr(
         config,
         "TRACECAT__BLOB_STORAGE_ENDPOINT",
-        "http://localhost:9002",
+        "http://localhost:9000",
         raising=False,
     )
     monkeypatch.setattr(
@@ -129,10 +122,10 @@ async def configure_minio_for_attachments(
 
     # Set MinIO credentials for the client
     monkeypatch.setenv(
-        "MINIO_ROOT_USER", os.environ.get("MINIO_ROOT_USER", "minioadmin")
+        "AWS_ACCESS_KEY_ID", os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
     )
     monkeypatch.setenv(
-        "MINIO_ROOT_PASSWORD", os.environ.get("MINIO_ROOT_PASSWORD", "minioadmin")
+        "AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
     )
 
     # Ensure bucket exists from our client perspective
@@ -366,10 +359,11 @@ async def test_delete_authorization_basic_vs_admin(
     # Attempt delete with a different BASIC user in the same workspace
     other_role = Role(
         type="user",
-        access_level=AccessLevel.BASIC,
         workspace_id=attachments_service.role.workspace_id,
+        organization_id=attachments_service.role.organization_id,
         user_id=uuid.uuid4(),
         service_id="tracecat-api",
+        scopes=ADMIN_SCOPES,
     )
     other_svc = CaseAttachmentService(session=session, role=other_role)
     with pytest.raises(TracecatAuthorizationError):

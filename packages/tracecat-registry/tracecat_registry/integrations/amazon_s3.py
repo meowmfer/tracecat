@@ -1,24 +1,29 @@
 """S3 integration to download files and return contents as a string."""
 
-import re
-from typing import Annotated, Any
-from typing_extensions import Doc
+import asyncio
 import base64
 import binascii
-import asyncio
+import re
+from typing import TYPE_CHECKING, Annotated, Any
 
 from tenacity import retry, stop_after_attempt, wait_exponential
-from types_aiobotocore_s3.type_defs import (
-    ListObjectsV2OutputTypeDef,
-    DeleteObjectOutputTypeDef,
-)
+from typing_extensions import Doc
+
+if TYPE_CHECKING:
+    from types_aiobotocore_s3.type_defs import (
+        DeleteObjectOutputTypeDef,
+        ListObjectsV2OutputTypeDef,
+    )
+else:
+    ListObjectsV2OutputTypeDef = dict[str, Any]
+    DeleteObjectOutputTypeDef = dict[str, Any]
 
 from tracecat_registry import RegistrySecret, registry
-import tracecat_registry.integrations.aws_boto3 as aws_boto3
-from tracecat.config import (
+from tracecat_registry.config import (
     TRACECAT__MAX_FILE_SIZE_BYTES,
     TRACECAT__S3_CONCURRENCY_LIMIT,
 )
+import tracecat_registry.integrations.aws_boto3 as aws_boto3
 
 # Add this at the top with other constants
 BUCKET_REGEX = re.compile(r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$")
@@ -32,8 +37,8 @@ s3_secret = RegistrySecret(
     optional_keys=[
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
         "AWS_REGION",
-        "AWS_PROFILE",
         "AWS_ROLE_ARN",
         "AWS_ROLE_SESSION_NAME",
     ],
@@ -44,15 +49,18 @@ s3_secret = RegistrySecret(
 - name: `amazon_s3`
 - optional_keys:
     Either:
+        - `AWS_ROLE_ARN` (recommended; Tracecat assumes the role on the host)
+        - `AWS_ROLE_SESSION_NAME` (optional audit session label)
+    Or:
         - `AWS_ACCESS_KEY_ID`
         - `AWS_SECRET_ACCESS_KEY`
-    Or:
-        - `AWS_PROFILE`
-    Or:
-        - `AWS_ROLE_ARN`
-        - `AWS_ROLE_SESSION_NAME` (optional)
+        - `AWS_SESSION_TOKEN` (optional)
     And:
         - `AWS_REGION`
+
+Tracecat automatically supplies the workspace-scoped AWS External ID used for
+cross-account AssumeRole requests and uses a default STS session name when
+`AWS_ROLE_SESSION_NAME` is unset.
 """
 
 

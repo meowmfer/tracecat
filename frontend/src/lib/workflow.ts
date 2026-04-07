@@ -1,16 +1,52 @@
-import type { ReactFlowInstance, ReactFlowJsonObject } from "@xyflow/react"
-
+import type { ReactFlowJsonObject } from "@xyflow/react"
 import { isEphemeral } from "@/components/builder/canvas/canvas"
+import { client } from "@/lib/api"
 
 export const CHILD_WORKFLOW_ACTION_TYPE = "core.workflow.execute" as const
 
-/**
- * Prune the React Flow instance to remove ephemeral nodes and edges.
- * @param reactFlowInstance - The React Flow instance.
- * @returns The pruned React Flow instance.
- */
-export function pruneReactFlowInstance(reactFlowInstance: ReactFlowInstance) {
-  return pruneGraphObject(reactFlowInstance.toObject())
+type WorkflowDefinitionExport = {
+  workspace_id?: string | null
+  workflow_id?: string | null
+  version?: number
+  definition: {
+    title: string
+    [key: string]: unknown
+  }
+  layout?: unknown
+  case_trigger?: unknown
+}
+
+export async function exportWorkflowDefinition(params: {
+  workspaceId: string
+  workflowId: string
+  draft?: boolean
+}): Promise<WorkflowDefinitionExport> {
+  const response = await client.get<WorkflowDefinitionExport>(
+    `/workflows/${params.workflowId}/export`,
+    {
+      params: {
+        workspace_id: params.workspaceId,
+        format: "json",
+        draft: params.draft ?? false,
+      },
+    }
+  )
+
+  return response.data
+}
+
+export function buildDuplicatedWorkflowDefinition(
+  definition: WorkflowDefinitionExport,
+  title: string
+): WorkflowDefinitionExport {
+  return {
+    ...definition,
+    workflow_id: null,
+    definition: {
+      ...definition.definition,
+      title: `Copy of ${title.trim() || definition.definition.title.trim() || "workflow"}`,
+    },
+  }
 }
 
 /**

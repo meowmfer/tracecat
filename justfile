@@ -5,6 +5,38 @@ default:
   @just --list
 test:
 	pytest --cache-clear tests/registry tests/unit tests/playbooks -x
+
+# Run fast unit tests in parallel (excludes slow/integration/temporal tests)
+test-fast:
+	uv run pytest tests/unit -m "not (slow or integration or temporal)" -n auto -x
+
+# Run only workflow/temporal tests
+test-temporal:
+	uv run pytest tests/temporal -x
+
+# Run specific test file with parallel execution
+test-file file:
+	uv run pytest {{file}} -n auto -x
+
+# Run tests matching a keyword
+test-k keyword:
+	uv run pytest tests/unit -k "{{keyword}}" -n auto -x
+
+# Run backend benchmarks inside Docker (required for nsjail on macOS)
+bench *args:
+	docker run --rm \
+		--network tracecat_default \
+		--cap-add SYS_ADMIN \
+		--security-opt seccomp=unconfined \
+		--env-file .env \
+		-e REDIS_URL=redis://redis:6379 \
+		-e TRACECAT__BLOB_STORAGE_ENDPOINT=http://minio:9000 \
+		-e TRACECAT__DB_URI=postgresql+psycopg://postgres:postgres@postgres_db:5432/postgres \
+		-v "$(pwd)/tests:/app/tests:ro" \
+		--entrypoint sh \
+		tracecat-executor \
+		-c "pip install pytest pytest-anyio anyio -q && python -m pytest tests/backends/test_backend_benchmarks.py -v -s {{args}}"
+
 down:
 	docker compose down --remove-orphans
 clean:
@@ -34,25 +66,35 @@ build:
 lint-ui:
 	pnpm -C frontend lint:fix
 lint-app:
-	ruff check
+	uv run ruff check
 
 lint-fix-ui:
 	pnpm -C frontend check
 lint-fix-app:
-	ruff check . && ruff format .
+	uv run ruff check . --fix && uv run ruff format .
 
 lint: lint-ui lint-app
 lint-fix: lint-fix-ui lint-fix-app
 fix: lint-fix
 
-mypy path:
-	mypy --ignore-missing-imports {{path}}
+typecheck:
+	uv run basedpyright --warnings --threads 4
 gen-client:
 	pnpm -C frontend generate-client
 	just lint-fix
 gen-client-ci:
 	pnpm -C frontend generate-client-ci
 	just lint-fix
+
+gen-mcp-docs:
+	uv run python scripts/generate_mcp_docs.py
+
+gen-tool-docs:
+	uv run python scripts/generate_tool_docs.py
+
+gen-functions-docs:
+	uv run python scripts/generate_functions_docs.py
+
 # Update version number. If no version is provided, increments patch version.
 update-version *after='':
 	@-./scripts/update-version.sh {{after}}
@@ -66,3 +108,7 @@ _check-temporal-cli:
 # Stop all running Temporal workflow executions
 temporal-stop-all: _check-temporal-cli
 	temporal workflow terminate --query "ExecutionStatus='Running'" --namespace default --yes
+
+# Manage multiple Tracecat clusters (run `just cluster` for usage)
+cluster *args:
+	./scripts/cluster {{args}}

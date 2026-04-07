@@ -6,15 +6,24 @@ from statistics import mean
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from tracecat import config
 from tracecat.auth.credentials import RoleACL, _role_dependency
-from tracecat.auth.models import UserRole
-from tracecat.authz.models import WorkspaceRole
-from tracecat.db.schemas import Membership, User
+from tracecat.auth.schemas import UserRole
+from tracecat.auth.types import Role
+from tracecat.authz.enums import WorkspaceRole
+from tracecat.authz.service import MembershipWithOrg
+from tracecat.db.models import (
+    Membership,
+    Organization,
+    OrganizationMembership,
+    User,
+    Workspace,
+)
 from tracecat.middleware import AuthorizationCacheMiddleware
-from tracecat.types.auth import AccessLevel, Role
 
 
 @pytest.fixture
@@ -24,7 +33,7 @@ def test_app():
     app.add_middleware(AuthorizationCacheMiddleware)
 
     @app.get("/test-workspace")
-    async def test_endpoint(
+    async def test_endpoint(  # pyright: ignore[reportUnusedFunction] - route handler
         role: Role = RoleACL(
             allow_user=True,
             allow_service=False,
@@ -40,6 +49,107 @@ def test_app():
 def client(test_app):
     """Create a test client."""
     return TestClient(test_app)
+
+
+@pytest.mark.anyio
+async def test_role_dependency_rebinds_rls_context_on_session(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Role resolution should re-apply RLS context on the request session."""
+    monkeypatch.setattr(config, "TRACECAT__RLS_MODE", config.RLSMode.ENFORCE)
+
+    workspace_id = uuid.uuid4()
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    request = MagicMock(spec=Request)
+    request.state = MagicMock()
+    request.state.auth_cache = None
+    session = AsyncMock()
+    user = MagicMock(spec=User)
+
+    role = Role(
+        type="user",
+        workspace_id=workspace_id,
+        organization_id=org_id,
+        user_id=user_id,
+        service_id="tracecat-api",
+    )
+    validated_role = role.model_copy(update={"scopes": frozenset({"tests:read"})})
+
+    with (
+        patch(
+            "tracecat.auth.credentials._authenticate_user",
+            new=AsyncMock(return_value=role),
+        ),
+        patch(
+            "tracecat.auth.credentials._validate_role",
+            new=AsyncMock(return_value=validated_role),
+        ),
+        patch(
+            "tracecat.auth.credentials.set_rls_context_from_role",
+            new=AsyncMock(),
+        ) as mock_set_rls,
+    ):
+        result = await _role_dependency(
+            request=request,
+            session=session,
+            workspace_id=workspace_id,
+            user=user,
+            api_key=None,
+            allow_user=True,
+            allow_service=False,
+            allow_executor=False,
+            require_workspace="yes",
+        )
+
+    assert result == validated_role
+    mock_set_rls.assert_awaited_once_with(session, validated_role)
+
+
+@pytest.mark.anyio
+async def test_role_dependency_preserves_auth_exception_when_cleanup_fails():
+    """Cleanup errors must not mask the original auth exception."""
+    workspace_id = uuid.uuid4()
+    request = MagicMock(spec=Request)
+    request.state = MagicMock()
+    request.state.auth_cache = None
+    session = AsyncMock()
+    user = MagicMock(spec=User)
+
+    original_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="auth failure",
+    )
+
+    with (
+        patch(
+            "tracecat.auth.credentials.set_rls_context",
+            new=AsyncMock(),
+        ),
+        patch(
+            "tracecat.auth.credentials._authenticate_user",
+            new=AsyncMock(side_effect=original_exc),
+        ),
+        patch(
+            "tracecat.auth.credentials.set_rls_context_from_role",
+            new=AsyncMock(side_effect=RuntimeError("cleanup failed")),
+        ) as mock_cleanup,
+    ):
+        with pytest.raises(HTTPException) as excinfo:
+            await _role_dependency(
+                request=request,
+                session=session,
+                workspace_id=workspace_id,
+                user=user,
+                api_key=None,
+                allow_user=True,
+                allow_service=False,
+                allow_executor=False,
+                require_workspace="yes",
+            )
+
+    assert excinfo.value is original_exc
+    mock_cleanup.assert_awaited_once_with(session, None)
 
 
 @pytest.mark.anyio
@@ -99,10 +209,23 @@ async def test_auth_cache_reduces_database_queries(mocker):
         db_call_count += 1
         return [mock_membership1, mock_membership2]
 
+    # Create organization IDs for memberships
+    org_id_1 = uuid.uuid4()
+    org_id_2 = uuid.uuid4()
+
     # Create a mock service instance
     mock_service = MagicMock(spec=MembershipService)
     mock_service.list_user_memberships = AsyncMock(
         side_effect=mock_list_user_memberships
+    )
+    mock_service.get_membership = AsyncMock(
+        side_effect=lambda workspace_id, user_id: (
+            MembershipWithOrg(membership=mock_membership1, org_id=org_id_1)
+            if workspace_id == workspace_id_1
+            else MembershipWithOrg(membership=mock_membership2, org_id=org_id_2)
+            if workspace_id == workspace_id_2
+            else None
+        )
     )
 
     # Mock the MembershipService constructor to return our mock
@@ -110,14 +233,17 @@ async def test_auth_cache_reduces_database_queries(mocker):
         "tracecat.auth.credentials.MembershipService", return_value=mock_service
     )
 
-    # Mock the access level lookup
-    mocker.patch.dict(
-        "tracecat.auth.credentials.USER_ROLE_TO_ACCESS_LEVEL",
-        {UserRole.BASIC: AccessLevel.BASIC},
-    )
-
     # Mock is_unprivileged to return True for basic users
     mocker.patch("tracecat.auth.credentials.is_unprivileged", return_value=True)
+
+    # Mock _get_workspace_org_id to return org_id for any workspace
+    mocker.patch(
+        "tracecat.auth.credentials._get_workspace_org_id",
+        side_effect=lambda ws_id: org_id_1 if ws_id == workspace_id_1 else org_id_2,
+    )
+
+    # Mock _is_org_admin_via_rbac to return False (not an org admin)
+    mocker.patch("tracecat.auth.credentials._is_org_admin_via_rbac", return_value=False)
 
     # Simulate multiple workspace checks in the same request
     request = MagicMock(spec=Request)
@@ -129,8 +255,11 @@ async def test_auth_cache_reduces_database_queries(mocker):
         "user_id": None,
     }
 
-    # Mock session
+    # Mock session with proper execute() and scalar_one_or_none() chain
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none = MagicMock(return_value=None)
     mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_result)
 
     # First workspace check - should trigger database query
     await _role_dependency(
@@ -142,8 +271,6 @@ async def test_auth_cache_reduces_database_queries(mocker):
         allow_user=True,
         allow_service=False,
         require_workspace="yes",
-        min_access_level=None,
-        require_workspace_roles=None,
     )
 
     assert db_call_count == 1  # First call triggers DB query
@@ -158,8 +285,6 @@ async def test_auth_cache_reduces_database_queries(mocker):
         allow_user=True,
         allow_service=False,
         require_workspace="yes",
-        min_access_level=None,
-        require_workspace_roles=None,
     )
 
     assert db_call_count == 1  # Still only 1 DB call - used cache!
@@ -202,19 +327,13 @@ async def test_performance_improvement(mocker):
     async def mock_get_membership_slow(self, workspace_id, user_id):
         # Simulate database query delay
         await asyncio.sleep(db_delay_ms / 1000)
-        return mock_membership
+        return MembershipWithOrg(membership=mock_membership, org_id=uuid.uuid4())
 
     # Patch the membership service
     mocker.patch.object(
         MembershipService, "list_user_memberships", mock_list_user_memberships_slow
     )
     mocker.patch.object(MembershipService, "get_membership", mock_get_membership_slow)
-
-    # Mock the access level lookup
-    mocker.patch.dict(
-        "tracecat.auth.credentials.USER_ROLE_TO_ACCESS_LEVEL",
-        {UserRole.ADMIN: AccessLevel.ADMIN, UserRole.BASIC: AccessLevel.BASIC},
-    )
 
     # Helper to time a single call
     async def time_auth_check(user, use_cache=True):
@@ -242,8 +361,6 @@ async def test_performance_improvement(mocker):
             allow_user=True,
             allow_service=False,
             require_workspace="yes",
-            min_access_level=None,
-            require_workspace_roles=None,
         )
         end = time.perf_counter()
 
@@ -339,14 +456,16 @@ async def test_cache_user_id_validation():
     # Mock the service
     mock_service = MagicMock(spec=MembershipService)
     mock_service.list_user_memberships = AsyncMock(
-        side_effect=lambda user_id: [membership1]
-        if user_id == user1.id
-        else [membership2]
+        side_effect=lambda user_id: (
+            [membership1] if user_id == user1.id else [membership2]
+        )
     )
     mock_service.get_membership = AsyncMock(
-        side_effect=lambda workspace_id, user_id: membership1
-        if user_id == user1.id
-        else membership2
+        side_effect=lambda workspace_id, user_id: (
+            MembershipWithOrg(membership=membership1, org_id=uuid.uuid4())
+            if user_id == user1.id
+            else MembershipWithOrg(membership=membership2, org_id=uuid.uuid4())
+        )
     )
 
     # Create request with cache
@@ -359,26 +478,31 @@ async def test_cache_user_id_validation():
         "user_id": None,
     }
 
+    # Create organization ID for the workspace
+    org_id = uuid.uuid4()
+
     # Set up mocks
     with (
         patch("tracecat.auth.credentials.MembershipService", return_value=mock_service),
         patch("tracecat.auth.credentials.is_unprivileged", return_value=True),
-        patch.dict(
-            "tracecat.auth.credentials.USER_ROLE_TO_ACCESS_LEVEL",
-            {UserRole.BASIC: AccessLevel.BASIC},
-        ),
+        patch("tracecat.auth.credentials._get_workspace_org_id", return_value=org_id),
+        patch("tracecat.auth.credentials._is_org_admin_via_rbac", return_value=False),
     ):
+        # Mock session with proper execute() and scalar_one_or_none() chain
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none = MagicMock(return_value=None)
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
         # Common parameters for _role_dependency
         common_params = {
             "request": request,
-            "session": AsyncMock(),
+            "session": mock_session,
             "workspace_id": workspace_id,
             "api_key": None,
             "allow_user": True,
             "allow_service": False,
             "require_workspace": "yes",
-            "min_access_level": None,
-            "require_workspace_roles": None,
         }
 
         # First check with user1 - should populate cache
@@ -391,9 +515,9 @@ async def test_cache_user_id_validation():
         # Now try to access with user2 - should NOT use user1's cached data
         role2 = await _role_dependency(user=user2, **common_params)
 
-        # Verify user2 got their own membership, not user1's cached data
-        assert role2.workspace_role == WorkspaceRole.EDITOR  # user2's role
-        assert role1.workspace_role == WorkspaceRole.ADMIN  # user1's role was different
+        # Verify both users got valid roles for the workspace
+        assert role2.workspace_id == workspace_id
+        assert role1.workspace_id == workspace_id
 
 
 @pytest.mark.anyio
@@ -419,10 +543,19 @@ async def test_cache_size_limit():
 
     # The workspace we're checking
     target_workspace_id = memberships[500].workspace_id
+    target_membership = memberships[500]
+    org_id = uuid.uuid4()
 
     # Mock the service
     mock_service = MagicMock(spec=MembershipService)
     mock_service.list_user_memberships = AsyncMock(return_value=memberships)
+    mock_service.get_membership = AsyncMock(
+        side_effect=lambda workspace_id, user_id: (
+            MembershipWithOrg(membership=target_membership, org_id=org_id)
+            if workspace_id == target_workspace_id
+            else None
+        )
+    )
 
     # Create request with cache
     request = MagicMock(spec=Request)
@@ -438,23 +571,25 @@ async def test_cache_size_limit():
     with (
         patch("tracecat.auth.credentials.MembershipService", return_value=mock_service),
         patch("tracecat.auth.credentials.is_unprivileged", return_value=True),
-        patch.dict(
-            "tracecat.auth.credentials.USER_ROLE_TO_ACCESS_LEVEL",
-            {UserRole.BASIC: AccessLevel.BASIC},
-        ),
+        patch("tracecat.auth.credentials._get_workspace_org_id", return_value=org_id),
+        patch("tracecat.auth.credentials._is_org_admin_via_rbac", return_value=False),
     ):
+        # Mock session with proper execute() and scalar_one_or_none() chain
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none = MagicMock(return_value=None)
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
         # Check with excessive memberships
         role = await _role_dependency(
             request=request,
-            session=AsyncMock(),
+            session=mock_session,
             workspace_id=target_workspace_id,
             user=user,
             api_key=None,
             allow_user=True,
             allow_service=False,
             require_workspace="yes",
-            min_access_level=None,
-            require_workspace_roles=None,
         )
 
         # Verify cache was NOT populated due to size limit
@@ -467,3 +602,209 @@ async def test_cache_size_limit():
 
         # But the role should still be valid (fallback worked)
         assert role.workspace_id == target_workspace_id
+
+
+@pytest.mark.anyio
+async def test_organization_id_populated_when_require_workspace_no(mocker):
+    """Test that organization_id is inferred from OrganizationMembership when require_workspace="no"."""
+
+    # Create mock user (non-superuser to avoid 428 org selection requirement)
+    mock_user = MagicMock(spec=User)
+    mock_user.id = uuid.uuid4()
+    mock_user.role = UserRole.ADMIN
+    mock_user.is_superuser = False
+
+    # Create a mock organization for the user to belong to
+    test_org_id = uuid.uuid4()
+
+    # Mock session - need to properly mock execute() for org membership lookup
+    # The code does: org_ids = {row[0] for row in org_membership_result.all()}
+    mock_session = AsyncMock()
+
+    # First call: OrganizationMembership query returns the org_id
+    org_result = MagicMock()
+    org_result.all.return_value = [(test_org_id,)]
+
+    # Second call: OrganizationMembership lookup for org_role returns None
+    org_role_result = MagicMock()
+    org_role_result.scalar_one_or_none.return_value = None
+
+    # Third call: compute_effective_scopes query returns empty scopes
+    scopes_result = MagicMock()
+    scopes_result.scalars.return_value.all.return_value = []
+
+    mock_session.execute.side_effect = [org_result, org_role_result, scopes_result]
+
+    # Mock is_unprivileged to return False for admin users
+    mocker.patch("tracecat.auth.credentials.is_unprivileged", return_value=False)
+
+    mocker.patch(
+        "tracecat.auth.credentials.set_rls_context",
+        new=AsyncMock(),
+    )
+    mocker.patch(
+        "tracecat.auth.credentials.set_rls_context_from_role",
+        new=AsyncMock(),
+    )
+    request = MagicMock(spec=Request)
+    request.state = MagicMock()
+    request.state.auth_cache = None
+
+    # Test with require_workspace="no" - organization_id should be inferred from OrganizationMembership
+    role = await _role_dependency(
+        request=request,
+        session=mock_session,
+        workspace_id=None,  # No workspace ID
+        user=mock_user,
+        api_key=None,
+        allow_user=True,
+        allow_service=False,
+        require_workspace="no",
+    )
+
+    # Verify organization_id was inferred from the user's OrganizationMembership
+    assert role.organization_id == test_org_id
+    assert role.workspace_id is None
+    assert role.user_id == mock_user.id
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("db")
+async def test_role_dependency_infers_org_from_single_membership(
+    session: AsyncSession,
+):
+    org_id = uuid.uuid4()
+    org = Organization(
+        id=org_id,
+        name="Test Org",
+        slug=f"test-org-{org_id.hex[:8]}",
+        is_active=True,
+    )
+    user = User(
+        id=uuid.uuid4(),
+        email=f"user-{uuid.uuid4()}@example.com",
+        hashed_password="test_password",
+        is_active=True,
+        is_verified=True,
+        is_superuser=False,
+        last_login_at=None,
+        role=UserRole.BASIC,
+    )
+    workspace = Workspace(
+        id=uuid.uuid4(),
+        name="Test Workspace",
+        organization_id=org.id,
+    )
+    session.add_all([org, user, workspace])
+    await session.commit()
+
+    membership = Membership(
+        user_id=user.id,
+        workspace_id=workspace.id,
+    )
+    # Also create organization membership - required for org context resolution
+    org_membership = OrganizationMembership(
+        user_id=user.id,
+        organization_id=org.id,
+    )
+    session.add_all([membership, org_membership])
+    await session.commit()
+
+    request = MagicMock(spec=Request)
+    request.state = MagicMock()
+    request.state.auth_cache = None
+
+    role = await _role_dependency(
+        request=request,
+        session=session,
+        workspace_id=None,
+        user=user,
+        api_key=None,
+        allow_user=True,
+        allow_service=False,
+        require_workspace="no",
+    )
+
+    assert role.organization_id == org.id
+    assert role.workspace_id is None
+    assert role.user_id == user.id
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("db")
+async def test_role_dependency_requires_workspace_for_multi_org(
+    session: AsyncSession,
+):
+    org_a_id = uuid.uuid4()
+    org_b_id = uuid.uuid4()
+    org_a = Organization(
+        id=org_a_id,
+        name="Org A",
+        slug=f"org-a-{org_a_id.hex[:8]}",
+        is_active=True,
+    )
+    org_b = Organization(
+        id=org_b_id,
+        name="Org B",
+        slug=f"org-b-{org_b_id.hex[:8]}",
+        is_active=True,
+    )
+    user = User(
+        id=uuid.uuid4(),
+        email=f"user-{uuid.uuid4()}@example.com",
+        hashed_password="test_password",
+        is_active=True,
+        is_verified=True,
+        is_superuser=False,
+        last_login_at=None,
+        role=UserRole.BASIC,
+    )
+    workspace_a = Workspace(
+        id=uuid.uuid4(),
+        name="Workspace A",
+        organization_id=org_a.id,
+    )
+    workspace_b = Workspace(
+        id=uuid.uuid4(),
+        name="Workspace B",
+        organization_id=org_b.id,
+    )
+    session.add_all([org_a, org_b, user, workspace_a, workspace_b])
+    await session.commit()
+
+    memberships = [
+        Membership(
+            user_id=user.id,
+            workspace_id=workspace_a.id,
+        ),
+        Membership(
+            user_id=user.id,
+            workspace_id=workspace_b.id,
+        ),
+    ]
+    # Also create organization memberships for both orgs
+    org_memberships = [
+        OrganizationMembership(user_id=user.id, organization_id=org_a.id),
+        OrganizationMembership(user_id=user.id, organization_id=org_b.id),
+    ]
+    session.add_all(memberships + org_memberships)
+    await session.commit()
+
+    request = MagicMock(spec=Request)
+    request.state = MagicMock()
+    request.state.auth_cache = None
+
+    # User belongs to multiple orgs, so require_workspace="no" should fail
+    with pytest.raises(HTTPException) as excinfo:
+        await _role_dependency(
+            request=request,
+            session=session,
+            workspace_id=None,
+            user=user,
+            api_key=None,
+            allow_user=True,
+            allow_service=False,
+            require_workspace="no",
+        )
+
+    assert excinfo.value.status_code == status.HTTP_400_BAD_REQUEST

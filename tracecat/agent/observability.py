@@ -1,43 +1,84 @@
-"""Langfuse observability helpers."""
+"""Process-local LLM gateway observability helpers."""
 
-from tracecat_registry import secrets
+from __future__ import annotations
 
-from tracecat.contexts import ctx_run
-from tracecat.logger import logger
-
-try:
-    from langfuse import get_client
-except ImportError:
-    get_client = None
+from dataclasses import dataclass
+from threading import Lock
 
 
-def init_langfuse(model_name: str | None, model_provider: str | None) -> str | None:
-    """Initialize Langfuse client and return the trace id when Langfuse is available."""
+@dataclass(frozen=True, slots=True)
+class LLMGatewayLoadSnapshot:
+    """Snapshot of current process-local LLM gateway path activity."""
 
-    if get_client is None or secrets.get_or_default("LANGFUSE_PUBLIC_KEY") is None:
-        logger.info("Langfuse client not available; skipping trace initialization")
-        return None
+    active_connections: int
+    active_requests: int
+    peak_active_connections: int
+    peak_active_requests: int
 
-    langfuse_client = get_client(
-        public_key=secrets.get_or_default("LANGFUSE_PUBLIC_KEY")
-    )
-    logger.info("Found Langfuse credentials; initialized Langfuse client.")
 
-    # Get workflow context for session_id
-    run_context = ctx_run.get()
-    if run_context:
-        session_id = f"{run_context.wf_id}/{run_context.wf_run_id}"
-        tags = ["action:ai.agent"]
-        if model_name:
-            tags.append(model_name)
-        if model_provider:
-            tags.append(model_provider)
+class LLMGatewayLoadTracker:
+    """Tracks process-local LLM gateway connection and request load."""
 
-        langfuse_client.update_current_trace(
-            session_id=session_id,
-            tags=tags,
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._request_counter = 0
+        self._active_connections = 0
+        self._active_requests = 0
+        self._peak_active_connections = 0
+        self._peak_active_requests = 0
+
+    def begin_connection(self) -> LLMGatewayLoadSnapshot:
+        """Record a new downstream connection."""
+        with self._lock:
+            self._active_connections += 1
+            self._peak_active_connections = max(
+                self._peak_active_connections, self._active_connections
+            )
+            return self._snapshot_unlocked()
+
+    def end_connection(self) -> LLMGatewayLoadSnapshot:
+        """Record a downstream connection closing."""
+        with self._lock:
+            self._active_connections = max(0, self._active_connections - 1)
+            return self._snapshot_unlocked()
+
+    def begin_request(self) -> tuple[int, LLMGatewayLoadSnapshot]:
+        """Record a new upstream LLM gateway request."""
+        with self._lock:
+            self._request_counter += 1
+            self._active_requests += 1
+            self._peak_active_requests = max(
+                self._peak_active_requests, self._active_requests
+            )
+            return self._request_counter, self._snapshot_unlocked()
+
+    def end_request(self) -> LLMGatewayLoadSnapshot:
+        """Record an upstream LLM gateway request finishing."""
+        with self._lock:
+            self._active_requests = max(0, self._active_requests - 1)
+            return self._snapshot_unlocked()
+
+    def snapshot(self) -> LLMGatewayLoadSnapshot:
+        """Return the current tracker snapshot."""
+        with self._lock:
+            return self._snapshot_unlocked()
+
+    def _snapshot_unlocked(self) -> LLMGatewayLoadSnapshot:
+        return LLMGatewayLoadSnapshot(
+            active_connections=self._active_connections,
+            active_requests=self._active_requests,
+            peak_active_connections=self._peak_active_connections,
+            peak_active_requests=self._peak_active_requests,
         )
 
-    # Get the current trace_id
-    trace_id = langfuse_client.get_current_trace_id()
-    return trace_id
+
+_TRACKERS: dict[str, LLMGatewayLoadTracker] = {}
+_TRACKERS_LOCK = Lock()
+
+
+def get_load_tracker(name: str) -> LLMGatewayLoadTracker:
+    """Return a named process-local load tracker."""
+    with _TRACKERS_LOCK:
+        if name not in _TRACKERS:
+            _TRACKERS[name] = LLMGatewayLoadTracker()
+        return _TRACKERS[name]

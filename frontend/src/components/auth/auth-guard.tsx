@@ -2,36 +2,54 @@
 
 import { useRouter } from "next/navigation"
 import { useEffect } from "react"
+import { useScopeCheck } from "@/components/auth/scope-guard"
 import { CenteredSpinner } from "@/components/loading/spinner"
 import { useAuth } from "@/hooks/use-auth"
 
 interface AuthGuardProps {
   children: React.ReactNode
   requireAuth?: boolean
-  requirePrivileged?: boolean
+  /** Require org admin privileges (platform admin OR org admin/owner) */
+  requireOrgAdmin?: boolean
+  requireSuperuser?: boolean
   redirectTo?: string
 }
 
 export function AuthGuard({
   children,
   requireAuth = true,
-  requirePrivileged = false,
+  requireOrgAdmin = false,
+  requireSuperuser = false,
   redirectTo = "/",
 }: AuthGuardProps) {
   const { user, userIsLoading } = useAuth()
+  const canAdministerOrg = useScopeCheck("org:update")
   const router = useRouter()
 
+  const isLoading = userIsLoading || canAdministerOrg === undefined
+
   useEffect(() => {
-    if (!userIsLoading) {
+    if (!isLoading) {
       if (requireAuth && !user) {
         router.push(redirectTo)
-      } else if (requirePrivileged && !user?.isPrivileged()) {
+      } else if (requireOrgAdmin && canAdministerOrg === false) {
+        router.push(redirectTo)
+      } else if (requireSuperuser && !user?.isSuperuser) {
         router.push(redirectTo)
       }
     }
-  }, [user, userIsLoading, requireAuth, requirePrivileged, redirectTo, router])
+  }, [
+    user,
+    isLoading,
+    requireAuth,
+    requireOrgAdmin,
+    canAdministerOrg,
+    requireSuperuser,
+    redirectTo,
+    router,
+  ])
 
-  if (userIsLoading) {
+  if (isLoading) {
     return <CenteredSpinner />
   }
 
@@ -39,7 +57,11 @@ export function AuthGuard({
     return null
   }
 
-  if (requirePrivileged && !user?.isPrivileged()) {
+  if (requireOrgAdmin && canAdministerOrg === false) {
+    return null
+  }
+
+  if (requireSuperuser && !user?.isSuperuser) {
     return null
   }
 

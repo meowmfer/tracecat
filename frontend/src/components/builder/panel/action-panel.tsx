@@ -15,7 +15,6 @@ import {
   ListIcon,
   Loader2Icon,
   type LucideIcon,
-  MessagesSquare,
   Plus,
   SaveIcon,
   ShapesIcon,
@@ -24,7 +23,7 @@ import {
 import Link from "next/link"
 import type React from "react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { FormProvider, useForm } from "react-hook-form"
+import { FormProvider, useForm, useWatch } from "react-hook-form"
 import type { ImperativePanelHandle } from "react-resizable-panels"
 import YAML from "yaml"
 import { z } from "zod"
@@ -33,7 +32,7 @@ import {
   type ActionUpdate,
   ApiError,
   type RegistryActionRead,
-  type RegistryOAuthSecret_Output as RegistryOAuthSecret,
+  type RegistryOAuthSecret,
   type RegistrySecret,
   type ValidationResult,
 } from "@/client"
@@ -116,10 +115,22 @@ import type { RequestValidationError, TracecatApiError } from "@/lib/errors"
 import { useAction, useGetRegistryAction, useOrgAppSettings } from "@/lib/hooks"
 import { PERMITTED_INTERACTION_ACTIONS } from "@/lib/interactions"
 import { isTracecatJsonSchema, type TracecatJsonSchema } from "@/lib/schema"
-import { cn, slugify } from "@/lib/utils"
+import { cn, slugifyActionRef } from "@/lib/utils"
 import { useWorkflowBuilder } from "@/providers/builder"
 import { useWorkflow } from "@/providers/workflow"
 import { useWorkspaceId } from "@/providers/workspace-id"
+
+const EMPTY_TEMPLATE_EXPRESSION_RE = /^\$\{\{\s*\}\}$/
+
+function normalizeOptionalExpression(
+  value: string | null | undefined
+): string | undefined {
+  const trimmed = value?.trim()
+  if (!trimmed || EMPTY_TEMPLATE_EXPRESSION_RE.test(trimmed)) {
+    return undefined
+  }
+  return trimmed
+}
 
 // These are YAML strings
 const actionFormSchema = z.object({
@@ -142,9 +153,12 @@ const actionFormSchema = z.object({
     ])
     .transform((val) => {
       if (Array.isArray(val)) {
-        return val.filter((item) => item.trim() !== "")
+        // Trim each expression and drop any that are empty after trimming.
+        return val
+          .map((item) => normalizeOptionalExpression(item))
+          .filter((item): item is string => item !== undefined)
       } else if (typeof val === "string") {
-        return val.trim() !== "" ? val : undefined
+        return normalizeOptionalExpression(val)
       }
       return val
     })
@@ -152,7 +166,7 @@ const actionFormSchema = z.object({
   run_if: z
     .string()
     .max(1000, "Run if must be less than 1000 characters")
-    .transform((val) => (val?.trim() ? val.trim() : undefined))
+    .transform((val) => normalizeOptionalExpression(val))
     .optional(),
   // Retry policy fields
   max_attempts: z.number().int().min(0).optional(),
@@ -160,6 +174,7 @@ const actionFormSchema = z.object({
   retry_until: z
     .string()
     .max(1000, "Retry until must be less than 1000 characters")
+    .transform((val) => normalizeOptionalExpression(val))
     .optional(),
   // Control flow options fields
   start_delay: z.number().min(0).optional(),
@@ -167,10 +182,12 @@ const actionFormSchema = z.object({
   wait_until: z
     .string()
     .max(1000, "Wait until must be less than 1000 characters")
+    .transform((val) => normalizeOptionalExpression(val))
     .optional(),
   environment: z
     .string()
     .max(1000, "Environment must be less than 1000 characters")
+    .transform((val) => normalizeOptionalExpression(val))
     .optional(),
   is_interactive: z.boolean().default(false),
   interaction: z
@@ -251,7 +268,11 @@ const reconstructYamlFromForm = (
 
 type InputMode = "form" | "yaml"
 
-export type ActionPanelTabs = "inputs" | "control-flow" | "template-inputs"
+export type ActionPanelTabs =
+  | "inputs"
+  | "schema"
+  | "control-flow"
+  | "template-inputs"
 export interface ActionPanelRef extends ImperativePanelHandle {
   setActiveTab: (tab: ActionPanelTabs) => void
   getActiveTab: () => ActionPanelTabs
@@ -274,7 +295,8 @@ function ActionPanelContent({
     workspaceId,
     workflowId
   )
-  const { actionPanelRef } = useWorkflowBuilder()
+  const { actionPanelRef, actionDrafts, setActionDraft, clearActionDraft } =
+    useWorkflowBuilder()
   const { commitAllEditors } = useYamlEditorContext()
   const { registryAction, registryActionIsLoading, registryActionError } =
     useGetRegistryAction(action?.type)
@@ -285,12 +307,14 @@ function ActionPanelContent({
 
   const actionInputsObj = useMemo(
     () => parseYaml(action?.inputs) ?? {},
-    [action?.inputs]
+    // Include actionId so switching to a different action with identical
+    // inputs still recalculates and triggers downstream resets.
+    [action?.inputs, actionId]
   )
-
-  const methods = useForm<ActionFormSchema>({
-    resolver: zodResolver(actionFormSchema),
-    values: {
+  // Compute initial form values based purely on the latest server state
+  // (ActionRead + control_flow). Drafts are layered on top of this later.
+  const baseFormValues = useMemo<ActionFormSchema>(
+    () => ({
       title: action?.title,
       description: action?.description,
       inputs: actionInputsObj,
@@ -305,8 +329,95 @@ function ActionPanelContent({
       environment: actionControlFlow?.environment || undefined,
       is_interactive: action?.is_interactive ?? false,
       interaction: action?.interaction ?? undefined,
-    },
+    }),
+    [
+      action?.title,
+      action?.description,
+      action?.is_interactive,
+      action?.interaction,
+      actionInputsObj,
+      actionControlFlow?.for_each,
+      actionControlFlow?.run_if,
+      actionControlFlow?.retry_policy?.max_attempts,
+      actionControlFlow?.retry_policy?.timeout,
+      actionControlFlow?.retry_policy?.retry_until,
+      actionControlFlow?.start_delay,
+      actionControlFlow?.join_strategy,
+      actionControlFlow?.wait_until,
+      actionControlFlow?.environment,
+    ]
+  )
+
+  // Local form state for this action. We always seed it from the latest
+  // server-backed baseFormValues; hydration from drafts happens via effects.
+  const methods = useForm<ActionFormSchema>({
+    resolver: zodResolver(actionFormSchema),
+    defaultValues: baseFormValues,
   })
+
+  const watchedValues = useWatch({
+    control: methods.control,
+  })
+
+  // Tracks whether we've already run the one-off hydration for this action.
+  const hasHydratedRef = useRef(false)
+  const lastBaseValuesRef = useRef<ActionFormSchema | null>(null)
+  const lastActionIdRef = useRef<string | null>(null)
+
+  // When the selected action changes, treat it as a fresh hydration target.
+  // We still preserve drafts per action via actionDrafts.
+  useEffect(() => {
+    if (lastActionIdRef.current !== actionId) {
+      hasHydratedRef.current = false
+      lastBaseValuesRef.current = null
+      lastActionIdRef.current = actionId
+    }
+  }, [actionId])
+
+  useEffect(() => {
+    const existingDraft = actionDrafts[actionId] as ActionFormSchema | undefined
+
+    // Never overwrite user edits: once the form is dirty, the user is in
+    // control and we should not reset from either drafts or server.
+    if (methods.formState.isDirty) {
+      return
+    }
+
+    // On first load for this action, prefer any stored draft so that
+    // switching between nodes restores unsaved edits.
+    if (existingDraft && !hasHydratedRef.current) {
+      methods.reset(existingDraft)
+      hasHydratedRef.current = true
+      return
+    }
+
+    // Otherwise, keep pristine forms in sync with the latest server-backed
+    // base values. This will:
+    // - Hydrate once on initial load when there is no draft, and
+    // - Re-hydrate again if the underlying action data changes while the
+    //   form is still pristine (e.g. server-normalized values).
+    if (!existingDraft && action) {
+      const prevBaseValues = lastBaseValuesRef.current
+      const hasBaseChanged =
+        !prevBaseValues ||
+        JSON.stringify(prevBaseValues) !== JSON.stringify(baseFormValues)
+
+      if (!hasHydratedRef.current || hasBaseChanged) {
+        methods.reset(baseFormValues)
+        hasHydratedRef.current = true
+        lastBaseValuesRef.current = baseFormValues
+      }
+    }
+  }, [actionDrafts, actionId, action, baseFormValues, methods])
+
+  useEffect(() => {
+    // Persist drafts only after the user has made changes. This avoids
+    // capturing the initial empty snapshot as a draft and ensures that
+    // drafts always represent actual user edits.
+    if (methods.formState.isDirty) {
+      setActionDraft(actionId, watchedValues)
+    }
+  }, [actionId, watchedValues, methods.formState.isDirty, setActionDraft])
 
   const [validationResults, setValidationResults] = useState<
     ValidationResult[]
@@ -351,7 +462,7 @@ function ActionPanelContent({
       requiredFields: requiredFieldEntries,
       optionalFields: optionalFieldEntries,
     }
-  }, [registryAction, required])
+  }, [action?.type, registryAction, required])
 
   // Track manually shown/hidden fields separately from fields with values
   const [manuallyVisibleFields, setManuallyVisibleFields] = useState<
@@ -365,10 +476,15 @@ function ActionPanelContent({
   const visibleOptionalFields = useMemo(() => {
     const fieldsWithValues = new Set<string>()
 
-    // Add fields that have values in the current inputs
-    if (optionalFields.length > 0 && actionInputsObj) {
+    // Add fields that have values in the current form inputs (draft),
+    // not just those persisted in the last saved YAML. This means that
+    // unsaved edits still keep optional fields visible while the user
+    // is actively configuring an action.
+    const currentInputs =
+      (watchedValues as ActionFormSchema | undefined)?.inputs ?? {}
+    if (optionalFields.length > 0 && currentInputs) {
       optionalFields.forEach(([fieldName]) => {
-        if (actionInputsObj[fieldName] !== undefined) {
+        if (currentInputs[fieldName] !== undefined) {
           fieldsWithValues.add(fieldName)
         }
       })
@@ -381,7 +497,7 @@ function ActionPanelContent({
     return visible
   }, [
     optionalFields,
-    actionInputsObj,
+    watchedValues,
     manuallyVisibleFields,
     manuallyHiddenFields,
   ])
@@ -463,7 +579,7 @@ function ActionPanelContent({
           inputs: inputsYaml, // Use preserved/raw YAML
           control_flow: {
             for_each: values.for_each,
-            run_if: values.run_if,
+            run_if: values.run_if ?? null,
             retry_policy: {
               max_attempts: values.max_attempts,
               timeout: values.timeout,
@@ -479,6 +595,10 @@ function ActionPanelContent({
         }
 
         await updateAction(params)
+        // Once the action is saved, clear any stored draft and
+        // mark the current form values as the new clean baseline.
+        clearActionDraft(actionId)
+        methods.reset(values)
         setTimeout(() => setSaveState(SaveState.SAVED), 300)
       } catch (error) {
         if (error instanceof ApiError) {
@@ -520,13 +640,14 @@ function ActionPanelContent({
     [
       registryAction,
       action,
+      actionId,
       updateAction,
       methods,
       setSaveState,
       setValidationResults,
       inputMode,
-      rawInputsYaml,
       commitAllEditors,
+      clearActionDraft,
     ]
   )
 
@@ -554,7 +675,7 @@ function ActionPanelContent({
                 msg: String(error),
               },
             ],
-            ref: slugify(action?.title ?? ""),
+            ref: slugifyActionRef(action?.title ?? ""),
           },
         ])
       }
@@ -562,13 +683,32 @@ function ActionPanelContent({
     [handleSave, action]
   )
 
-  const onPanelBlur = useCallback(() => {
-    // Commit all YAML editors before form submission
-    if (methods.formState.isDirty) {
-      commitAllEditors()
-      methods.handleSubmit(onSubmit)()
-    }
-  }, [methods, onSubmit, commitAllEditors])
+  const panelRef = useRef<HTMLDivElement | null>(null)
+
+  const onPanelBlur = useCallback(
+    (event: React.FocusEvent<HTMLDivElement>) => {
+      const nextFocusTarget = event.relatedTarget as Node | null
+
+      // If focus is moving to another element inside the panel, do not
+      // auto-save. This avoids immediately saving (and resetting) fields
+      // when the user clicks between controls such as "Add expression"
+      // and the new expression input.
+      if (
+        panelRef.current &&
+        nextFocusTarget &&
+        panelRef.current.contains(nextFocusTarget)
+      ) {
+        return
+      }
+
+      // Only when focus actually leaves the panel do we auto-save.
+      if (methods.formState.isDirty) {
+        commitAllEditors()
+        methods.handleSubmit(onSubmit)()
+      }
+    },
+    [methods, onSubmit, commitAllEditors]
+  )
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -646,19 +786,26 @@ function ActionPanelContent({
   const finalValErrors = [
     ...(validationResults || []),
     ...(validationErrors || []),
-  ].filter((e) => e.ref === slugify(action.title))
+  ].filter((e) => e.ref === slugifyActionRef(action.title))
 
   return (
-    <div onBlur={onPanelBlur} className="pb-10">
+    <div
+      ref={panelRef}
+      onBlur={onPanelBlur}
+      className="flex h-full flex-col overflow-hidden pb-16"
+    >
       <Tabs
         defaultValue="inputs"
         value={activeTab}
         onValueChange={(value) => setActiveTab(value as ActionPanelTabs)}
-        className="w-full"
+        className="flex h-full w-full flex-col"
       >
         <FormProvider {...methods}>
-          <form onSubmit={methods.handleSubmit(onSubmit)}>
-            <div className="relative">
+          <form
+            onSubmit={methods.handleSubmit(onSubmit)}
+            className="flex min-h-0 flex-1 flex-col overflow-hidden"
+          >
+            <div className="relative shrink-0">
               <h3 className="p-4 pt-6">
                 <div className="flex w-full items-start space-x-4">
                   <div className="flex-col">
@@ -681,6 +828,9 @@ function ActionPanelContent({
                                 className="h-auto w-full border-none p-0 text-xs font-medium leading-none focus-visible:border-input focus-visible:bg-background focus-visible:ring-0"
                                 placeholder="Name your action..."
                                 {...field}
+                                // Always provide a string value so this
+                                // input stays controlled for its lifetime.
+                                value={field.value ?? ""}
                               />
                             </FormControl>
                           </FormItem>
@@ -701,6 +851,9 @@ function ActionPanelContent({
                                     className="h-auto w-full max-w-xl overflow-x-auto whitespace-nowrap border-none bg-transparent p-0 text-xs leading-normal placeholder:italic placeholder:text-muted-foreground focus-visible:border-input focus-visible:bg-background focus-visible:ring-0"
                                     placeholder="No description"
                                     {...field}
+                                    // Keep description input controlled
+                                    // even when the value is initially undefined.
+                                    value={field.value ?? ""}
                                   />
                                 </FormControl>
                               </TooltipTrigger>
@@ -768,14 +921,21 @@ function ActionPanelContent({
               <div className="flex items-center justify-start">
                 <TabsList className="h-8 justify-start rounded-none bg-transparent p-0">
                   <TabsTrigger
-                    className="flex h-full min-w-24 items-center justify-center rounded-none border-b-2 border-transparent py-0 text-xs data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                    className="flex h-full min-w-24 items-center justify-center rounded-none py-0 text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none"
                     value="inputs"
                   >
                     <LayoutListIcon className="mr-2 size-4" />
                     <span>Inputs</span>
                   </TabsTrigger>
                   <TabsTrigger
-                    className="flex h-full min-w-24 items-center justify-center rounded-none border-b-2 border-transparent py-0 text-xs data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                    className="flex h-full min-w-24 items-center justify-center rounded-none py-0 text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                    value="schema"
+                  >
+                    <ShapesIcon className="mr-2 size-4" />
+                    <span>Schema</span>
+                  </TabsTrigger>
+                  <TabsTrigger
+                    className="flex h-full min-w-24 items-center justify-center rounded-none py-0 text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none"
                     value="control-flow"
                   >
                     <SplitIcon className="mr-2 size-4" />
@@ -783,7 +943,7 @@ function ActionPanelContent({
                   </TabsTrigger>
                   {registryAction.is_template && (
                     <TabsTrigger
-                      className="flex h-full min-w-24 items-center justify-center rounded-none border-b-2 border-transparent py-0 text-xs data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                      className="flex h-full min-w-24 items-center justify-center rounded-none py-0 text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none"
                       value="template-inputs"
                     >
                       <FileTextIcon className="mr-2 size-4" />
@@ -793,470 +953,418 @@ function ActionPanelContent({
                 </TabsList>
               </div>
               <Separator />
-              <div className="w-full overflow-x-auto">
-                <TabsContent value="inputs">
+            </div>
+            <div className="flex-1 overflow-auto">
+              <div className="w-full min-w-[30rem] overflow-x-auto pb-32">
+                <TabsContent value="inputs" className="pb-8">
                   <SectionErrorBoundary>
-                    {/* Metadata */}
-                    <Accordion
-                      type="multiple"
-                      defaultValue={["action-inputs"]}
-                      className="pb-10"
-                    >
+                    <div className="mt-4 flex flex-col space-y-4 px-4 pb-10">
+                      {finalValErrors.length > 0 && (
+                        <ValidationErrorView
+                          validationErrors={finalValErrors}
+                          side="left"
+                          className="max-w-[600px]"
+                        >
+                          <div className="flex items-center space-x-2">
+                            <AlertTriangleIcon className="size-4 fill-rose-500 stroke-white" />
+                            <span className="pointer-events-none text-xs text-rose-500">
+                              Hover to view errors.
+                            </span>
+                          </div>
+                        </ValidationErrorView>
+                      )}
+                      {/* Input Mode Toggle */}
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-muted-foreground">
+                          {inputMode === "form"
+                            ? "Define action inputs using form fields below."
+                            : "Define action inputs in YAML below."}
+                        </span>
+                        {formModeEnabled && (
+                          <ToggleTabs
+                            options={
+                              [
+                                {
+                                  value: "form",
+                                  content: (
+                                    <div className="flex items-center gap-1">
+                                      <ListIcon className="size-3" />
+                                      <span className="text-xs">Form</span>
+                                    </div>
+                                  ),
+                                  tooltip: "Use form fields",
+                                  ariaLabel: "Form mode",
+                                },
+                                {
+                                  value: "yaml",
+                                  content: (
+                                    <div className="flex items-center gap-1">
+                                      <CodeIcon className="size-3" />
+                                      <span className="text-xs">YAML</span>
+                                    </div>
+                                  ),
+                                  tooltip: "Use YAML editor",
+                                  ariaLabel: "YAML mode",
+                                },
+                              ] as ToggleTabOption<InputMode>[]
+                            }
+                            value={inputMode}
+                            onValueChange={handleModeChange}
+                            size="sm"
+                            className="w-auto"
+                          />
+                        )}
+                      </div>
+
+                      {inputMode === "yaml" && (
+                        /* YAML Mode - Preserve raw YAML */
+                        <ControlledYamlField
+                          label="Inputs"
+                          fieldName="inputs"
+                        />
+                      )}
+                      {inputMode === "form" && formModeEnabled && (
+                        <>
+                          {/* Required fields - always shown */}
+                          {requiredFields.map(([fieldName, fieldDefn]) => {
+                            const fullFieldName = `inputs.${fieldName}`
+                            const label = fieldName
+                              .replaceAll("_", " ")
+                              .replace(/^\w/, (c) => c.toUpperCase())
+                            if (!isTracecatJsonSchema(fieldDefn)) {
+                              // For non-TracecatJsonSchema, we can't extract type information
+                              return (
+                                <ControlledYamlField
+                                  key={fieldName}
+                                  label={label}
+                                  fieldName={fullFieldName}
+                                  info="Please sync your base actions repository to get the latest field schema."
+                                />
+                              )
+                            }
+
+                            return (
+                              <PolymorphicField
+                                key={fieldName}
+                                label={label}
+                                fieldName={fullFieldName}
+                                fieldDefn={fieldDefn}
+                              />
+                            )
+                          })}
+
+                          {/* Optional fields - only shown if in visibleOptionalFields */}
+                          {optionalFields
+                            .filter(([fieldName]) =>
+                              visibleOptionalFields.has(fieldName)
+                            )
+                            .map(([fieldName, fieldDefn]) => {
+                              const fullFieldName = `inputs.${fieldName}`
+                              const label = fieldName
+                                .replaceAll("_", " ")
+                                .replace(/^\w/, (c) => c.toUpperCase())
+                              if (!isTracecatJsonSchema(fieldDefn)) {
+                                // For non-TracecatJsonSchema, we can't extract type information
+                                return (
+                                  <ControlledYamlField
+                                    key={fieldName}
+                                    label={label}
+                                    fieldName={fullFieldName}
+                                  />
+                                )
+                              }
+
+                              return (
+                                <PolymorphicField
+                                  key={fieldName}
+                                  label={label}
+                                  fieldName={fullFieldName}
+                                  fieldDefn={fieldDefn}
+                                />
+                              )
+                            })}
+
+                          {/* Add optional fields dropdown */}
+                          {optionalFields.length > 0 && (
+                            <div className="mt-4">
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="w-full"
+                                  >
+                                    <Plus className="mr-2 size-4" />
+                                    Optional fields
+                                  </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent
+                                  align="start"
+                                  collisionPadding={8}
+                                  className="max-h-[var(--radix-dropdown-menu-content-available-height)] max-w-96 overflow-y-auto"
+                                >
+                                  {optionalFields.map(
+                                    ([fieldName, fieldDefn]) => {
+                                      const label = fieldName
+                                        .replaceAll("_", " ")
+                                        .replace(/^\w/, (c) => c.toUpperCase())
+                                      const isVisible =
+                                        visibleOptionalFields.has(fieldName)
+                                      const description = isTracecatJsonSchema(
+                                        fieldDefn
+                                      )
+                                        ? fieldDefn.description
+                                        : null
+                                      return (
+                                        <DropdownMenuCheckboxItem
+                                          key={fieldName}
+                                          checked={isVisible}
+                                          onCheckedChange={(checked) => {
+                                            if (checked) {
+                                              // Show the field
+                                              setManuallyVisibleFields(
+                                                (prev) =>
+                                                  new Set([...prev, fieldName])
+                                              )
+                                              setManuallyHiddenFields(
+                                                (prev) => {
+                                                  const newSet = new Set(prev)
+                                                  newSet.delete(fieldName)
+                                                  return newSet
+                                                }
+                                              )
+                                            } else {
+                                              // Hide the field
+                                              setManuallyHiddenFields(
+                                                (prev) =>
+                                                  new Set([...prev, fieldName])
+                                              )
+                                              setManuallyVisibleFields(
+                                                (prev) => {
+                                                  const newSet = new Set(prev)
+                                                  newSet.delete(fieldName)
+                                                  return newSet
+                                                }
+                                              )
+                                              // Remove field from form state when hiding
+                                              const currentInputs =
+                                                methods.getValues("inputs")
+                                              const {
+                                                [fieldName]: _removed,
+                                                ...remainingInputs
+                                              } = currentInputs
+                                              methods.setValue(
+                                                "inputs",
+                                                remainingInputs
+                                              )
+                                              methods.unregister(
+                                                `inputs.${fieldName}`
+                                              )
+                                            }
+                                          }}
+                                        >
+                                          <div className="flex flex-col gap-1">
+                                            <span className="font-medium">
+                                              {label}
+                                            </span>
+                                            {description && (
+                                              <span className="text-xs text-muted-foreground">
+                                                {description.endsWith(".")
+                                                  ? description
+                                                  : `${description}.`}
+                                              </span>
+                                            )}
+                                          </div>
+                                        </DropdownMenuCheckboxItem>
+                                      )
+                                    }
+                                  )}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </SectionErrorBoundary>
+                </TabsContent>
+                <TabsContent value="schema" className="pb-8">
+                  <SectionErrorBoundary>
+                    <div className="mt-4 space-y-6 px-4 pb-10">
+                      {/* Action secrets */}
+                      <div className="space-y-4">
+                        <h4 className="text-xs font-bold">Secrets</h4>
+                        {registryAction.secrets &&
+                        registryAction.secrets.length > 0 ? (
+                          <RegistryActionSecrets
+                            secrets={registryAction.secrets}
+                          />
+                        ) : (
+                          <span className="text-xs text-muted-foreground">
+                            No secrets required.
+                          </span>
+                        )}
+                      </div>
+                      {/* Action inputs schema */}
+                      <div className="space-y-4">
+                        <h4 className="text-xs font-bold">Input schema</h4>
+                        <span className="text-xs text-muted-foreground">
+                          Hover over each row for details.
+                        </span>
+                        <JSONSchemaTable
+                          schema={
+                            registryAction.interface
+                              .expects as TracecatJsonSchema
+                          }
+                        />
+                      </div>
                       {/* Interaction */}
                       {appSettings?.app_interactions_enabled &&
                         PERMITTED_INTERACTION_ACTIONS.includes(
                           registryAction.action as (typeof PERMITTED_INTERACTION_ACTIONS)[number]
                         ) && (
-                          <AccordionItem value="action-interaction">
-                            <AccordionTrigger className="px-4 text-xs font-bold">
-                              <div className="flex items-center">
-                                <MessagesSquare className="mr-3 size-4" />
-                                <span>Interaction</span>
-                              </div>
-                            </AccordionTrigger>
-                            <AccordionContent>
-                              <div className="my-4 space-y-2 px-4">
-                                {/* Toggle for enabling interaction */}
-                                <FormField
-                                  control={methods.control}
-                                  name="is_interactive"
-                                  render={({ field }) => (
-                                    <FormItem>
-                                      <div className="flex items-center gap-2">
-                                        <FormControl>
-                                          <Switch
-                                            checked={field.value}
-                                            onCheckedChange={field.onChange}
-                                          />
-                                        </FormControl>
+                          <div className="space-y-4">
+                            <h4 className="text-xs font-bold">Interaction</h4>
+                            <div className="space-y-2">
+                              {/* Toggle for enabling interaction */}
+                              <FormField
+                                control={methods.control}
+                                name="is_interactive"
+                                render={({ field }) => (
+                                  <FormItem>
+                                    <div className="flex items-center gap-2">
+                                      <FormControl>
+                                        <Switch
+                                          checked={field.value}
+                                          onCheckedChange={field.onChange}
+                                        />
+                                      </FormControl>
+                                      <FormLabel className="text-xs">
+                                        Enable interaction
+                                      </FormLabel>
+                                    </div>
+                                    <FormMessage className="whitespace-pre-line" />
+                                  </FormItem>
+                                )}
+                              />
+
+                              {/* Interaction settings - only shown when interaction is enabled */}
+                              {isInteractive && (
+                                <>
+                                  <FormField
+                                    control={methods.control}
+                                    name="interaction.type"
+                                    render={({ field }) => (
+                                      <FormItem>
                                         <FormLabel className="text-xs">
-                                          Enable interaction
+                                          Type
                                         </FormLabel>
-                                      </div>
-                                      <FormMessage className="whitespace-pre-line" />
-                                    </FormItem>
-                                  )}
-                                />
-
-                                {/* Interaction settings - only shown when interaction is enabled */}
-                                {isInteractive && (
-                                  <>
-                                    <FormField
-                                      control={methods.control}
-                                      name="interaction.type"
-                                      render={({ field }) => (
-                                        <FormItem>
-                                          <FormLabel className="text-xs">
-                                            Type
-                                          </FormLabel>
-                                          <FormControl>
-                                            <Select
-                                              value={field.value}
-                                              onValueChange={field.onChange}
-                                            >
-                                              <SelectTrigger className="text-xs">
-                                                <SelectValue
-                                                  placeholder="Select a type..."
-                                                  className="text-xs"
-                                                />
-                                              </SelectTrigger>
-                                              <SelectContent className="w-full text-xs">
-                                                <SelectItem
-                                                  value="response"
-                                                  className="text-xs"
-                                                >
-                                                  Response
-                                                </SelectItem>
-                                                <SelectItem
-                                                  value="approval"
-                                                  className="text-xs"
-                                                  disabled
-                                                >
-                                                  <span>Approval</span>
-                                                  <Badge
-                                                    variant="outline"
-                                                    className="ml-4 text-xs font-normal"
-                                                  >
-                                                    Coming soon
-                                                  </Badge>
-                                                </SelectItem>
-                                                <SelectItem
-                                                  value="mfa"
-                                                  className="text-xs"
-                                                  disabled
-                                                >
-                                                  <span>
-                                                    Multi-factor Authentication
-                                                  </span>
-                                                  <Badge
-                                                    variant="outline"
-                                                    className="ml-4 text-xs font-normal"
-                                                  >
-                                                    Coming soon
-                                                  </Badge>
-                                                </SelectItem>
-                                                <SelectItem
-                                                  value="form"
-                                                  className="text-xs"
-                                                  disabled
-                                                >
-                                                  <span>Form</span>
-                                                  <Badge
-                                                    variant="outline"
-                                                    className="ml-4 text-xs font-normal"
-                                                  >
-                                                    Coming soon
-                                                  </Badge>
-                                                </SelectItem>
-                                              </SelectContent>
-                                            </Select>
-                                          </FormControl>
-                                          <FormMessage className="whitespace-pre-line" />
-                                        </FormItem>
-                                      )}
-                                    />
-
-                                    {interactionType === "response" && (
-                                      <div className="space-y-2">
-                                        <FormDescription className="text-xs">
-                                          The action will only complete when it
-                                          receives a response.
-                                        </FormDescription>
-                                        <FormField
-                                          control={methods.control}
-                                          name="interaction.timeout"
-                                          render={({ field }) => (
-                                            <FormItem>
-                                              <FormLabel className="text-xs">
-                                                Timeout
-                                              </FormLabel>
-                                              <FormControl>
-                                                <Input
-                                                  disabled
-                                                  type="number"
-                                                  value={field.value || ""}
-                                                  onChange={field.onChange}
-                                                  placeholder="Timeout in seconds"
-                                                  className="text-xs"
-                                                />
-                                              </FormControl>
-                                              <FormMessage className="whitespace-pre-line" />
-                                            </FormItem>
-                                          )}
-                                        />
-                                      </div>
-                                    )}
-                                  </>
-                                )}
-                              </div>
-                            </AccordionContent>
-                          </AccordionItem>
-                        )}
-
-                      {/* Schema */}
-                      <AccordionItem value="action-schema">
-                        <AccordionTrigger className="px-4 text-xs font-bold">
-                          <div className="flex items-center">
-                            <ShapesIcon className="mr-3 size-4" />
-                            <span>Input schema</span>
-                          </div>
-                        </AccordionTrigger>
-                        <AccordionContent className="space-y-4">
-                          {/* Action secrets */}
-                          <div className="space-y-4 px-4">
-                            {registryAction.secrets &&
-                            registryAction.secrets.length > 0 ? (
-                              <RegistryActionSecrets
-                                secrets={registryAction.secrets}
-                              />
-                            ) : (
-                              <span className="text-xs text-muted-foreground">
-                                No secrets required.
-                              </span>
-                            )}
-                          </div>
-                          {/* Action inputs */}
-                          {inputMode === "yaml" && (
-                            <div className="space-y-4 px-4">
-                              <span className="text-xs text-muted-foreground">
-                                Hover over each row for details.
-                              </span>
-                              <JSONSchemaTable
-                                schema={
-                                  registryAction.interface
-                                    .expects as TracecatJsonSchema
-                                }
-                              />
-                            </div>
-                          )}
-                        </AccordionContent>
-                      </AccordionItem>
-
-                      {/* Inputs */}
-                      <AccordionItem value="action-inputs">
-                        <AccordionTrigger className="px-4 text-xs font-bold">
-                          <div className="flex items-center">
-                            <LayoutListIcon className="mr-3 size-4" />
-                            <span>Inputs</span>
-                          </div>
-                        </AccordionTrigger>
-                        <AccordionContent>
-                          <div className="mb-8 flex flex-col space-y-4 px-4">
-                            {finalValErrors.length > 0 && (
-                              <ValidationErrorView
-                                validationErrors={finalValErrors}
-                                side="left"
-                                className="max-w-[600px]"
-                              >
-                                <div className="flex items-center space-x-2">
-                                  <AlertTriangleIcon className="size-4 fill-rose-500 stroke-white" />
-                                  <span className="pointer-events-none text-xs text-rose-500">
-                                    Hover to view errors.
-                                  </span>
-                                </div>
-                              </ValidationErrorView>
-                            )}
-                            {/* Input Mode Toggle */}
-                            <div className="flex flex-col space-y-2">
-                              <div className="flex items-center justify-between">
-                                <span className="text-xs text-muted-foreground">
-                                  {inputMode === "form"
-                                    ? "Define action inputs using form fields below."
-                                    : "Define action inputs in YAML below."}
-                                </span>
-                                {formModeEnabled && (
-                                  <ToggleTabs
-                                    options={
-                                      [
-                                        {
-                                          value: "form",
-                                          content: (
-                                            <div className="flex items-center gap-1">
-                                              <ListIcon className="size-3" />
-                                              <span className="text-xs">
-                                                Form
-                                              </span>
-                                            </div>
-                                          ),
-                                          tooltip: "Use form fields",
-                                          ariaLabel: "Form mode",
-                                        },
-                                        {
-                                          value: "yaml",
-                                          content: (
-                                            <div className="flex items-center gap-1">
-                                              <CodeIcon className="size-3" />
-                                              <span className="text-xs">
-                                                YAML
-                                              </span>
-                                            </div>
-                                          ),
-                                          tooltip: "Use YAML editor",
-                                          ariaLabel: "YAML mode",
-                                        },
-                                      ] as ToggleTabOption<InputMode>[]
-                                    }
-                                    value={inputMode}
-                                    onValueChange={handleModeChange}
-                                    size="sm"
-                                    className="w-auto"
-                                  />
-                                )}
-                              </div>
-                            </div>
-
-                            {inputMode === "yaml" && (
-                              /* YAML Mode - Preserve raw YAML */
-                              <ControlledYamlField
-                                label="Inputs"
-                                fieldName="inputs"
-                              />
-                            )}
-                            {inputMode === "form" && formModeEnabled && (
-                              <>
-                                {/* Required fields - always shown */}
-                                {requiredFields.map(
-                                  ([fieldName, fieldDefn]) => {
-                                    const fullFieldName = `inputs.${fieldName}`
-                                    const label = fieldName
-                                      .replaceAll("_", " ")
-                                      .replace(/^\w/, (c) => c.toUpperCase())
-                                    if (!isTracecatJsonSchema(fieldDefn)) {
-                                      // For non-TracecatJsonSchema, we can't extract type information
-                                      return (
-                                        <ControlledYamlField
-                                          key={fieldName}
-                                          label={label}
-                                          fieldName={fullFieldName}
-                                          info="Please sync your base actions repository to get the latest field schema."
-                                        />
-                                      )
-                                    }
-
-                                    return (
-                                      <PolymorphicField
-                                        key={fieldName}
-                                        label={label}
-                                        fieldName={fullFieldName}
-                                        fieldDefn={fieldDefn}
-                                      />
-                                    )
-                                  }
-                                )}
-
-                                {/* Optional fields - only shown if in visibleOptionalFields */}
-                                {optionalFields
-                                  .filter(([fieldName]) =>
-                                    visibleOptionalFields.has(fieldName)
-                                  )
-                                  .map(([fieldName, fieldDefn]) => {
-                                    const fullFieldName = `inputs.${fieldName}`
-                                    const label = fieldName
-                                      .replaceAll("_", " ")
-                                      .replace(/^\w/, (c) => c.toUpperCase())
-                                    if (!isTracecatJsonSchema(fieldDefn)) {
-                                      // For non-TracecatJsonSchema, we can't extract type information
-                                      return (
-                                        <ControlledYamlField
-                                          key={fieldName}
-                                          label={label}
-                                          fieldName={fullFieldName}
-                                        />
-                                      )
-                                    }
-
-                                    return (
-                                      <PolymorphicField
-                                        key={fieldName}
-                                        label={label}
-                                        fieldName={fullFieldName}
-                                        fieldDefn={fieldDefn}
-                                      />
-                                    )
-                                  })}
-
-                                {/* Add optional fields dropdown */}
-                                {optionalFields.length > 0 && (
-                                  <div className="mt-4">
-                                    <DropdownMenu>
-                                      <DropdownMenuTrigger asChild>
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          className="w-full"
-                                        >
-                                          <Plus className="mr-2 size-4" />
-                                          Optional fields
-                                        </Button>
-                                      </DropdownMenuTrigger>
-                                      <DropdownMenuContent
-                                        align="start"
-                                        className="max-w-96"
-                                      >
-                                        {optionalFields.map(
-                                          ([fieldName, fieldDefn]) => {
-                                            const label = fieldName
-                                              .replaceAll("_", " ")
-                                              .replace(/^\w/, (c) =>
-                                                c.toUpperCase()
-                                              )
-                                            const isVisible =
-                                              visibleOptionalFields.has(
-                                                fieldName
-                                              )
-                                            const description =
-                                              isTracecatJsonSchema(fieldDefn)
-                                                ? fieldDefn.description
-                                                : null
-                                            return (
-                                              <DropdownMenuCheckboxItem
-                                                key={fieldName}
-                                                checked={isVisible}
-                                                onCheckedChange={(checked) => {
-                                                  if (checked) {
-                                                    // Show the field
-                                                    setManuallyVisibleFields(
-                                                      (prev) =>
-                                                        new Set([
-                                                          ...prev,
-                                                          fieldName,
-                                                        ])
-                                                    )
-                                                    setManuallyHiddenFields(
-                                                      (prev) => {
-                                                        const newSet = new Set(
-                                                          prev
-                                                        )
-                                                        newSet.delete(fieldName)
-                                                        return newSet
-                                                      }
-                                                    )
-                                                  } else {
-                                                    // Hide the field
-                                                    setManuallyHiddenFields(
-                                                      (prev) =>
-                                                        new Set([
-                                                          ...prev,
-                                                          fieldName,
-                                                        ])
-                                                    )
-                                                    setManuallyVisibleFields(
-                                                      (prev) => {
-                                                        const newSet = new Set(
-                                                          prev
-                                                        )
-                                                        newSet.delete(fieldName)
-                                                        return newSet
-                                                      }
-                                                    )
-                                                    // Remove field from form state when hiding
-                                                    const currentInputs =
-                                                      methods.getValues(
-                                                        "inputs"
-                                                      )
-                                                    const {
-                                                      [fieldName]: _removed,
-                                                      ...remainingInputs
-                                                    } = currentInputs
-                                                    methods.setValue(
-                                                      "inputs",
-                                                      remainingInputs
-                                                    )
-                                                    methods.unregister(
-                                                      `inputs.${fieldName}`
-                                                    )
-                                                  }
-                                                }}
+                                        <FormControl>
+                                          <Select
+                                            value={field.value}
+                                            onValueChange={field.onChange}
+                                          >
+                                            <SelectTrigger className="text-xs">
+                                              <SelectValue
+                                                placeholder="Select a type..."
+                                                className="text-xs"
+                                              />
+                                            </SelectTrigger>
+                                            <SelectContent className="w-full text-xs">
+                                              <SelectItem
+                                                value="response"
+                                                className="text-xs"
                                               >
-                                                <div className="flex flex-col gap-1">
-                                                  <span className="font-medium">
-                                                    {label}
-                                                  </span>
-                                                  {description && (
-                                                    <span className="text-xs text-muted-foreground">
-                                                      {description.endsWith(".")
-                                                        ? description
-                                                        : `${description}.`}
-                                                    </span>
-                                                  )}
-                                                </div>
-                                              </DropdownMenuCheckboxItem>
-                                            )
-                                          }
+                                                Response
+                                              </SelectItem>
+                                              <SelectItem
+                                                value="approval"
+                                                className="text-xs"
+                                                disabled
+                                              >
+                                                <span>Approval</span>
+                                                <Badge
+                                                  variant="outline"
+                                                  className="ml-4 text-xs font-normal"
+                                                >
+                                                  Coming soon
+                                                </Badge>
+                                              </SelectItem>
+                                              <SelectItem
+                                                value="mfa"
+                                                className="text-xs"
+                                                disabled
+                                              >
+                                                <span>
+                                                  Multi-factor Authentication
+                                                </span>
+                                                <Badge
+                                                  variant="outline"
+                                                  className="ml-4 text-xs font-normal"
+                                                >
+                                                  Coming soon
+                                                </Badge>
+                                              </SelectItem>
+                                              <SelectItem
+                                                value="form"
+                                                className="text-xs"
+                                                disabled
+                                              >
+                                                <span>Form</span>
+                                                <Badge
+                                                  variant="outline"
+                                                  className="ml-4 text-xs font-normal"
+                                                >
+                                                  Coming soon
+                                                </Badge>
+                                              </SelectItem>
+                                            </SelectContent>
+                                          </Select>
+                                        </FormControl>
+                                        <FormMessage className="whitespace-pre-line" />
+                                      </FormItem>
+                                    )}
+                                  />
+
+                                  {interactionType === "response" && (
+                                    <div className="space-y-2">
+                                      <FormDescription className="text-xs">
+                                        The action will only complete when it
+                                        receives a response.
+                                      </FormDescription>
+                                      <FormField
+                                        control={methods.control}
+                                        name="interaction.timeout"
+                                        render={({ field }) => (
+                                          <FormItem>
+                                            <FormLabel className="text-xs">
+                                              Timeout
+                                            </FormLabel>
+                                            <FormControl>
+                                              <Input
+                                                disabled
+                                                type="number"
+                                                value={field.value ?? ""}
+                                                onChange={field.onChange}
+                                                placeholder="Timeout in seconds"
+                                                className="text-xs"
+                                              />
+                                            </FormControl>
+                                            <FormMessage className="whitespace-pre-line" />
+                                          </FormItem>
                                         )}
-                                      </DropdownMenuContent>
-                                    </DropdownMenu>
-                                  </div>
-                                )}
-                              </>
-                            )}
+                                      />
+                                    </div>
+                                  )}
+                                </>
+                              )}
+                            </div>
                           </div>
-                        </AccordionContent>
-                      </AccordionItem>
-                    </Accordion>
+                        )}
+                    </div>
                   </SectionErrorBoundary>
                 </TabsContent>
-                <TabsContent value="control-flow">
+                <TabsContent value="control-flow" className="pb-8">
                   <SectionErrorBoundary>
                     <div className="mt-6 space-y-8 px-4">
                       {/* Run if */}
@@ -1371,7 +1479,7 @@ function ActionPanelContent({
                               <FormControl>
                                 <Input
                                   type="number"
-                                  value={field.value || ""}
+                                  value={field.value ?? ""}
                                   onChange={(e) =>
                                     field.onChange(
                                       e.target.value
@@ -1403,7 +1511,7 @@ function ActionPanelContent({
                               <FormControl>
                                 <Input
                                   type="number"
-                                  value={field.value || ""}
+                                  value={field.value ?? ""}
                                   onChange={(e) =>
                                     field.onChange(
                                       e.target.value
@@ -1435,7 +1543,7 @@ function ActionPanelContent({
                               <FormControl>
                                 <Input
                                   type="number"
-                                  value={field.value || ""}
+                                  value={field.value ?? ""}
                                   onChange={(e) =>
                                     field.onChange(
                                       e.target.value
@@ -1502,7 +1610,7 @@ function ActionPanelContent({
                 </TabsContent>
                 {/* Template */}
                 {registryAction?.implementation && (
-                  <TabsContent value="template-inputs">
+                  <TabsContent value="template-inputs" className="pb-8">
                     <SectionErrorBoundary>
                       <Accordion
                         type="multiple"
@@ -1708,14 +1816,14 @@ function RegistryActionSecrets({
           </span>
           <Table>
             <TableHeader>
-              <TableRow className="h-6  text-xs capitalize">
-                <TableHead className="font-bold" colSpan={1}>
+              <TableRow className="h-6 text-xs capitalize">
+                <TableHead className="min-w-28 whitespace-nowrap font-bold">
                   Secret Name
                 </TableHead>
-                <TableHead className="font-bold" colSpan={1}>
+                <TableHead className="min-w-28 whitespace-nowrap font-bold">
                   Required Keys
                 </TableHead>
-                <TableHead className="font-bold" colSpan={1}>
+                <TableHead className="min-w-28 whitespace-nowrap font-bold">
                   Optional Keys
                 </TableHead>
               </TableRow>
@@ -1726,7 +1834,9 @@ function RegistryActionSecrets({
                   key={secret.name}
                   className="font-mono text-xs tracking-tight text-muted-foreground"
                 >
-                  <TableCell>{secret.name}</TableCell>
+                  <TableCell className="whitespace-nowrap">
+                    {secret.name}
+                  </TableCell>
                   <TableCell>{secret.keys?.join(", ") || "-"}</TableCell>
                   <TableCell>
                     {secret.optional_keys?.join(", ") || "-"}
@@ -1746,11 +1856,11 @@ function RegistryActionSecrets({
           </span>
           <Table>
             <TableHeader>
-              <TableRow className="h-6  text-xs capitalize">
-                <TableHead className="font-bold" colSpan={1}>
+              <TableRow className="h-6 text-xs capitalize">
+                <TableHead className="min-w-28 whitespace-nowrap font-bold">
                   Provider ID
                 </TableHead>
-                <TableHead className="font-bold" colSpan={1}>
+                <TableHead className="min-w-28 whitespace-nowrap font-bold">
                   Grant Type
                 </TableHead>
               </TableRow>
@@ -1761,16 +1871,18 @@ function RegistryActionSecrets({
                   key={`${secret.provider_id}-${secret.grant_type}`}
                   className="font-mono text-xs tracking-tight text-muted-foreground"
                 >
-                  <TableCell className="flex items-center gap-1">
+                  <TableCell className="flex items-center gap-1 whitespace-nowrap">
                     <span>{secret.provider_id}</span>
                     <Link
-                      href={`/workspaces/${workspaceId}/integrations/${secret.provider_id}?tab=configuration`}
+                      href={`/workspaces/${workspaceId}/integrations?connect=${encodeURIComponent(secret.provider_id)}&grant_type=${secret.grant_type}`}
                       target="_blank"
                     >
                       <ExternalLinkIcon className="size-3" strokeWidth={2.5} />
                     </Link>
                   </TableCell>
-                  <TableCell>{secret.grant_type}</TableCell>
+                  <TableCell className="whitespace-nowrap">
+                    {secret.grant_type}
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>

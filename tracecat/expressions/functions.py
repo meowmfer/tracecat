@@ -20,9 +20,10 @@ from uuid import uuid4
 import orjson
 import yaml
 from slugify import slugify
+from tracecat_registry._internal.flatten import flatten_dict as _flatten_dict
 
 from tracecat.common import is_iterable
-from tracecat.contexts import ctx_interaction
+from tracecat.contexts import ctx_interaction, ctx_logical_time
 from tracecat.expressions.formatters import (
     tabulate,
     to_markdown_list,
@@ -45,7 +46,7 @@ from tracecat.expressions.ioc_extractors import (
     extract_urls,
     normalize_email,
 )
-from tracecat.interactions.models import InteractionContext
+from tracecat.interactions.schemas import InteractionContext
 from tracecat.parse import unescape_string
 
 
@@ -133,6 +134,11 @@ def slice_str(x: str, start_index: int, length: int) -> str:
     return x[start_index : start_index + length]
 
 
+def at(sequence: Sequence[Any], index: int) -> Any:
+    """Return the element at the given index."""
+    return sequence[index]
+
+
 def endswith(x: str, suffix: str) -> bool:
     """Check if a string ends with a specified suffix."""
     return x.endswith(suffix)
@@ -210,11 +216,15 @@ def replace(x: str, old: str, new: str) -> str:
 
 
 def regex_extract(pattern: str, text: str) -> str | None:
-    """Extract first match of regex pattern from text."""
+    """Extract the first captured group from text; fallback to full match if none."""
     match = re.search(pattern, text)
-    if match:
-        return match.group(0)
-    return None
+    if not match:
+        return None
+    if match.lastindex:
+        for group in match.groups():
+            if group is not None:
+                return group
+    return match.group(0)
 
 
 def regex_match(pattern: str, text: str) -> bool:
@@ -347,6 +357,11 @@ def compact(x: list[Any]) -> list[Any]:
     return [item for item in x if item is not None]
 
 
+def drop_nulls(items: list[Any]) -> list[Any]:
+    """Remove all null or empty string values from a list."""
+    return [item for item in items if item is not None and item != ""]
+
+
 def is_in(item: Any, container: Sequence[Any]) -> bool:
     """Check if item exists in a sequence."""
     return item in container
@@ -437,9 +452,9 @@ def iter_product(*iterables: Sequence[Any]) -> list[tuple[Any, ...]]:
     return list(itertools.product(*iterables))
 
 
-def create_range(start: int, end: int, step: int = 1) -> range:
+def create_range(start: int, end: int, step: int = 1) -> list[int]:
     """Create a range of integers from start to end (exclusive), with a step size."""
-    return range(start, end, step)
+    return list(range(start, end, step))
 
 
 # Dictionary functions
@@ -461,20 +476,22 @@ def is_json(x: str) -> bool:
         return False
 
 
-def index_by_key(
-    x: list[dict[str, Any]],
-    field_key: str,
-    value_key: str | None = None,
-) -> dict[str, Any]:
-    """Convert a list of objects into an object indexed by the specified key."""
-    if value_key:
-        return {item[field_key]: item[value_key] for item in x}
-    return {item[field_key]: item for item in x}
-
-
 def merge_dicts(x: list[dict[Any, Any]]) -> dict[Any, Any]:
     """Merge list of objects. Similar to merge function in Terraform."""
     return {k: v for d in x for k, v in d.items()}
+
+
+def flatten_dict(
+    x: str | dict[str, Any] | list[Any], max_depth: int = 100
+) -> dict[str, Any]:
+    """Return object with single level of keys (as jsonpath) and values."""
+    if isinstance(x, str):
+        x = orjson.loads(x)
+        if not isinstance(x, (dict, list)):
+            raise ValueError(
+                f"Input string must decode to a JSON object or array, got {type(x)}."
+            )
+    return _flatten_dict(x=x, max_depth=max_depth)
 
 
 def dict_keys(x: dict[Any, Any]) -> list[Any]:
@@ -507,6 +524,11 @@ def map_dict_keys(x: dict[str, Any], keys: dict[str, str]) -> dict[str, Any]:
 
 def serialize_json(x: Any) -> str:
     """Convert object to JSON string."""
+    return orjson.dumps(x).decode()
+
+
+def serialize(x: Any) -> str:
+    """Serialize a JSON-compatible value to string."""
     return orjson.dumps(x).decode()
 
 
@@ -851,24 +873,82 @@ def to_isoformat(x: datetime | str, timespec: str = "auto") -> str:
 
 
 def now(as_isoformat: bool = False, timespec: str = "auto") -> datetime | str:
-    """Return the current datetime."""
-    dt = datetime.now()
+    """Return workflow logical time (local, naive) or current time if outside workflow.
+
+    When called within a workflow context, returns the workflow's logical time
+    (time_anchor + elapsed workflow time) converted to the local timezone as a
+    naive datetime. This ensures deterministic behavior during workflow replay
+    and reset while allowing time to progress as the workflow executes.
+
+    Outside workflow context, falls back to wall clock time.
+    """
+    logical_time = ctx_logical_time.get()
+    if logical_time is not None:
+        # Convert UTC logical_time to local timezone, then make naive
+        dt = logical_time.astimezone().replace(tzinfo=None)
+    else:
+        dt = datetime.now()
+
     if as_isoformat:
         return to_isoformat(dt, timespec)
     return dt
 
 
 def utcnow(as_isoformat: bool = False, timespec: str = "auto") -> datetime | str:
-    """Return the current timezone-aware datetime."""
-    dt = datetime.now(UTC)
+    """Return workflow logical time (UTC, aware) or current UTC time if outside workflow.
+
+    When called within a workflow context, returns the workflow's logical time
+    (time_anchor + elapsed workflow time) as a UTC-aware datetime. This ensures
+    deterministic behavior during workflow replay and reset while allowing time
+    to progress as the workflow executes.
+
+    Outside workflow context, falls back to wall clock UTC time.
+    """
+    logical_time = ctx_logical_time.get()
+    if logical_time is not None:
+        # Ensure logical_time is UTC-aware; convert if it has a different timezone
+        if logical_time.tzinfo is None:
+            dt = logical_time.replace(tzinfo=UTC)
+        else:
+            dt = logical_time.astimezone(UTC)
+    else:
+        dt = datetime.now(UTC)
+
     if as_isoformat:
         return to_isoformat(dt, timespec)
     return dt
 
 
 def today() -> date:
-    """Return the current date."""
+    """Return workflow logical time date (local) or current date if outside workflow.
+
+    When called within a workflow context, returns the date portion of the
+    workflow's logical time (time_anchor + elapsed workflow time) in local
+    timezone. This ensures deterministic behavior during workflow replay and reset.
+
+    Outside workflow context, falls back to current date.
+    """
+    logical_time = ctx_logical_time.get()
+    if logical_time is not None:
+        # Convert to local timezone and get date
+        return logical_time.astimezone().date()
     return date.today()
+
+
+def wall_clock(as_isoformat: bool = False, timespec: str = "auto") -> datetime | str:
+    """Return actual current wall clock time (local, naive).
+
+    This function always returns the real current time, ignoring any workflow
+    time_anchor. Use this only when you need the actual wall clock time rather
+    than the workflow's logical time.
+
+    Note: Using wall_clock() in workflows may cause non-deterministic behavior
+    during replay. Prefer FN.now() for most use cases.
+    """
+    dt = datetime.now()
+    if as_isoformat:
+        return to_isoformat(dt, timespec)
+    return dt
 
 
 def set_timezone(x: datetime | str, timezone: str) -> datetime:
@@ -1021,6 +1101,7 @@ _FUNCTION_MAPPING = {
     "difference": difference,
     "flatten": flatten,
     "intersection": intersection,
+    "drop_nulls": drop_nulls,
     "is_empty": is_empty,
     "is_in": is_in,
     "length": len,
@@ -1032,6 +1113,7 @@ _FUNCTION_MAPPING = {
     "union": union,
     "unique": unique,
     "zip_map": zip_map,  # Inspired by Terraform: https://developer.hashicorp.com/terraform/language/functions/zipmap
+    "at": at,
     # Math
     "add": add,
     "sub": sub,
@@ -1049,10 +1131,10 @@ _FUNCTION_MAPPING = {
     # Generators
     "uuid4": generate_uuid,
     # JSON functions
-    "index_by_key": index_by_key,
     "lookup": dict_lookup,
     "map_keys": map_dict_keys,
     "merge": merge_dicts,
+    "flatten_dict": flatten_dict,
     "to_keys": dict_keys,
     "to_values": dict_values,
     "tabulate": tabulate,
@@ -1070,6 +1152,7 @@ _FUNCTION_MAPPING = {
     "deserialize_ndjson": deserialize_ndjson,
     "deserialize_yaml": deserialize_yaml,
     "prettify_json": prettify_json,
+    "serialize": serialize,
     "serialize_json": serialize_json,
     "serialize_yaml": serialize_yaml,
     # Time related
@@ -1103,6 +1186,7 @@ _FUNCTION_MAPPING = {
     "today": today,
     "unset_timezone": unset_timezone,
     "utcnow": utcnow,
+    "wall_clock": wall_clock,
     "weeks_between": weeks_between,
     "weeks": create_weeks,
     "windows_filetime": windows_filetime,
@@ -1182,13 +1266,20 @@ def mappable(func: F) -> F:
         zipped_args = zip(*iterables, strict=False)
         return [func(*zipped) for zipped in zipped_args]
 
-    wrapper.map = broadcast_map  # type: ignore
+    wrapper.map = broadcast_map  # pyright: ignore[reportAttributeAccessIssue]
     wrapper.__doc__ = func.__doc__
     return wrapper
 
 
 FUNCTION_MAPPING = {k: mappable(v) for k, v in _FUNCTION_MAPPING.items()}
-"""Mapping of function names to decorated mappable versions."""
+"""Mapping of function names to decorated mappable versions.
+
+Function results support normal bracket indexing in expressions, such as
+`FN.range(0, 3)[0]` or `FN.zip_map(["a"], ["x"])["a"]`.
+
+Function results do not support JSONPath wildcards or filters. For example,
+`FN.range(0, 3)[*]` is invalid.
+"""
 
 BUILTIN_TYPE_MAPPING = {
     "int": int,

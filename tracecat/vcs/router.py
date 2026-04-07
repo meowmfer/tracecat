@@ -1,18 +1,17 @@
 """VCS integration router for organization-level platform features."""
 
-from __future__ import annotations
-
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from tracecat.auth.dependencies import OrgAdminUser
+from tracecat.auth.dependencies import OrgUserRole
+from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.logger import logger
 from tracecat.vcs.github.app import GitHubAppError, GitHubAppService
 from tracecat.vcs.github.flows import handle_manifest_conversion
 from tracecat.vcs.github.manifest import generate_github_app_manifest
-from tracecat.vcs.models import (
+from tracecat.vcs.schemas import (
     GitHubAppCredentialsRequest,
     GitHubAppCredentialsStatus,
     GitHubAppManifestResponse,
@@ -26,9 +25,10 @@ github_router = APIRouter(prefix="/github", tags=["vcs", "github", "organization
 
 
 @github_router.get("/manifest", response_model=GitHubAppManifestResponse)
+@require_scope("org:settings:read")
 async def get_github_app_manifest(
     *,
-    _role: OrgAdminUser,
+    _role: OrgUserRole,
 ) -> GitHubAppManifestResponse:
     """Generate GitHub App manifest for enterprise installation."""
     try:
@@ -54,10 +54,11 @@ async def get_github_app_manifest(
 
 
 @github_router.get("/install")
+@require_scope("org:settings:update")
 async def github_app_install_callback(
     *,
     session: AsyncDBSession,
-    role: OrgAdminUser,
+    role: OrgUserRole,
     code: str = Query(..., description="Temporary code from GitHub manifest flow"),
 ):
     """Handle GitHub App installation flow.
@@ -122,10 +123,11 @@ async def github_webhook(*, payload: dict[str, Any]) -> dict[str, str]:
 
 
 @github_router.post("/credentials", status_code=status.HTTP_201_CREATED)
+@require_scope("org:settings:update")
 async def save_github_app_credentials(
     *,
     session: AsyncDBSession,
-    role: OrgAdminUser,
+    role: OrgUserRole,
     request: GitHubAppCredentialsRequest,
 ) -> dict[str, str]:
     """Save GitHub App credentials (register new or update existing)."""
@@ -152,24 +154,59 @@ async def save_github_app_credentials(
         }
 
     except GitHubAppError as e:
-        logger.error("Failed to save GitHub App credentials", error=str(e))
+        logger.error(
+            "Failed to save GitHub App credentials",
+            error_type=type(e).__name__,
+            error=str(e),
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to save GitHub App credentials: {str(e)}",
         ) from e
     except Exception as e:
-        logger.error("Error saving GitHub App credentials", error=str(e))
+        logger.error(
+            "Error saving GitHub App credentials",
+            error_type=type(e).__name__,
+            error=str(e),
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error while saving credentials",
         ) from e
 
 
+@github_router.delete("/credentials", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("org:settings:delete")
+async def delete_github_app_credentials(
+    *,
+    session: AsyncDBSession,
+    role: OrgUserRole,
+) -> None:
+    """Delete GitHub App credentials."""
+    try:
+        github_service = GitHubAppService(session=session, role=role)
+        await github_service.delete_github_app_credentials()
+
+    except GitHubAppError as e:
+        logger.error("Failed to delete GitHub App credentials", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to delete GitHub App credentials: {str(e)}",
+        ) from e
+    except Exception as e:
+        logger.error("Error deleting GitHub App credentials", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error while deleting credentials",
+        ) from e
+
+
 @github_router.get("/credentials/status", response_model=GitHubAppCredentialsStatus)
+@require_scope("org:settings:read")
 async def get_github_app_credentials_status(
     *,
     session: AsyncDBSession,
-    role: OrgAdminUser,
+    role: OrgUserRole,
 ) -> GitHubAppCredentialsStatus:
     """Get the status of GitHub App credentials."""
     # Organization-level operation, no specific checks needed since this is org VCS
@@ -179,7 +216,11 @@ async def get_github_app_credentials_status(
         return GitHubAppCredentialsStatus(**status_data)
 
     except Exception as e:
-        logger.error("Error getting GitHub App credentials status", error=str(e))
+        logger.error(
+            "Error getting GitHub App credentials status",
+            error_type=type(e).__name__,
+            error=str(e),
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error while getting credentials status",

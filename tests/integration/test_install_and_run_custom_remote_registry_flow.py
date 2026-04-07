@@ -6,38 +6,46 @@ This checks the full "happy path" in production mode:
 3. Create GitHub SSH deploy key secret for repository access
 4. Sync the repo, which clones via git+ssh and installs with `uv add`
 5. Verify the action is registered in the repository
-6. Run a DSLWorkflow that calls `tracecat.math.add_300` via the executor
-   service, verifying the executor container can import and execute the
-   freshly-installed code
+6. Run a DSLWorkflow that calls `tracecat.math.add_300` via Temporal,
+   verifying the worker can import and execute the freshly-installed code
 """
 
 from __future__ import annotations
 
 import os
 import uuid
+from datetime import timedelta
 
 import pytest
 import requests
 from pydantic import SecretStr, ValidationError
+from temporalio.client import WorkflowFailureError
+from temporalio.common import RetryPolicy
 
-from tests.shared import generate_test_exec_id
-from tracecat.dsl.models import ActionStatement, RunActionInput, RunContext, StreamID
+from tests.shared import generate_test_exec_id, to_data
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
+from tracecat.contexts import ctx_role
+from tracecat.dsl.client import get_temporal_client
+from tracecat.dsl.common import DSLEntrypoint, DSLInput, DSLRunArgs
+from tracecat.dsl.schemas import ActionStatement
+from tracecat.dsl.workflow import DSLWorkflow
 from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.logger import logger
 from tracecat.secrets.enums import SecretType
-from tracecat.secrets.models import SecretCreate
-from tracecat.settings.models import GitSettingsUpdate
-from tracecat.types.auth import system_role
+from tracecat.secrets.schemas import SecretCreate
+from tracecat.settings.schemas import GitSettingsUpdate
 
 GIT_SSH_URL = "git+ssh://git@github.com/TracecatHQ/internal-registry.git"
+KNOWN_GOOD_REMOTE_COMMIT_SHA = "e2bfd94c35c93f8052c2b97ff542961596ddd3f8"
 
 
 @pytest.mark.anyio
 async def test_remote_custom_registry_repo() -> None:
     """
-    End-to-end assertion that the executor can:
+    End-to-end assertion that the worker can:
     1. Clone & install the remote repo via `uv add`.
-    2. Execute the `tracecat.math.add_300` action inside a workflow.
+    2. Execute the `tracecat.math.add_300` action inside a workflow via Temporal.
     """
     logger.info("Starting remote custom registry repo test")
 
@@ -69,6 +77,18 @@ async def test_remote_custom_registry_repo() -> None:
     )
     assert login_response.status_code == 204, f"Login failed: {login_response.text}"
     logger.info("Successfully logged in with test credentials")
+
+    # Set organization context (required for superusers and org-scoped endpoints)
+    # Use the admin endpoint which doesn't require org context
+    orgs_resp = session.get(f"{base_url}/admin/organizations")
+    assert orgs_resp.status_code == 200, (
+        f"Failed to get organizations: {orgs_resp.text}"
+    )
+    orgs_list = orgs_resp.json()
+    assert len(orgs_list) > 0, "No organizations found"
+    org_id = orgs_list[0]["id"]
+    session.cookies.set("tracecat-org-id", org_id)
+    logger.info("Set organization context", organization_id=org_id)
 
     # ---------------------------------------------------------------------
     # 2.  Get or create a RegistryRepository pointing to the remote Git repo
@@ -171,9 +191,16 @@ async def test_remote_custom_registry_repo() -> None:
     )
     sync_response = session.post(
         f"{base_url}/registry/repos/{repository_id}/sync",
+        json={"target_commit_sha": KNOWN_GOOD_REMOTE_COMMIT_SHA},
     )
-    assert sync_response.status_code == 204, f"Sync failed: {sync_response.text}"
-    logger.info("Repository sync completed successfully")
+    assert sync_response.status_code == 200, f"Sync failed: {sync_response.text}"
+    sync_data = sync_response.json()
+    assert sync_data["success"] is True, f"Sync was not successful: {sync_data}"
+    logger.info(
+        "Repository sync completed successfully",
+        version=sync_data.get("version"),
+        actions_count=sync_data.get("actions_count"),
+    )
 
     # ---------------------------------------------------------------------
     # 5.  Verify the action is registered
@@ -196,40 +223,94 @@ async def test_remote_custom_registry_repo() -> None:
     )
 
     # ---------------------------------------------------------------------
-    # 6.  Execute the action via the executor service
+    # 6.  Execute the action via Temporal workflow
     # ---------------------------------------------------------------------
-    logger.info("Step 6: Executing action via executor service")
-    # Hit the executor directly to run the action
-    # Grab the service key from the environment
-    service_key = os.environ.get("TRACECAT__SERVICE_KEY")
-    if not service_key:
-        pytest.fail("TRACECAT__SERVICE_KEY is not set")
-    role = system_role()
-    run_action_response = session.post(
-        "http://localhost:8001/api/executor/run/tracecat.math.add_300",
-        headers={
-            "x-tracecat-service-key": service_key,
-            **role.to_headers(),
-        },
-        json=RunActionInput(
-            task=ActionStatement(
-                ref="a",
+    logger.info("Step 6: Executing action via Temporal workflow")
+
+    # Get the workspace ID and organization ID from the API to create a proper role
+    workspaces_response = session.get(f"{base_url}/workspaces")
+    assert workspaces_response.status_code == 200, (
+        f"Failed to get workspaces: {workspaces_response.text}"
+    )
+    workspaces = workspaces_response.json()
+    if not workspaces:
+        logger.info("No workspaces found, creating workspace for test org")
+        create_workspace_response = session.post(
+            f"{base_url}/workspaces",
+            json={"name": f"__integration_workspace_{uuid.uuid4().hex[:8]}"},
+        )
+        assert create_workspace_response.status_code == 201, (
+            f"Failed to create workspace: {create_workspace_response.text}"
+        )
+        workspaces = [create_workspace_response.json()]
+    workspace_id = uuid.UUID(workspaces[0]["id"])
+
+    # Fetch full workspace details to get organization_id
+    workspace_response = session.get(f"{base_url}/workspaces/{workspace_id}")
+    assert workspace_response.status_code == 200, (
+        f"Failed to get workspace details: {workspace_response.text}"
+    )
+    workspace_data = workspace_response.json()
+    organization_id = uuid.UUID(workspace_data["organization_id"])
+    logger.info(
+        "Using workspace for workflow execution",
+        workspace_id=workspace_id,
+        organization_id=organization_id,
+    )
+
+    # Create a role for workflow execution
+    role = Role(
+        type="service",
+        service_id="tracecat-runner",
+        workspace_id=workspace_id,
+        organization_id=organization_id,
+        user_id=uuid.UUID(int=0),
+        scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-runner"],
+    )
+    token = ctx_role.set(role)
+
+    # Create a simple DSL workflow that calls the action
+    test_name = "test_remote_custom_registry_repo"
+    wf_id = WorkflowUUID.new_uuid4()
+    wf_exec_id = generate_test_exec_id(test_name)
+
+    dsl = DSLInput(
+        title=test_name,
+        description="Test workflow for custom registry action",
+        entrypoint=DSLEntrypoint(ref="add_action"),
+        actions=[
+            ActionStatement(
+                ref="add_action",
                 action="tracecat.math.add_300",
                 args={"number": 1},
-            ),
-            stream_id=StreamID("stream_id"),
-            exec_context={},
-            run_context=RunContext(
-                wf_id=WorkflowUUID.new_uuid4(),
-                wf_exec_id=generate_test_exec_id("test-workflow"),
-                wf_run_id=uuid.uuid4(),
-                environment="default",
-            ),
-        ).model_dump(mode="json"),
+            )
+        ],
+        returns="${{ ACTIONS.add_action.result }}",
     )
-    assert run_action_response.status_code == 200, (
-        f"Run action failed: {run_action_response.text}"
-    )
-    result = run_action_response.json()
-    assert result == 301, "Result should be 301"
-    logger.info("Action execution successful", result=result)
+
+    # Get Temporal client and execute workflow
+    # The worker service running in Docker will handle the execution
+    client = await get_temporal_client()
+    # Use the default task queue that matches the Docker worker
+    # (conftest sets config.TEMPORAL__CLUSTER_QUEUE to "test-tracecat-task-queue" for unit tests,
+    # but this integration test runs against the Docker worker which uses the default queue)
+    task_queue = "tracecat-task-queue"
+
+    try:
+        result = await client.execute_workflow(
+            DSLWorkflow.run,
+            DSLRunArgs(dsl=dsl, role=role, wf_id=wf_id),
+            id=wf_exec_id,
+            task_queue=task_queue,
+            retry_policy=RetryPolicy(maximum_attempts=1),
+            execution_timeout=timedelta(seconds=60),  # Prevent indefinite hangs
+        )
+        # The workflow returns the action result via the returns expression
+        # Unwrap StoredObject to compare actual data (handles both inline and external)
+        actual_result = await to_data(result)
+        assert actual_result == 301, f"Result should be 301, got {actual_result}"
+        logger.info("Action execution successful", result=actual_result)
+    except WorkflowFailureError as e:
+        pytest.fail(f"Workflow execution failed: {e}")
+    finally:
+        ctx_role.reset(token)

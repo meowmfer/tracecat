@@ -10,16 +10,18 @@ from httpx import Response
 from pydantic import SecretStr
 
 from tracecat import config
-from tracecat.db.schemas import BaseSecret
+from tracecat.auth.types import Role
+from tracecat.db.models import Secret
+from tracecat.exceptions import TracecatExpressionError
 from tracecat.expressions.common import (
     ExprContext,
     ExprType,
     IterableExpr,
-    build_safe_lambda,
     eval_jsonpath,
 )
 from tracecat.expressions.core import TemplateExpression
 from tracecat.expressions.eval import (
+    collect_expressions,
     eval_templated_object,
     extract_expressions,
     extract_templated_secrets,
@@ -35,93 +37,55 @@ from tracecat.expressions.validator.validator import (
     TemplateActionValidationContext,
 )
 from tracecat.logger import logger
+from tracecat.secrets.constants import DEFAULT_SECRETS_ENVIRONMENT
 from tracecat.secrets.encryption import decrypt_keyvalues, encrypt_keyvalues
-from tracecat.secrets.models import SecretKeyValue
-from tracecat.types.exceptions import TracecatExpressionError
+from tracecat.secrets.enums import SecretType
+from tracecat.secrets.schemas import SecretKeyValue, SecretRead
 from tracecat.validation.common import get_validators
-from tracecat.validation.models import ExprValidationResult, ValidationDetail
+from tracecat.validation.schemas import (
+    ExprBaseValidationResult,
+    ValidationDetail,
+)
+from tracecat.variables.schemas import VariableCreate
+from tracecat.variables.service import VariablesService
+
+
+@pytest.fixture
+def evaluator() -> ExprEvaluator:
+    return ExprEvaluator()
 
 
 @pytest.mark.parametrize(
-    "lambda_str,test_input,expected_result",
+    "base,indexes,expected",
     [
-        ("lambda x: x + 1", 1, 2),
-        ("lambda x: x * 2", 2, 4),
-        ("lambda x: str(x)", 1, "1"),
-        ("lambda x: len(x)", "hello", 5),
-        ("lambda x: x.upper()", "hello", "HELLO"),
-        ("lambda x: x['key']", {"key": "value"}, "value"),
-        ("lambda x: x.get('key', 'default')", {}, "default"),
-        ("lambda x: bool(x)", 1, True),
-        ("lambda x: [i * 2 for i in x]", [1, 2, 3], [2, 4, 6]),
-        ("lambda x: sum(x)", [1, 2, 3], 6),
-        ("lambda x: x is None", None, True),
-        ("lambda x: x.strip()", "  hello  ", "hello"),
-        ("lambda x: x.startswith('test')", "test_string", True),
-        ("lambda x: list(x.keys())", {"a": 1, "b": 2}, ["a", "b"]),
-        ("lambda x: max(x)", [1, 5, 3], 5),
+        (["hello", "world"], (1,), "world"),
+        ((1, 2, 3), (0,), 1),
+        ("tracecat", (-1,), "t"),
+        (([["nested"]], 1), (0, 0, 0), "nested"),
+        ({"foo": {"bar": 42}}, ("foo", "bar"), 42),
     ],
 )
-def test_build_lambda(lambda_str: str, test_input: Any, expected_result: Any) -> None:
-    fn = build_safe_lambda(lambda_str)
-    assert fn(test_input) == expected_result
-
-
-@pytest.mark.parametrize(
-    "lambda_str,test_input,expected_result",
-    [
-        ("lambda x: jsonpath('$.name', x) == 'John'", {"name": "John"}, True),
-        # Test nested objects
-        (
-            "lambda x: jsonpath('$.user.name', x) == 'Alice'",
-            {"user": {"name": "Alice"}},
-            True,
-        ),
-        # Test array indexing
-        (
-            "lambda x: jsonpath('$.users[0].name', x) == 'Bob'",
-            {"users": [{"name": "Bob"}]},
-            True,
-        ),
-        # Test array wildcard
-        (
-            "lambda x: len(jsonpath('$.users[*].name', x)) == 2",
-            {"users": [{"name": "Alice"}, {"name": "Bob"}]},
-            True,
-        ),
-        # Test deep nesting
-        (
-            "lambda x: jsonpath('$.data.nested.very.deep.value', x) == 42",
-            {"data": {"nested": {"very": {"deep": {"value": 42}}}}},
-            True,
-        ),
-        # Test array filtering
-        (
-            "lambda x: len(jsonpath('$.numbers[?@ > 2]', x)) == 2",
-            {"numbers": [1, 2, 3, 4]},
-            True,
-        ),
-        # Test with null/missing values
-        ("lambda x: jsonpath('$.missing.path', x) is None", {"other": "value"}, True),
-        # Test multiple conditions
-        (
-            "lambda x: all(v > 0 for v in jsonpath('$.values[*]', x))",
-            {"values": [1, 2, 3]},
-            True,
-        ),
-        # Test with string operations
-        (
-            "lambda x: jsonpath('$.text', x).startswith('hello')",
-            {"text": "hello world"},
-            True,
-        ),
-    ],
-)
-def test_use_jsonpath_in_safe_lambda(
-    lambda_str: str, test_input: Any, expected_result: Any
+def test_primary_expr_indexing(
+    evaluator: ExprEvaluator, base, indexes, expected
 ) -> None:
-    jsonpath = build_safe_lambda(lambda_str)
-    assert jsonpath(test_input) == expected_result
+    assert evaluator.primary_expr(base, *indexes) == expected
+
+
+@pytest.mark.parametrize(
+    "base,indexes,error_message",
+    [
+        ([1, 2], (5,), "Sequence index 5 out of range"),
+        ([1, 2], ("0",), "Sequence indices must be integers"),
+        (42, (0,), "Object of type 'int' is not indexable"),
+        ({"foo": 1}, ("bar",), "Key 'bar' not found for mapping access"),
+    ],
+)
+def test_primary_expr_indexing_errors(
+    evaluator: ExprEvaluator, base, indexes, error_message: str
+) -> None:
+    with pytest.raises(TracecatExpressionError) as exc:
+        evaluator.primary_expr(base, *indexes)
+    assert error_message in str(exc.value)
 
 
 @pytest.mark.parametrize(
@@ -317,7 +281,7 @@ def mixed_args_obj(simple_secret_expr, complex_secret_expr):
 # ------------------------------ Corner case tests ------------------------------ #
 
 
-def test_evaluate_templated_secret(test_role):
+def test_evaluate_templated_secret(test_role: Role):
     TEST_SECRETS = {
         "my_secret": [
             SecretKeyValue(key="TEST_API_KEY_1", value=SecretStr("1234567890")),
@@ -376,7 +340,7 @@ def test_evaluate_templated_secret(test_role):
 
     base_secrets_url = f"{config.TRACECAT__API_URL}/secrets"
 
-    def format_secrets_as_json(secrets: list[BaseSecret]) -> dict[str, str]:
+    def format_secrets_as_json(secrets: list[SecretRead]) -> dict[str, str]:
         """Format secrets as a dict."""
         secret_dict = {}
         for secret in secrets:
@@ -388,18 +352,23 @@ def test_evaluate_templated_secret(test_role):
             }
         return secret_dict
 
-    def get_secret(secret_name: str):
+    def get_secret(secret_name: str) -> SecretRead:
         with httpx.Client(base_url=config.TRACECAT__API_URL) as client:
             response = client.get(f"/secrets/{secret_name}")
             response.raise_for_status()
-        return BaseSecret.model_validate(response.json())
+        return SecretRead.model_validate(response.json())
 
     with respx.mock:
         # Mock workflow getter from API side
         for secret_name, secret_keys in TEST_SECRETS.items():
-            secret = BaseSecret(
+            secret = Secret(
+                id=uuid.uuid4(),
                 name=secret_name,
-                owner_id=uuid.uuid4(),
+                workspace_id=uuid.uuid4(),
+                # Explicitly set the concrete secret type so enums can be resolved during serialization.
+                type=SecretType.CUSTOM.value,
+                # Ensure the environment matches the default API environment to mimic production payloads.
+                environment=DEFAULT_SECRETS_ENVIRONMENT,
                 encrypted_keys=encrypt_keyvalues(
                     secret_keys, key=os.environ["TRACECAT__DB_ENCRYPTION_KEY"]
                 ),
@@ -407,13 +376,11 @@ def test_evaluate_templated_secret(test_role):
                 updated_at=datetime.now(),
                 tags=None,
             )
+            secret_payload = SecretRead.from_database(secret).model_dump(mode="json")
 
             # Mock hitting get secrets endpoint
             respx.get(f"{base_secrets_url}/{secret_name}").mock(
-                return_value=Response(
-                    200,
-                    json=secret.model_dump(mode="json"),
-                )
+                return_value=Response(200, json=secret_payload)
             )
 
         # Start test
@@ -518,6 +485,8 @@ def test_eval_templated_object_inline_fails_if_not_str():
         ("       ACTIONS.action_test.baz    ", 2),
         ("ACTIONS.action_test", {"bar": 1, "baz": 2}),
         ("   ACTIONS.action_test", {"bar": 1, "baz": 2}),
+        ("VARS.api_config.base_url", "https://example.com"),
+        ("VARS.api_config.timeout", 30),
         # Secret expressions
         ("SECRETS.secret_test.KEY", "SECRET"),
         ("   SECRETS.secret_test.KEY    ", "SECRET"),
@@ -618,6 +587,45 @@ def test_eval_templated_object_inline_fails_if_not_str():
         ("TRIGGER.data.people[*].name", ["Alice", "Bob", "Charlie"]),
         ("TRIGGER.data.people[*].gender", ["female", "male"]),
         # ('TRIGGER.data.["user@tracecat.com"].name', "Bob"), TODO: Add support for object key indexing
+        # Test direct indexing expressions
+        ## List indexing
+        ("ACTIONS.test_list[0]", "hello"),
+        ("ACTIONS.test_list[1]", "world"),
+        ("ACTIONS.test_list[3]", "bar"),
+        ("ACTIONS.test_list[-1]", "bar"),
+        ("ACTIONS.test_list[-2]", "foo"),
+        ## String indexing
+        ("ACTIONS.test_string[0]", "t"),
+        ("ACTIONS.test_string[-1]", "t"),
+        ("ACTIONS.test_string[5]", "c"),
+        ## Tuple indexing
+        ("ACTIONS.test_tuple[0]", 10),
+        ("ACTIONS.test_tuple[1]", 20),
+        ("ACTIONS.test_tuple[2]", 30),
+        ("ACTIONS.test_tuple[-1]", 30),
+        ## Nested indexing
+        ("ACTIONS.nested_structure['level1']['level2'][0]['name']", "nested_item"),
+        ("ACTIONS.nested_structure['level1']['level2'][0]['value']", 99),
+        ("ACTIONS.mixed_nested[0][0][0]", "deep"),
+        ("ACTIONS.mixed_nested[1][0][0]", "value"),
+        ## Mixed dot and bracket notation
+        ("ACTIONS.nested_structure.level1.level2[0].name", "nested_item"),
+        ("ACTIONS.nested_structure.level1['level2'][0]['value']", 99),
+        ## List indexing with existing data
+        ("TRIGGER.data.list[0]", 1),
+        ("TRIGGER.data.list[1]", 2),
+        ("TRIGGER.data.list[-1]", 3),
+        ("TRIGGER.data.adjectives[0]", "cool"),
+        ("TRIGGER.data.adjectives[2]", "happy"),
+        ("TRIGGER.data.my.module.items[0]", "a"),
+        ("TRIGGER.data.my.module.items[1]", "b"),
+        ("TRIGGER.data.my.module.items[-1]", "c"),
+        ## Function result indexing
+        ("FN.split('hello,world,foo', ',')[0]", "hello"),
+        ("FN.split('hello,world,foo', ',')[1]", "world"),
+        ("FN.split('hello,world,foo', ',')[-1]", "foo"),
+        ("FN.split(TRIGGER.data.text, 'e')[0]", "t"),
+        ("FN.split(TRIGGER.data.text, 'e')[1]", "st"),
         # Combination
         ("'a' if FN.is_equal(var.y, '100') else 'b'", "a"),
         ("'a' if var.y == '100' else 'b'", "a"),
@@ -631,6 +639,9 @@ def test_eval_templated_object_inline_fails_if_not_str():
         ("FN.sum([1,2,3]) -> int", 6),
         ("[1,2,3] + [4,5,6]", [1, 2, 3, 4, 5, 6]),
         ("'hello' if False else 'goodbye'", "goodbye"),
+        ("1 if False else 1", 1),
+        ("1 if True else 1/0", 1),
+        ("1/0 if False else 1", 1),
         ("{ 'key1': 1, 'key2': 'value' }", {"key1": 1, "key2": "value"}),
         ("(1 + 10) > 3 -> str", "True"),
         ("True || (1 != 1)", True),
@@ -684,6 +695,13 @@ def test_expression_parser(expr, expected):
                 "bar": 1,
                 "baz": 2,
             },
+            "test_list": ["hello", "world", "foo", "bar"],
+            "test_string": "tracecat",
+            "test_tuple": (10, 20, 30),
+            "nested_structure": {
+                "level1": {"level2": [{"name": "nested_item", "value": 99}]}
+            },
+            "mixed_nested": [[["deep"]], [["value"]]],
             "users": [
                 {
                     "name": "Alice",
@@ -723,6 +741,12 @@ def test_expression_parser(expr, expected):
             "secret_test": {
                 "KEY": "SECRET",
             },
+        },
+        ExprContext.VARS: {
+            "api_config": {
+                "base_url": "https://example.com",
+                "timeout": 30,
+            }
         },
         ExprContext.ENV: {
             "item": "ITEM",
@@ -804,7 +828,8 @@ def test_expression_parser(expr, expected):
     # assert parser.walk_expr(expr, visitor) == expected
     parser = ExprParser()
     parse_tree = parser.parse(expr)
-    ev = ExprEvaluator(operand=context)
+    # ExprContext is a StrEnum so values are strings - pyright doesn't recognize this
+    ev = ExprEvaluator(operand=context)  # pyright: ignore[reportArgumentType]
     assert parse_tree is not None
     actual = ev.transform(parse_tree)
     assert actual == expected
@@ -882,7 +907,8 @@ def test_jsonpath_wildcard():
     parser = ExprParser()
     parse_tree = parser.parse(expr)
     assert parse_tree is not None
-    ev = ExprEvaluator(operand=context)
+    # ExprContext is a StrEnum so values are strings - pyright doesn't recognize this
+    ev = ExprEvaluator(operand=context)  # pyright: ignore[reportArgumentType]
     actual = ev.transform(parse_tree)
     assert actual == ["Alice", "Bob", "Charlie"]
 
@@ -892,7 +918,7 @@ def test_jsonpath_wildcard():
     parser = ExprParser()
     parse_tree = parser.parse(expr)
     assert parse_tree is not None
-    ev = ExprEvaluator(operand=context)
+    ev = ExprEvaluator(operand=context)  # pyright: ignore[reportArgumentType]
     actual = ev.transform(parse_tree)
     assert actual == "Alice"
 
@@ -902,7 +928,7 @@ def test_jsonpath_wildcard():
     parser = ExprParser()
     parse_tree = parser.parse(expr)
     assert parse_tree is not None
-    ev = ExprEvaluator(operand=context)
+    ev = ExprEvaluator(operand=context)  # pyright: ignore[reportArgumentType]
     actual = ev.transform(parse_tree)
     # Returns a single list of all the values
     assert actual == [[{"value": 1}]]
@@ -912,9 +938,53 @@ def test_jsonpath_wildcard():
     parser = ExprParser()
     parse_tree = parser.parse(expr)
     assert parse_tree is not None
-    ev = ExprEvaluator(operand=context)
+    ev = ExprEvaluator(operand=context)  # pyright: ignore[reportArgumentType]
     actual = ev.transform(parse_tree)
     assert actual == [1]
+
+
+def test_jsonpath_filter_returns_list():
+    context = {
+        ExprContext.ACTIONS: {
+            "parse_event": {
+                "result": {
+                    "included": [
+                        {
+                            "attributes": {
+                                "incident_role": {
+                                    "data": {"attributes": {"slug": "primary-role"}}
+                                }
+                            }
+                        },
+                        {
+                            "attributes": {
+                                "incident_role": {
+                                    "data": {"attributes": {"slug": "secondary-role"}}
+                                }
+                            }
+                        },
+                    ]
+                }
+            }
+        }
+    }
+
+    expr = 'ACTIONS.parse_event.result.included[?(@.attributes.incident_role.data.attributes.slug != "primary-role")].attributes.incident_role.data.attributes.slug'
+    parser = ExprParser()
+    parse_tree = parser.parse(expr)
+    assert parse_tree is not None
+    ev = ExprEvaluator(operand=context)  # pyright: ignore[reportArgumentType]
+    actual = ev.transform(parse_tree)
+    assert actual == ["secondary-role"]
+
+    expr = "ACTIONS.parse_event.result.included[?(@.attributes.incident_role.data.attributes.slug)].attributes.incident_role.data.attributes.slug"
+    parse_tree = parser.parse(expr)
+    assert parse_tree is not None
+    actual = ev.transform(parse_tree)
+    assert actual == [
+        "primary-role",
+        "secondary-role",
+    ]
 
 
 def test_time_funcs():
@@ -963,14 +1033,15 @@ def test_parser_error():
     with pytest.raises(TracecatExpressionError):
         parser.parse(expr)
 
-    strict_evaluator = ExprEvaluator(operand=context, strict=True)
+    # ExprContext is a StrEnum so values are strings - pyright doesn't recognize this
+    strict_evaluator = ExprEvaluator(operand=context, strict=True)  # pyright: ignore[reportArgumentType]
     with pytest.raises(TracecatExpressionError):
         test = "ACTIONS.action_test.foo"
         parse_tree = parser.parse(test)
         assert parse_tree is not None
         strict_evaluator.evaluate(parse_tree)
 
-    evaluator = ExprEvaluator(operand=context, strict=False)
+    evaluator = ExprEvaluator(operand=context, strict=False)  # pyright: ignore[reportArgumentType]
     test = "ACTIONS.action_test.foo.bar.baz"
     parse_tree = parser.parse(test)
     assert parse_tree is not None
@@ -978,7 +1049,7 @@ def test_parser_error():
 
 
 def assert_validation_result(
-    res: ExprValidationResult,
+    res: ExprBaseValidationResult,
     *,
     type: ExprType,
     status: Literal["success", "error"],
@@ -1138,6 +1209,52 @@ async def test_extract_expressions_errors(expr, expected, test_role, env_sandbox
 
     for actual, ex in zip(errors, expected, strict=True):
         assert_validation_detail(actual, **ex)
+
+
+@pytest.mark.anyio
+async def test_expr_validator_vars_key_depth_limit(test_role, env_sandbox):
+    async with VariablesService.with_session(role=test_role) as service:
+        await service.create_variable(
+            VariableCreate(
+                name="config",
+                values={
+                    "base_url": "https://example.com",
+                    "api": {
+                        "base_url": "https://example.com/api",
+                    },
+                },
+            )
+        )
+
+    validation_context = ExprValidationContext(action_refs=set())
+
+    async with ExprValidator(
+        validation_context=validation_context
+    ) as success_validator:
+        for template in extract_expressions("${{ VARS.config.base_url }}"):
+            template.validate(success_validator)
+    assert success_validator.errors() == []
+
+    async with ExprValidator(validation_context=validation_context) as depth_validator:
+        for template in extract_expressions("${{ VARS.config.api.base_url }}"):
+            template.validate(depth_validator)
+    depth_errors = depth_validator.errors()
+    assert len(depth_errors) == 1
+    depth_error = depth_errors[0]
+    assert depth_error.type == ExprType.VARIABLE
+    assert "support at most one key segment" in depth_error.msg
+
+    parser = ExprParser()
+    evaluator = ExprEvaluator(
+        operand={ExprContext.VARS: {"config": {"api": {"base_url": "value"}}}},
+        strict=True,
+    )
+    parse_tree = parser.parse("VARS.config.api.base_url")
+    assert parse_tree is not None
+    with pytest.raises(
+        TracecatExpressionError, match="support at most one key segment"
+    ):
+        evaluator.evaluate(parse_tree)
 
 
 @pytest.mark.parametrize(
@@ -1520,265 +1637,6 @@ def test_validate_template_action_key_expressions(expr, expected):
         assert_validation_result(actual, **ex)
 
 
-@pytest.mark.parametrize(
-    "lambda_str,error_msg",
-    [
-        # Test restricted symbols - file operations
-        ("lambda x: open('/etc/passwd')", "Expression contains restricted symbols"),
-        ("lambda x: file.read()", "Expression contains restricted symbols"),
-        ("lambda x: io.open('test')", "Expression contains restricted symbols"),
-        ("lambda x: pathlib.Path('/')", "Expression contains restricted symbols"),
-        # Test restricted symbols - OS/system operations
-        ("lambda x: os.system('ls')", "Expression contains restricted symbols"),
-        ("lambda x: subprocess.run(['ls'])", "Expression contains restricted symbols"),
-        ("lambda x: sys.exit()", "Expression contains restricted symbols"),
-        ("lambda x: __import__('os')", "Expression contains restricted symbols"),
-        # Test restricted symbols - network operations
-        ("lambda x: socket.socket()", "Expression contains restricted symbols"),
-        (
-            "lambda x: urllib.request.urlopen('http://evil.com')",
-            "Expression contains restricted symbols",
-        ),
-        (
-            "lambda x: requests.get('http://evil.com')",
-            "Expression contains restricted symbols",
-        ),
-        # Test restricted symbols - introspection
-        ("lambda x: eval('x + 1')", "Expression contains restricted symbols"),
-        ("lambda x: exec('print(x)')", "Expression contains restricted symbols"),
-        (
-            "lambda x: compile('x', 'test', 'eval')",
-            "Expression contains restricted symbols",
-        ),
-        ("lambda x: globals()['secret']", "Expression contains restricted symbols"),
-        ("lambda x: locals()['key']", "Expression contains restricted symbols"),
-        # Test dangerous patterns
-        (
-            "lambda x: x.__class__.__bases__",
-            "Expression contains dangerous pattern: __",
-        ),
-        ("lambda x: '\\x41\\x42\\x43'", "Expression contains dangerous pattern: \\x"),
-        ("lambda x: '\\u0041\\u0042'", "Expression contains dangerous pattern: \\u"),
-        ("lambda x: chr(65)", "Expression contains dangerous pattern: chr("),
-        ("lambda x: ord('A')", "Expression contains dangerous pattern: ord("),
-        # Note: These are caught by restricted symbols check since 'decode'/'encode' are in the list
-        ("lambda x: 'test'.decode('utf-8')", "Expression contains restricted symbols"),
-        ("lambda x: x.encode('utf-8')", "Expression contains restricted symbols"),
-        # Note: This is caught by restricted symbols because 'encode' is in 'b64encode'
-        ("lambda x: base64.b64encode(x)", "Expression contains restricted symbols"),
-        # Test expression too long
-        (f"lambda x: {'x + ' * 500}x", "Expression too long"),
-    ],
-)
-def test_build_lambda_security_restrictions(lambda_str: str, error_msg: str) -> None:
-    """Test that dangerous lambda expressions are blocked."""
-    with pytest.raises(ValueError):
-        build_safe_lambda(lambda_str)
-
-
-@pytest.mark.parametrize(
-    "lambda_str,error_msg",
-    [
-        # Test AST-level restrictions - imports
-        # Note: __import__ is caught by string-level check first
-        (
-            "lambda x: (lambda: __import__('os'))()",
-            "Expression contains restricted symbols",
-        ),
-        # Test AST-level restrictions - direct function calls
-        # Note: These are all caught by string-level check first since they're in RESTRICTED_SYMBOLS
-        ("lambda x: eval('x')", "Expression contains restricted symbols"),
-        ("lambda x: exec('x')", "Expression contains restricted symbols"),
-        ("lambda x: open('file.txt')", "Expression contains restricted symbols"),
-        # Test AST-level restrictions - attribute access
-        # Note: decode/encode are caught by string-level check
-        ("lambda x: x.decode", "Expression contains restricted symbols"),
-        ("lambda x: str.encode", "Expression contains restricted symbols"),
-        # Test AST-level restrictions - accessing restricted names
-        # Note: os/sys are caught by string-level check
-        ("lambda x: os", "Expression contains restricted symbols"),
-        ("lambda x: sys", "Expression contains restricted symbols"),
-        # Test whitelist validation - disallowed node types
-        ("lambda x: (yield x)", "Node type Yield is not allowed in expressions"),
-    ],
-)
-def test_build_lambda_ast_restrictions(lambda_str: str, error_msg: str) -> None:
-    """Test that AST-level restrictions work properly."""
-    with pytest.raises(ValueError):
-        build_safe_lambda(lambda_str)
-
-
-def test_build_lambda_recursion_limit() -> None:
-    """Test that recursion depth limits are enforced."""
-    # Test that the recursion limit is properly set and restored
-    import sys
-
-    original_limit = sys.getrecursionlimit()
-
-    # Execute a lambda to ensure the limit is set and restored
-    simple_lambda = build_safe_lambda("lambda x: x + 1")
-    result = simple_lambda(1)
-    assert result == 2
-
-    # Check that the recursion limit was restored
-    assert sys.getrecursionlimit() == original_limit
-
-
-def test_build_lambda_safe_builtins() -> None:
-    """Test that only safe builtins are available in lambda execution."""
-    # Test allowed builtins work
-    allowed_builtins = [
-        ("lambda x: abs(x)", -5, 5),
-        ("lambda x: min(x)", [3, 1, 4], 1),
-        ("lambda x: max(x)", [3, 1, 4], 4),
-        ("lambda x: sum(x)", [1, 2, 3], 6),
-        ("lambda x: len(x)", [1, 2, 3], 3),
-        ("lambda x: int(x)", "42", 42),
-        ("lambda x: float(x)", "3.14", 3.14),
-        ("lambda x: str(x)", 42, "42"),
-        ("lambda x: bool(x)", 1, True),
-        ("lambda x: list(x)", (1, 2, 3), [1, 2, 3]),
-        ("lambda x: dict(x)", [("a", 1), ("b", 2)], {"a": 1, "b": 2}),
-        ("lambda x: tuple(x)", [1, 2, 3], (1, 2, 3)),
-        ("lambda x: set(x)", [1, 2, 2, 3], {1, 2, 3}),
-        ("lambda x: sorted(x)", [3, 1, 4], [1, 3, 4]),
-        ("lambda x: list(reversed(x))", [1, 2, 3], [3, 2, 1]),
-        ("lambda x: all(x)", [True, True, False], False),
-        ("lambda x: any(x)", [False, False, True], True),
-    ]
-
-    for lambda_str, test_input, expected in allowed_builtins:
-        fn = build_safe_lambda(lambda_str)
-        assert fn(test_input) == expected
-
-
-def test_build_lambda_iteration_limit() -> None:
-    """Test that iteration limits prevent infinite loops."""
-    # This lambda would iterate too many times
-    large_iteration_lambda = build_safe_lambda("lambda x: [i for i in range(x)]")
-
-    # This should work fine with small numbers
-    assert large_iteration_lambda(10) == list(range(10))
-
-    # With our iteration guard, large iterations might fail
-    # Note: Current implementation only guards the input, not internal iterations
-    # So this test mainly verifies the wrapper doesn't break normal operations
-
-
-def test_build_lambda_safe_return_types() -> None:
-    """Test that lambdas can only return safe types."""
-    # These should work - returning safe types
-    safe_returns = [
-        ("lambda x: None", 1, None),
-        ("lambda x: True", 1, True),
-        ("lambda x: 42", 1, 42),
-        ("lambda x: 3.14", 1, 3.14),
-        ("lambda x: 'hello'", 1, "hello"),
-        ("lambda x: [1, 2, 3]", 1, [1, 2, 3]),
-        ("lambda x: {'a': 1}", 1, {"a": 1}),
-        ("lambda x: (1, 2)", 1, (1, 2)),
-        ("lambda x: {1, 2, 3}", 1, {1, 2, 3}),
-    ]
-
-    for lambda_str, test_input, expected in safe_returns:
-        fn = build_safe_lambda(lambda_str)
-        assert fn(test_input) == expected
-
-
-def test_build_lambda_jsonpath_allowed() -> None:
-    """Test that jsonpath is allowed and works correctly."""
-    # Ensure jsonpath is in the allowed functions
-    jsonpath_lambda = build_safe_lambda("lambda x: jsonpath('$.name', x)")
-    result = jsonpath_lambda({"name": "Alice", "age": 30})
-    assert result == "Alice"
-
-    # Test complex jsonpath usage
-    complex_lambda = build_safe_lambda(
-        "lambda x: [jsonpath(f'$.users[{i}].name', x) for i in range(len(jsonpath('$.users', x)))]"
-    )
-    result = complex_lambda(
-        {"users": [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]}
-    )
-    assert result == ["Alice", "Bob"]
-
-
-@pytest.mark.parametrize(
-    "lambda_str",
-    [
-        # Attribute chains that might try to escape
-        "lambda x: x.__class__.__mro__[1].__subclasses__",
-        "lambda x: ''.__class__.__bases__[0].__subclasses__()",
-        "lambda x: x.__init__.__globals__",  # This one has 'globals' which is restricted
-        # Trying to access builtins through various means
-        "lambda x: [].__class__.__base__.__subclasses__()[104]",  # Would access <type 'sys'>
-        "lambda x: ''.__class__.__mro__[1].__init__.__globals__['sys']",  # Has both 'globals' and 'sys'
-    ],
-)
-def test_build_lambda_attribute_chain_attacks(lambda_str: str) -> None:
-    """Test that attribute chain attacks are blocked."""
-    with pytest.raises(ValueError) as exc_info:
-        build_safe_lambda(lambda_str)
-    # Should be caught by either dangerous pattern, dunder attribute, or restricted symbols
-    error_msg = str(exc_info.value)
-    assert any(
-        msg in error_msg
-        for msg in [
-            "dangerous pattern: __",
-            "dunder attribute",
-            "Expression contains restricted symbols",
-        ]
-    )
-
-
-def test_build_lambda_complex_safe_expressions() -> None:
-    """Test that complex but safe expressions work correctly."""
-    # List comprehension with filtering
-    fn1 = build_safe_lambda("lambda x: [i * 2 for i in x if i > 2]")
-    assert fn1([1, 2, 3, 4, 5]) == [6, 8, 10]
-
-    # Dictionary comprehension
-    fn2 = build_safe_lambda("lambda x: {k: v * 2 for k, v in x.items() if v > 0}")
-    assert fn2({"a": 1, "b": -1, "c": 2}) == {"a": 2, "c": 4}
-
-    # Nested lambda (not actual lambda keyword, but functional style)
-    fn3 = build_safe_lambda(
-        "lambda x: list(map(lambda y: y * 2, filter(lambda z: z > 0, x))) if False else [i * 2 for i in x if i > 0]"
-    )
-    assert fn3([-1, 0, 1, 2, 3]) == [2, 4, 6]
-
-    # Complex boolean logic
-    fn4 = build_safe_lambda(
-        "lambda x: all(i > 0 for i in x) and len(x) > 2 and sum(x) < 100"
-    )
-    assert fn4([1, 2, 3])
-    assert not fn4([1, 2])
-    assert not fn4([1, 2, -3])
-    assert not fn4([30, 40, 50])
-
-    # Ternary with complex conditions
-    fn5 = build_safe_lambda(
-        "lambda x: 'greater' if x > 0 else ('lesser' if x < 0 else 'equal')"
-    )
-    assert fn5(5) == "greater"
-    assert fn5(-5) == "lesser"
-    assert fn5(0) == "equal"
-
-
-def test_build_lambda_input_sanitization() -> None:
-    """Test that inputs are properly sanitized with iteration guards."""
-    # Test with dict input
-    dict_lambda = build_safe_lambda("lambda x: sum(x.values())")
-    assert dict_lambda({"a": 1, "b": 2, "c": 3}) == 6
-
-    # Test with list input
-    list_lambda = build_safe_lambda("lambda x: [i * 2 for i in x]")
-    assert list_lambda([1, 2, 3]) == [2, 4, 6]
-
-    # Test with string input (should not be wrapped)
-    str_lambda = build_safe_lambda("lambda x: x.upper()")
-    assert str_lambda("hello") == "HELLO"
-
-
 def test_multiple_secrets_in_single_template():
     expr = "${{ FN.concat(SECRETS.a.K1, '-', SECRETS.a.K2, '-', SECRETS.b.K3) }}"
     got = sorted(extract_templated_secrets(expr))
@@ -1837,3 +1695,77 @@ def test_mixed_nested_object():
     }
     got = sorted(extract_templated_secrets(mixed_args_obj))
     assert got == sorted(["alpha.KEY", "beta.SECRET", "gamma.TOKEN"])
+
+
+def test_collect_expressions_captures_vars_references():
+    """Test that collect_expressions correctly captures VARS expressions.
+
+    This verifies that the ExprPathCollector visitor method is named 'vars'
+    to match the grammar, not 'variables'. The grammar emits 'vars' nodes,
+    so the visitor method must be named accordingly.
+    """
+    # Test single VARS reference
+    obj = {"param": "${{ VARS.my_variable }}"}
+    result = collect_expressions(obj)
+    assert result.variables == {"my_variable"}
+
+    # Test multiple VARS references
+    obj = {
+        "api_url": "${{ VARS.api_config.base_url }}",
+        "timeout": "${{ VARS.api_config.timeout }}",
+        "retry_count": "${{ VARS.retry_settings.max_retries }}",
+    }
+    result = collect_expressions(obj)
+    assert result.variables == {"api_config", "retry_settings"}
+
+    # Test VARS with SECRETS together
+    obj = {
+        "auth": "${{ SECRETS.my_secret.API_KEY }}",
+        "endpoint": "${{ VARS.endpoints.production }}",
+    }
+    result = collect_expressions(obj)
+    assert result.secrets == {"my_secret.API_KEY"}
+    assert result.variables == {"endpoints"}
+
+    # Test VARS in complex expressions
+    obj = {
+        "url": "${{ FN.concat(VARS.base_url, '/api/v1') }}",
+        "headers": {
+            "Authorization": "${{ SECRETS.auth.TOKEN }}",
+            "X-API-Version": "${{ VARS.api_version }}",
+        },
+    }
+    result = collect_expressions(obj)
+    assert result.secrets == {"auth.TOKEN"}
+    assert result.variables == {"base_url", "api_version"}
+
+    # Test multiple references to same variable (should dedupe)
+    obj = {
+        "url1": "${{ VARS.config }}",
+        "url2": "${{ VARS.config.nested }}",
+        "url3": "${{ FN.upper(VARS.config) }}",
+    }
+    result = collect_expressions(obj)
+    assert result.variables == {"config"}
+
+    # Test nested VARS in lists
+    obj = {
+        "items": [
+            "${{ VARS.item1 }}",
+            {"nested": "${{ VARS.item2 }}"},
+            "${{ FN.format('{} - {}', VARS.item3, VARS.item1) }}",  # item1 duplicate
+        ],
+    }
+    result = collect_expressions(obj)
+    assert result.variables == {"item1", "item2", "item3"}
+
+    # Test that non-VARS expressions don't create false positives
+    obj = {
+        "action": "${{ ACTIONS.my_action.result }}",
+        "trigger": "${{ TRIGGER.data }}",
+        "env": "${{ ENV.some_var }}",
+        "local": "${{ var.x }}",
+    }
+    result = collect_expressions(obj)
+    assert result.variables == set()  # No VARS expressions
+    assert result.secrets == set()  # No SECRETS expressions

@@ -23,6 +23,10 @@ import { CodeEditor } from "@/components/editor/codemirror/code-editor"
 import { YamlStyledEditor } from "@/components/editor/codemirror/yaml-editor"
 import { ExpressionInput } from "@/components/editor/expression-input"
 import { getIcon } from "@/components/icons"
+import {
+  LockedFeatureChip,
+  LockedFeatureModal,
+} from "@/components/locked-feature-modal"
 import { type FieldTypeTab, PolyField } from "@/components/polymorphic-field"
 import {
   CustomTagInput,
@@ -30,7 +34,6 @@ import {
   type Suggestion,
 } from "@/components/tags-input"
 import { Button } from "@/components/ui/button"
-import { Checkbox } from "@/components/ui/checkbox"
 import {
   Command,
   CommandEmpty,
@@ -59,7 +62,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
+import {
+  useAgentPresets,
+  useAgentPresetVersions,
+} from "@/hooks/use-agent-presets"
 import { isExpression } from "@/lib/expressions"
 import { useBuilderRegistryActions } from "@/lib/hooks"
 import { getType } from "@/lib/jsonschema"
@@ -70,6 +78,8 @@ import {
   type TracecatEditorComponent,
   type TracecatJsonSchema,
 } from "@/lib/schema"
+import { cn } from "@/lib/utils"
+import { useWorkspaceId } from "@/providers/workspace-id"
 
 export interface FormComponentProps {
   label: string
@@ -135,26 +145,32 @@ export function ControlledYamlField({
   description,
   type,
   info,
+  hideType,
 }: {
   fieldName: string
   label?: string
   description?: string
   type?: string
   info?: string
+  hideType?: boolean
 }) {
   const methods = useFormContext()
   const forEach = methods.watch("for_each")
+  // Only show FormLabelComponent if we have content to display
+  const showLabel = label || description || (!hideType && type)
   return (
     <Controller
       name={fieldName}
       control={methods.control}
       render={() => (
         <FormItem>
-          <FormLabelComponent
-            label={label}
-            description={description}
-            type={type}
-          />
+          {showLabel && (
+            <FormLabelComponent
+              label={label}
+              description={description}
+              type={hideType ? undefined : type}
+            />
+          )}
           <FormMessage className="whitespace-pre-line" />
           {info && (
             <div className="flex max-w-fit items-center gap-1 rounded bg-blue-100 px-2 py-0.5 text-xs text-blue-500">
@@ -476,6 +492,8 @@ function ComponentContent({
           </SelectContent>
         </Select>
       )
+    case "agent-preset":
+      return <AgentPresetSelect field={field} />
     case "tag-input":
       return (
         <CustomTagInput
@@ -496,6 +514,9 @@ function ComponentContent({
         />
       )
     case "integer":
+      if (isAgentPresetVersionFieldName(field.name)) {
+        return <AgentPresetVersionField field={field} />
+      }
       return (
         <Input
           type="number"
@@ -525,17 +546,17 @@ function ComponentContent({
           }
         />
       )
-    case "toggle":
+    case "toggle": {
+      const stateLabel = field.value
+        ? component.label_on || "On"
+        : component.label_off || "Off"
       return (
         <div className="flex items-center space-x-2">
-          <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-          <span className="text-sm text-muted-foreground">
-            {field.value
-              ? component.label_on || "On"
-              : component.label_off || "Off"}
-          </span>
+          <Switch checked={field.value} onCheckedChange={field.onChange} />
+          <span className="text-sm text-muted-foreground">{stateLabel}</span>
         </div>
       )
+    }
     case "code":
       return (
         <CodeEditor
@@ -571,9 +592,10 @@ function SingleActionTypeField({
   searchKeys: (keyof RegistryActionReadMinimal)[]
 }) {
   const [open, setOpen] = useState(false)
+  const [lockedFeatureOpen, setLockedFeatureOpen] = useState(false)
   const [searchValue, setSearchValue] = useState("")
   const { registryActions, registryActionsIsLoading } =
-    useBuilderRegistryActions()
+    useBuilderRegistryActions({ includeLocked: true })
 
   const filterActions = useCallback(
     (actions: RegistryActionReadMinimal[], search: string) => {
@@ -620,104 +642,123 @@ function SingleActionTypeField({
     return registryActions?.find((action) => action.action === field.value)
   }, [registryActions, field.value])
 
-  const handleSelect = (actionKey: string) => {
-    field.onChange(actionKey)
-    onChange(actionKey)
+  const handleSelect = (action: RegistryActionReadMinimal) => {
+    if (action.availability?.locked ?? false) {
+      setOpen(false)
+      setLockedFeatureOpen(true)
+      return
+    }
+
+    field.onChange(action.action)
+    onChange(action.action)
     setOpen(false)
     setSearchValue("")
   }
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          variant="outline"
-          role="combobox"
-          aria-expanded={open}
-          className="w-full justify-between text-left font-normal"
-        >
-          <div className="flex items-center gap-2 truncate">
-            {selectedAction ? (
-              getIcon(selectedAction.action, {
-                className: "size-4 shrink-0",
-              })
-            ) : (
-              <TypeIcon className="size-4 shrink-0" />
-            )}
-            <span className="truncate">
-              {selectedAction
-                ? selectedAction.default_title || selectedAction.action
-                : "Select action type..."}
-            </span>
-          </div>
-          <ChevronDownIcon className="ml-2 size-4 shrink-0 opacity-50" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent className="w-[400px] p-0" align="start">
-        <Command shouldFilter={false}>
-          <CommandInput
-            placeholder="Search actions..."
-            value={searchValue}
-            onValueChange={setSearchValue}
-          />
-          <ScrollArea className="h-[300px]">
-            <CommandList>
-              <CommandEmpty className="py-6 text-center text-xs text-muted-foreground">
-                {registryActionsIsLoading
-                  ? "Loading actions..."
-                  : "No actions found."}
-              </CommandEmpty>
-              {sortedActions.map((result) => {
-                const action = result.obj
-                return (
-                  <CommandItem
-                    key={action.action}
-                    value={action.action}
-                    onSelect={() => handleSelect(action.action)}
-                    className="cursor-pointer p-2"
-                  >
-                    <div className="flex w-full flex-col gap-1">
-                      <div className="flex items-center gap-2">
-                        {getIcon(action.action, {
-                          className: "size-4 shrink-0 text-muted-foreground",
-                        })}
-                        <span className="font-medium">
-                          {action.default_title || action.name}
-                        </span>
-                        {action.type === "template" && (
-                          <span className="rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-800 dark:bg-blue-900 dark:text-blue-200">
-                            template
+    <>
+      <LockedFeatureModal
+        open={lockedFeatureOpen}
+        onOpenChange={setLockedFeatureOpen}
+      />
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <Button
+            variant="outline"
+            role="combobox"
+            aria-expanded={open}
+            className="w-full justify-between text-left font-normal"
+          >
+            <div className="flex items-center gap-2 truncate">
+              {selectedAction ? (
+                getIcon(selectedAction.action, {
+                  className: "size-4 shrink-0",
+                })
+              ) : (
+                <TypeIcon className="size-4 shrink-0" />
+              )}
+              <span className="truncate">
+                {selectedAction
+                  ? selectedAction.default_title || selectedAction.action
+                  : "Select action type..."}
+              </span>
+            </div>
+            <ChevronDownIcon className="ml-2 size-4 shrink-0 opacity-50" />
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent className="w-[400px] p-0" align="start">
+          <Command shouldFilter={false}>
+            <CommandInput
+              placeholder="Search actions..."
+              value={searchValue}
+              onValueChange={setSearchValue}
+            />
+            <ScrollArea className="h-[300px]">
+              <CommandList>
+                <CommandEmpty className="py-6 text-center text-xs text-muted-foreground">
+                  {registryActionsIsLoading
+                    ? "Loading actions..."
+                    : "No actions found."}
+                </CommandEmpty>
+                {sortedActions.map((result) => {
+                  const action = result.obj
+                  const isLocked = action.availability?.locked ?? false
+
+                  return (
+                    <CommandItem
+                      key={action.action}
+                      value={action.action}
+                      onSelect={() => handleSelect(action)}
+                      className={cn(
+                        "cursor-pointer p-2",
+                        isLocked && "text-muted-foreground"
+                      )}
+                    >
+                      <div className="flex w-full flex-col gap-1">
+                        <div className="flex items-center gap-2">
+                          {getIcon(action.action, {
+                            className: "size-4 shrink-0 text-muted-foreground",
+                          })}
+                          <span className="font-medium">
+                            {action.default_title || action.name}
                           </span>
-                        )}
+                          {isLocked ? (
+                            <LockedFeatureChip className="shrink-0" />
+                          ) : null}
+                          {action.type === "template" && (
+                            <span className="rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-800 dark:bg-blue-900 dark:text-blue-200">
+                              template
+                            </span>
+                          )}
+                        </div>
+                        <p className="line-clamp-2 text-xs text-muted-foreground">
+                          {action.description}
+                        </p>
+                        <span className="font-mono text-xs text-muted-foreground/70">
+                          {action.action}
+                        </span>
                       </div>
-                      <p className="line-clamp-2 text-xs text-muted-foreground">
-                        {action.description}
-                      </p>
-                      <span className="font-mono text-xs text-muted-foreground/70">
-                        {action.action}
-                      </span>
-                    </div>
-                  </CommandItem>
-                )
-              })}
-            </CommandList>
-          </ScrollArea>
-        </Command>
-      </PopoverContent>
-    </Popover>
+                    </CommandItem>
+                  )
+                })}
+              </CommandList>
+            </ScrollArea>
+          </Command>
+        </PopoverContent>
+      </Popover>
+    </>
   )
 }
 
 function MultipleActionTypeField({
   field,
   onChange,
-  searchKeys,
 }: {
   field: ControllerRenderProps<FieldValues>
   onChange: (value: string[]) => void
-  searchKeys: (keyof RegistryActionReadMinimal)[]
 }) {
-  const { registryActions } = useBuilderRegistryActions()
+  const [lockedFeatureOpen, setLockedFeatureOpen] = useState(false)
+  const { registryActions } = useBuilderRegistryActions({ includeLocked: true })
 
   // Map actions to suggestions format for MultiTagCommandInput
   const suggestions = useMemo(() => {
@@ -732,19 +773,27 @@ function MultipleActionTypeField({
           icon: getIcon(action.action, {
             className: "size-6 p-[3px] border-[0.5px]",
           }),
+          locked: action.availability?.locked ?? false,
+          onSelect: () => setLockedFeatureOpen(true),
         }))
         .sort((a, b) => a.value.localeCompare(b.value)) || []
     )
   }, [registryActions])
 
   return (
-    <MultiTagCommandInput
-      value={field.value}
-      onChange={onChange}
-      suggestions={suggestions}
-      searchKeys={searchKeys as (keyof Suggestion)[]}
-      placeholder="Start typing to search actions..."
-    />
+    <>
+      <LockedFeatureModal
+        open={lockedFeatureOpen}
+        onOpenChange={setLockedFeatureOpen}
+      />
+      <MultiTagCommandInput
+        value={field.value}
+        onChange={onChange}
+        suggestions={suggestions}
+        searchKeys={["value", "label", "description", "group"]}
+        placeholder="Start typing to search actions..."
+      />
+    </>
   )
 }
 
@@ -770,7 +819,6 @@ export function ActionTypeField({
       <MultipleActionTypeField
         field={field}
         onChange={onChange as (value: string[]) => void}
-        searchKeys={searchKeys}
       />
     )
   }
@@ -797,6 +845,7 @@ const COMPONENT_LABELS: Record<TracecatComponentId, string> = {
   expression: "Expression",
   "action-type": "Action Type",
   "workflow-alias": "Workflow Alias",
+  "agent-preset": "Agent Preset",
 }
 
 const COMPONENT_ICONS: Record<TracecatComponentId, LucideIcon> = {
@@ -812,4 +861,168 @@ const COMPONENT_ICONS: Record<TracecatComponentId, LucideIcon> = {
   expression: BracesIcon,
   "action-type": TypeIcon,
   "workflow-alias": WorkflowIcon,
+  "agent-preset": WorkflowIcon,
+}
+
+function AgentPresetSelect({
+  field,
+}: {
+  field: ControllerRenderProps<FieldValues>
+}) {
+  const methods = useFormContext()
+  const workspaceId = useWorkspaceId()
+  const { presets, presetsIsLoading, presetsError } = useAgentPresets(
+    workspaceId,
+    { enabled: Boolean(workspaceId) }
+  )
+
+  const handleChange = (value: string) => {
+    field.onChange(value)
+    const presetVersionFieldName = getAgentPresetVersionFieldName(field.name)
+    if (presetVersionFieldName) {
+      methods.setValue(presetVersionFieldName, undefined, {
+        shouldDirty: true,
+        shouldTouch: true,
+      })
+    }
+  }
+
+  const placeholder = !workspaceId
+    ? "Select a workspace to load agent presets"
+    : presetsIsLoading
+      ? "Loading agent presets..."
+      : presetsError
+        ? "Failed to load agent presets"
+        : "Select an agent preset"
+
+  return (
+    <Select
+      value={typeof field.value === "string" ? field.value : undefined}
+      onValueChange={handleChange}
+      disabled={!workspaceId}
+    >
+      <SelectTrigger>
+        <SelectValue placeholder={placeholder} />
+      </SelectTrigger>
+      <SelectContent>
+        {presetsIsLoading && (
+          <SelectItem value="__loading" disabled>
+            Loading agent presets...
+          </SelectItem>
+        )}
+        {presetsError && (
+          <SelectItem value="__error" disabled>
+            Failed to load agent presets
+          </SelectItem>
+        )}
+        {!presetsIsLoading &&
+          !presetsError &&
+          workspaceId &&
+          (presets?.length ?? 0) === 0 && (
+            <SelectItem value="__empty" disabled>
+              No agent presets found
+            </SelectItem>
+          )}
+        {presets?.map((preset) => (
+          <SelectItem key={preset.slug} value={preset.slug}>
+            {preset.name} ({preset.slug})
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+}
+
+function isAgentPresetVersionFieldName(fieldName: string): boolean {
+  return fieldName === "preset_version" || fieldName.endsWith(".preset_version")
+}
+
+function getAgentPresetFieldName(fieldName: string): string | null {
+  if (fieldName === "preset_version") {
+    return "preset"
+  }
+  if (fieldName.endsWith(".preset_version")) {
+    return fieldName.replace(/\.preset_version$/, ".preset")
+  }
+  return null
+}
+
+function getAgentPresetVersionFieldName(fieldName: string): string | null {
+  if (fieldName === "preset") {
+    return "preset_version"
+  }
+  if (fieldName.endsWith(".preset")) {
+    return fieldName.replace(/\.preset$/, ".preset_version")
+  }
+  return null
+}
+
+function AgentPresetVersionField({
+  field,
+}: {
+  field: ControllerRenderProps<FieldValues>
+}) {
+  const methods = useFormContext()
+  const workspaceId = useWorkspaceId()
+  const presetFieldName = getAgentPresetFieldName(field.name)
+  const presetValue = presetFieldName
+    ? methods.watch(presetFieldName)
+    : undefined
+  const selectedPresetSlug =
+    typeof presetValue === "string" ? presetValue : null
+  const { presets } = useAgentPresets(workspaceId, {
+    enabled: Boolean(workspaceId),
+  })
+  const selectedPreset = presets?.find(
+    (preset) => preset.slug === selectedPresetSlug
+  )
+  const { versions, versionsIsLoading, versionsError } = useAgentPresetVersions(
+    workspaceId,
+    selectedPreset?.id,
+    { enabled: Boolean(workspaceId && selectedPreset?.id) }
+  )
+
+  return (
+    <Select
+      value={
+        typeof field.value === "number" ? String(field.value) : "__current__"
+      }
+      onValueChange={(value) => {
+        field.onChange(value === "__current__" ? undefined : parseInt(value))
+      }}
+      disabled={!workspaceId || !selectedPreset}
+    >
+      <SelectTrigger>
+        <SelectValue
+          placeholder={
+            selectedPreset ? "Select a version" : "Choose an agent preset first"
+          }
+        />
+      </SelectTrigger>
+      <SelectContent>
+        {versionsIsLoading ? (
+          <SelectItem value="__loading" disabled>
+            Loading versions...
+          </SelectItem>
+        ) : null}
+        {versionsError ? (
+          <SelectItem value="__error" disabled>
+            Failed to load versions
+          </SelectItem>
+        ) : null}
+        {!versionsIsLoading && !versionsError ? (
+          <SelectItem value="__current__">Current</SelectItem>
+        ) : null}
+        {versions?.map((version) => (
+          <SelectItem key={version.id} value={String(version.version)}>
+            {`v${version.version}${
+              version.id === selectedPreset?.current_version_id
+                ? " • Current"
+                : ""
+            }`}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
 }

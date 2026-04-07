@@ -1,25 +1,40 @@
 """Tests for WorkflowImportService functionality."""
 
-import pytest
-from sqlmodel import col, select
-from sqlmodel.ext.asyncio.session import AsyncSession
+from unittest.mock import AsyncMock, patch
 
-from tracecat.db.schemas import Schedule, Tag, Workflow, WorkflowDefinition, WorkflowTag
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from tracecat.auth.types import Role
+from tracecat.cases.enums import CaseEventType
+from tracecat.db.models import (
+    Schedule,
+    Workflow,
+    WorkflowDefinition,
+    WorkflowTag,
+    WorkflowTagLink,
+)
 from tracecat.dsl.common import DSLConfig, DSLEntrypoint, DSLInput
 from tracecat.dsl.enums import PlatformAction
-from tracecat.dsl.models import ActionStatement
-from tracecat.dsl.view import RFGraph
+from tracecat.dsl.schemas import ActionStatement
+from tracecat.expressions.expectations import ExpectedField
 from tracecat.identifiers.workflow import WorkflowUUID
-from tracecat.types.auth import Role
+from tracecat.workflow.case_triggers.schemas import CaseTriggerConfig
+from tracecat.workflow.case_triggers.service import CaseTriggersService
 from tracecat.workflow.store.import_service import WorkflowImportService
-from tracecat.workflow.store.models import (
+from tracecat.workflow.store.schemas import (
+    RemoteCaseTrigger,
     RemoteWebhook,
     RemoteWorkflowDefinition,
     RemoteWorkflowSchedule,
     RemoteWorkflowTag,
 )
 
-pytestmark = pytest.mark.usefixtures("db")
+pytestmark = [
+    pytest.mark.usefixtures("db"),
+    pytest.mark.usefixtures("registry_version_with_manifest"),
+]
 
 
 @pytest.fixture
@@ -116,8 +131,8 @@ class TestWorkflowImportService:
         # Verify the workflow was created
         wf_id = WorkflowUUID.new("wf_testworkflow001")
         stmt = select(Workflow).where(Workflow.id == wf_id)
-        result = await session.exec(stmt)
-        workflow = result.first()
+        result = await session.execute(stmt)
+        workflow = result.scalars().first()
         assert workflow is not None
         assert workflow.title == "Test Import Workflow"
         assert workflow.description == "A workflow for testing import functionality"
@@ -133,12 +148,9 @@ class TestWorkflowImportService:
         assert "core.transform.transform" in action_types
         assert "core.http_request" in action_types
 
-        # Verify React Flow graph was generated
-        assert workflow.object is not None
-        rf_graph = RFGraph.model_validate(workflow.object)
-        assert rf_graph.trigger is not None
-        assert len(rf_graph.nodes) >= 3  # trigger + 2 actions
-        assert len(rf_graph.edges) >= 2  # trigger -> first action, first -> second
+        # Verify workflow graph metadata was initialized
+        assert workflow.trigger_position_x == 0.0
+        assert workflow.trigger_position_y == 0.0
 
         # Verify webhook was created
         assert workflow.webhook is not None
@@ -148,15 +160,15 @@ class TestWorkflowImportService:
 
         # Verify workflow definition was created
         stmt = select(WorkflowDefinition).where(WorkflowDefinition.workflow_id == wf_id)
-        result = await session.exec(stmt)
-        definition = result.first()
+        result = await session.execute(stmt)
+        definition = result.scalars().first()
         assert definition is not None
         assert definition.version == 1
 
         # Verify schedule was created
         stmt = select(Schedule).where(Schedule.workflow_id == wf_id)
-        result = await session.exec(stmt)
-        schedule = result.first()
+        result = await session.execute(stmt)
+        schedule = result.scalars().first()
         assert schedule is not None
         assert schedule.cron == "0 */6 * * *"
         assert schedule.every is None
@@ -164,18 +176,89 @@ class TestWorkflowImportService:
         assert schedule.status == "online"
 
         # Verify tags were created
-        stmt = select(WorkflowTag).where(WorkflowTag.workflow_id == wf_id)
-        result = await session.exec(stmt)
-        workflow_tags = result.all()
+        stmt = select(WorkflowTagLink).where(WorkflowTagLink.workflow_id == wf_id)
+        result = await session.execute(stmt)
+        workflow_tags = result.scalars().all()
         assert len(workflow_tags) == 2
 
         # Get the actual tag names
         tag_ids = [wt.tag_id for wt in workflow_tags]
-        stmt = select(Tag).where(col(Tag.id).in_(tag_ids))
-        result = await session.exec(stmt)
-        tags = result.all()
+        stmt = select(WorkflowTag).where(WorkflowTag.id.in_(tag_ids))
+        result = await session.execute(stmt)
+        tags = result.scalars().all()
         tag_names = {tag.name for tag in tags}
         assert tag_names == {"test", "import"}
+
+    @pytest.mark.anyio
+    async def test_update_case_trigger_clears_existing_trigger_when_remote_block_missing(
+        self,
+        import_service: WorkflowImportService,
+        sample_dsl: DSLInput,
+    ) -> None:
+        workflow = await import_service.wf_mgmt.create_db_workflow_from_dsl(
+            sample_dsl, workflow_id=WorkflowUUID.new_uuid4()
+        )
+        case_trigger_service = CaseTriggersService(
+            import_service.session, role=import_service.role
+        )
+        await case_trigger_service.upsert_case_trigger(
+            WorkflowUUID.new(workflow.id),
+            CaseTriggerConfig(
+                status="online",
+                event_types=[CaseEventType.CASE_CREATED],
+                tag_filters=[],
+            ),
+        )
+
+        await import_service._update_case_trigger(workflow, None)
+        await import_service.session.refresh(workflow, ["case_trigger"])
+
+        assert workflow.case_trigger is not None
+        assert workflow.case_trigger.status == "offline"
+        assert workflow.case_trigger.event_types == []
+        assert workflow.case_trigger.tag_filters == []
+
+    @pytest.mark.anyio
+    async def test_update_case_trigger_clears_existing_trigger_from_inert_remote_block(
+        self,
+        import_service: WorkflowImportService,
+        sample_dsl: DSLInput,
+    ) -> None:
+        workflow = await import_service.wf_mgmt.create_db_workflow_from_dsl(
+            sample_dsl, workflow_id=WorkflowUUID.new_uuid4()
+        )
+        case_trigger_service = CaseTriggersService(
+            import_service.session, role=import_service.role
+        )
+        await case_trigger_service.upsert_case_trigger(
+            WorkflowUUID.new(workflow.id),
+            CaseTriggerConfig(
+                status="online",
+                event_types=[CaseEventType.CASE_CREATED],
+                tag_filters=[],
+            ),
+        )
+
+        with patch(
+            "tracecat.workflow.store.import_service.CaseTriggersService.upsert_case_trigger",
+            new_callable=AsyncMock,
+        ) as mock_upsert:
+            await import_service._update_case_trigger(
+                workflow,
+                RemoteCaseTrigger(
+                    status="offline",
+                    event_types=[],
+                    tag_filters=[],
+                ),
+            )
+
+        mock_upsert.assert_not_awaited()
+        await import_service.session.refresh(workflow, ["case_trigger"])
+
+        assert workflow.case_trigger is not None
+        assert workflow.case_trigger.status == "offline"
+        assert workflow.case_trigger.event_types == []
+        assert workflow.case_trigger.tag_filters == []
 
     @pytest.mark.anyio
     async def test_import_workflow_overwrite_behavior(
@@ -204,8 +287,8 @@ class TestWorkflowImportService:
         # Verify workflow still exists and wasn't duplicated
         wf_id = WorkflowUUID.new("wf_testworkflow001")
         stmt = select(Workflow).where(Workflow.id == wf_id)
-        result = await session.exec(stmt)
-        workflow = result.first()
+        result = await session.execute(stmt)
+        workflow = result.scalars().first()
         assert workflow is not None
 
     @pytest.mark.anyio
@@ -253,8 +336,8 @@ class TestWorkflowImportService:
         # Verify the workflow was updated
         wf_id = WorkflowUUID.new("wf_testworkflow001")
         stmt = select(Workflow).where(Workflow.id == wf_id)
-        result = await session.exec(stmt)
-        workflow = result.first()
+        result = await session.execute(stmt)
+        workflow = result.scalars().first()
         assert workflow is not None
         assert workflow.title == "Updated Import Workflow"
         assert workflow.description == "Updated description"
@@ -269,21 +352,85 @@ class TestWorkflowImportService:
         assert "core.http_request" in action_types
         assert "core.transform.reshape" in action_types
 
-        # Verify React Flow graph was regenerated
-        assert workflow.object is not None
-        rf_graph = RFGraph.model_validate(workflow.object)
-        assert len(rf_graph.nodes) >= 4  # trigger + 3 actions
+        # Verify workflow graph metadata still initialized
+        assert workflow.trigger_position_x == 0.0
+        assert workflow.trigger_position_y == 0.0
 
         # Verify a new workflow definition version was created
         stmt = (
             select(WorkflowDefinition)
             .where(WorkflowDefinition.workflow_id == wf_id)
-            .order_by(col(WorkflowDefinition.version).desc())
+            .order_by(WorkflowDefinition.version.desc())
         )
-        result = await session.exec(stmt)
-        definitions = result.all()
+        result = await session.execute(stmt)
+        definitions = result.scalars().all()
         assert len(definitions) == 2  # Original + updated
         assert definitions[0].version == 2  # Latest version
+
+    @pytest.mark.anyio
+    async def test_import_workflow_overwrite_refreshes_runtime_metadata(
+        self,
+        import_service: WorkflowImportService,
+        remote_workflow_definition: RemoteWorkflowDefinition,
+        session: AsyncSession,
+    ) -> None:
+        """Overwrite should refresh runtime-relevant draft workflow metadata."""
+        initial_dsl = remote_workflow_definition.definition.model_copy(deep=True)
+        initial_dsl.entrypoint = DSLEntrypoint(
+            ref="test_action",
+            expects={
+                "old_input": ExpectedField(type="str", description="Old input"),
+            },
+        )
+        initial_dsl.returns = "${{ ACTIONS.second_action.result }}"
+        initial_dsl.config = DSLConfig(environment="default", timeout=300)
+        initial_dsl.error_handler = "old_error_handler"
+
+        initial_remote = remote_workflow_definition.model_copy(deep=True)
+        initial_remote.definition = initial_dsl
+
+        first_result = await import_service.import_workflows_atomic(
+            remote_workflows=[initial_remote],
+            commit_sha="abc123",
+        )
+        assert first_result.success is True
+
+        updated_dsl = initial_dsl.model_copy(deep=True)
+        updated_dsl.entrypoint = DSLEntrypoint(
+            ref="second_action",
+            expects={
+                "new_input": ExpectedField(type="int", description="New input"),
+            },
+        )
+        updated_dsl.returns = {"wrapped": "${{ ACTIONS.second_action.result }}"}
+        updated_dsl.config = DSLConfig(environment="staging", timeout=900)
+        updated_dsl.error_handler = "new_error_handler"
+
+        updated_remote = remote_workflow_definition.model_copy(deep=True)
+        updated_remote.definition = updated_dsl
+
+        second_result = await import_service.import_workflows_atomic(
+            remote_workflows=[updated_remote],
+            commit_sha="def456",
+        )
+        assert second_result.success is True
+
+        wf_id = WorkflowUUID.new("wf_testworkflow001")
+        stmt = select(Workflow).where(Workflow.id == wf_id)
+        result = await session.execute(stmt)
+        workflow = result.scalars().first()
+        assert workflow is not None
+
+        assert workflow.expects == updated_dsl.entrypoint.model_dump().get("expects")
+        assert workflow.returns == updated_dsl.returns
+        assert workflow.config == updated_dsl.config.model_dump()
+        assert workflow.error_handler == "new_error_handler"
+
+        built_dsl = await import_service.wf_mgmt.build_dsl_from_workflow(workflow)
+        assert built_dsl.entrypoint.expects == updated_dsl.entrypoint.expects
+        assert built_dsl.returns == updated_dsl.returns
+        assert built_dsl.config == updated_dsl.config
+        assert built_dsl.error_handler == "new_error_handler"
 
     @pytest.mark.anyio
     async def test_import_workflow_overwrite_default_behavior(
@@ -318,10 +465,35 @@ class TestWorkflowImportService:
         import_service: WorkflowImportService,
         sample_dsl: DSLInput,
     ):
-        """Test the _create_actions_from_dsl helper method."""
+        """Test the create_actions_from_dsl helper method."""
+        # Create workflow first (actions require existing workflow due to FK constraint)
         workflow_id = WorkflowUUID.new("wf_testworkflowactions")
+        base_dsl = DSLInput(
+            title="Base Workflow",
+            description="Workflow for testing actions",
+            entrypoint=DSLEntrypoint(ref="placeholder"),
+            actions=[
+                ActionStatement(
+                    ref="placeholder",
+                    action="core.transform.transform",
+                    args={"value": "placeholder"},
+                    description="Placeholder",
+                )
+            ],
+        )
+        workflow = await import_service.wf_mgmt.create_db_workflow_from_dsl(
+            base_dsl, workflow_id=workflow_id, commit=False
+        )
+        # Remove the placeholder actions created by create_db_workflow_from_dsl
+        await import_service.session.refresh(workflow, ["actions"])
+        for action in workflow.actions:
+            await import_service.session.delete(action)
+        await import_service.session.flush()
 
-        actions = await import_service._create_actions_from_dsl(sample_dsl, workflow_id)
+        # Now test creating actions from DSL
+        actions = await import_service.wf_mgmt.create_actions_from_dsl(
+            sample_dsl, workflow_id
+        )
 
         assert len(actions) == 2
 
@@ -330,7 +502,7 @@ class TestWorkflowImportService:
         assert action1.description == "Transforms test data"
         assert action1.type == "core.transform.transform"
         assert action1.workflow_id == workflow_id
-        assert action1.owner_id == import_service.workspace_id
+        assert action1.workspace_id == import_service.workspace_id
 
         # Verify inputs are YAML serialized
         import yaml
@@ -373,8 +545,8 @@ class TestWorkflowImportService:
         wf_id = WorkflowUUID.new("wf_testworkflow001")
 
         stmt = select(Schedule).where(Schedule.workflow_id == wf_id)
-        result = await session.exec(stmt)
-        schedules = result.all()
+        result = await session.execute(stmt)
+        schedules = result.scalars().all()
         assert len(schedules) == 1
         original_schedule = schedules[0]
         assert original_schedule.cron == "0 */6 * * *"
@@ -403,8 +575,8 @@ class TestWorkflowImportService:
 
         # Verify old schedule was replaced with new ones
         stmt = select(Schedule).where(Schedule.workflow_id == wf_id)
-        result = await session.exec(stmt)
-        new_schedules = result.all()
+        result = await session.execute(stmt)
+        new_schedules = result.scalars().all()
         assert len(new_schedules) == 2
 
         # Verify schedule details
@@ -437,8 +609,8 @@ class TestWorkflowImportService:
         wf_id = WorkflowUUID.new("wf_testworkflow001")
 
         stmt = select(Schedule).where(Schedule.workflow_id == wf_id)
-        result = await session.exec(stmt)
-        schedules = result.all()
+        result = await session.execute(stmt)
+        schedules = result.scalars().all()
         assert len(schedules) == 0
 
     @pytest.mark.anyio
@@ -525,9 +697,11 @@ class TestWorkflowImportService:
         assert len(result.diagnostics) == 1
 
         # Verify NO workflows were imported (atomic rollback)
-        stmt = select(Workflow).where(Workflow.owner_id == import_service.workspace_id)
-        result = await session.exec(stmt)
-        workflows = result.all()
+        stmt = select(Workflow).where(
+            Workflow.workspace_id == import_service.workspace_id
+        )
+        result = await session.execute(stmt)
+        workflows = result.scalars().all()
         assert len(workflows) == 0  # Nothing should be imported
 
     @pytest.mark.anyio
@@ -573,11 +747,11 @@ class TestWorkflowImportService:
         wf2_id = WorkflowUUID.new("wf_testworkflow002")
 
         stmt1 = select(Workflow).where(Workflow.id == wf1_id)
-        result1 = await session.exec(stmt1)
-        workflow1 = result1.first()
+        result1 = await session.execute(stmt1)
+        workflow1 = result1.scalars().first()
         stmt2 = select(Workflow).where(Workflow.id == wf2_id)
-        result2 = await session.exec(stmt2)
-        workflow2 = result2.first()
+        result2 = await session.execute(stmt2)
+        workflow2 = result2.scalars().first()
 
         assert workflow1 is not None
         assert workflow2 is not None
@@ -617,9 +791,11 @@ class TestWorkflowImportService:
         )
 
         # Verify tags in database
-        stmt = select(Tag).where(Tag.owner_id == import_service.workspace_id)
-        result = await session.exec(stmt)
-        tags = result.all()
+        stmt = select(WorkflowTag).where(
+            WorkflowTag.workspace_id == import_service.workspace_id
+        )
+        result = await session.execute(stmt)
+        tags = result.scalars().all()
 
         tag_names = {tag.name for tag in tags}
         assert tag_names == {"test", "import", "second"}  # 3 unique tags total
@@ -629,9 +805,9 @@ class TestWorkflowImportService:
         assert len(test_tags) == 1  # Only one "test" tag should exist
 
         # Verify both workflows use the same "test" tag
-        stmt = select(WorkflowTag).where(WorkflowTag.tag_id == test_tags[0].id)
-        result = await session.exec(stmt)
-        workflow_tags = result.all()
+        stmt = select(WorkflowTagLink).where(WorkflowTagLink.tag_id == test_tags[0].id)
+        result = await session.execute(stmt)
+        workflow_tags = result.scalars().all()
         assert len(workflow_tags) == 2  # Both workflows should use this tag
 
     @pytest.mark.anyio

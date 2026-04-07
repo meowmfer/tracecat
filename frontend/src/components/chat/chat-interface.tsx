@@ -1,50 +1,94 @@
 "use client"
 
-import { formatDistanceToNow } from "date-fns"
-import { ChevronDown, MessageSquare, Plus } from "lucide-react"
+import { ChevronDown, Plus } from "lucide-react"
 import Link from "next/link"
 import { useEffect, useState } from "react"
-import type { ChatEntity, ChatRead } from "@/client"
+import type {
+  AgentPresetRead,
+  AgentPresetReadMinimal,
+  AgentSessionEntity,
+  AgentSessionsGetSessionVercelResponse,
+} from "@/client"
+import { ChatHistoryDropdown } from "@/components/chat/chat-history-dropdown"
 import { ChatSessionPane } from "@/components/chat/chat-session-pane"
 import { NoMessages } from "@/components/chat/messages"
 import { CenteredSpinner } from "@/components/loading/spinner"
-import { Button } from "@/components/ui/button"
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
-import { ScrollArea } from "@/components/ui/scroll-area"
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog"
+import { Button } from "@/components/ui/button"
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
-import { useCreateChat, useGetChatVercel, useListChats } from "@/hooks/use-chat"
-import type { ModelInfo } from "@/lib/chat"
+import { toast } from "@/components/ui/use-toast"
+import {
+  parseChatError,
+  useCreateChat,
+  useGetChatVercel,
+  useListChats,
+  useUpdateChat,
+} from "@/hooks/use-chat"
+import { useChatPresetManager } from "@/hooks/use-chat-preset-manager"
+import { useEntitlements } from "@/hooks/use-entitlements"
 import { useChatReadiness } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 interface ChatInterfaceProps {
   chatId?: string
-  entityType: ChatEntity
+  entityType: AgentSessionEntity
   entityId: string
   onChatSelect?: (chatId: string) => void
+  bodyClassName?: string
 }
+
+type PendingFirstMessage = {
+  chatId: string
+  text: string
+}
+
+type PresetConfigLike = Pick<
+  AgentPresetRead,
+  "model_name" | "model_provider" | "base_url"
+>
 
 export function ChatInterface({
   chatId,
   entityType,
   entityId,
   onChatSelect,
+  bodyClassName,
 }: ChatInterfaceProps) {
   const workspaceId = useWorkspaceId()
+  const { hasEntitlement } = useEntitlements()
+  const agentAddonsEnabled = hasEntitlement("agent_addons")
   const [selectedChatId, setSelectedChatId] = useState<string | undefined>(
     chatId
   )
+  const [newChatDialogOpen, setNewChatDialogOpen] = useState(false)
+  const [autoCreateAttempted, setAutoCreateAttempted] = useState(false)
+  const [isCaseDraftChat, setIsCaseDraftChat] = useState(false)
+  const [pendingFirstMessage, setPendingFirstMessage] =
+    useState<PendingFirstMessage | null>(null)
+
+  // Keep local selection aligned when a parent-driven chatId changes.
+  useEffect(() => {
+    setSelectedChatId(chatId)
+    if (chatId) {
+      setIsCaseDraftChat(false)
+    }
+  }, [chatId])
 
   const { chats, chatsLoading, chatsError } = useListChats({
     workspaceId: workspaceId,
@@ -55,24 +99,103 @@ export function ChatInterface({
   // Create chat mutation
   const { createChat, createChatPending } = useCreateChat(workspaceId)
 
-  /* chat readiness -------------------- */
-  const {
-    ready: chatReady,
-    loading: chatReadyLoading,
-    reason: chatReason,
-    modelInfo,
-  } = useChatReadiness()
+  const { chat, chatLoading, chatError } = useGetChatVercel({
+    chatId: selectedChatId,
+    workspaceId,
+  })
+  const { updateChat, isUpdating } = useUpdateChat(workspaceId)
 
-  // Set the first chat as selected when chats are loaded and no chat is selected
+  const presetsEnabled =
+    agentAddonsEnabled && (entityType === "case" || entityType === "copilot")
+
+  const {
+    presets: presetOptions,
+    presetsIsLoading,
+    presetsError,
+    selectedPreset,
+    selectedPresetConfig,
+    selectedPresetId: effectivePresetId,
+    selectedPresetVersionId,
+    handlePresetChange,
+    presetMenuLabel,
+    presetMenuDisabled,
+    showPresetSpinner,
+  } = useChatPresetManager({
+    workspaceId,
+    chat,
+    updateChat,
+    isUpdatingChat: isUpdating,
+    chatLoading,
+    selectedChatId,
+    enabled: presetsEnabled,
+  })
+  const activePreset = selectedPresetConfig ?? selectedPreset
+
   useEffect(() => {
-    if (chats && chats.length > 0 && !selectedChatId) {
+    setAutoCreateAttempted(false)
+    setIsCaseDraftChat(false)
+    setPendingFirstMessage(null)
+  }, [entityType, entityId])
+
+  // Auto-select the first chat when available.
+  // For non-case entities we preserve the legacy behavior of creating a chat
+  // automatically when none exists.
+  useEffect(() => {
+    if (!chats || chatsLoading || createChatPending) return
+
+    if (
+      chats.length > 0 &&
+      !selectedChatId &&
+      !(entityType === "case" && isCaseDraftChat)
+    ) {
+      // Select first existing chat
       const firstChatId = chats[0].id
       setSelectedChatId(firstChatId)
       onChatSelect?.(firstChatId)
+    } else if (
+      entityType !== "case" &&
+      chats.length === 0 &&
+      !selectedChatId &&
+      !autoCreateAttempted
+    ) {
+      // Auto-create a chat session immediately
+      setAutoCreateAttempted(true)
+      createChat({
+        title: "Chat 1",
+        entity_type: entityType,
+        entity_id: entityId,
+      })
+        .then((newChat) => {
+          setSelectedChatId(newChat.id)
+          onChatSelect?.(newChat.id)
+        })
+        .catch((error) => {
+          console.error("Failed to auto-create chat:", error)
+        })
     }
-  }, [chats, selectedChatId, onChatSelect])
+  }, [
+    chats,
+    chatsLoading,
+    selectedChatId,
+    onChatSelect,
+    createChat,
+    createChatPending,
+    entityType,
+    entityId,
+    autoCreateAttempted,
+    isCaseDraftChat,
+  ])
 
   const handleCreateChat = async () => {
+    setNewChatDialogOpen(false)
+
+    if (entityType === "case") {
+      setIsCaseDraftChat(true)
+      setPendingFirstMessage(null)
+      setSelectedChatId(undefined)
+      return
+    }
+
     try {
       const newChat = await createChat({
         title: `Chat ${(chats?.length || 0) + 1}`,
@@ -86,32 +209,57 @@ export function ChatInterface({
     }
   }
 
+  const handleCreateCaseChatOnFirstSend = async (
+    messageText: string,
+    selectedTools?: string[]
+  ) => {
+    if (entityType !== "case" || createChatPending) {
+      return null
+    }
+
+    try {
+      const newChat = await createChat({
+        title: `Chat ${(chats?.length || 0) + 1}`,
+        entity_type: "case",
+        entity_id: entityId,
+        tools: selectedTools,
+        agent_preset_id: effectivePresetId,
+        agent_preset_version_id: selectedPresetVersionId,
+      })
+
+      setIsCaseDraftChat(false)
+      setSelectedChatId(newChat.id)
+      setPendingFirstMessage({
+        chatId: newChat.id,
+        text: messageText,
+      })
+      onChatSelect?.(newChat.id)
+      return newChat.id
+    } catch (error) {
+      console.error("Failed to create case chat on first message:", error)
+      toast({
+        title: "Failed to create chat",
+        description: parseChatError(error),
+        variant: "destructive",
+      })
+      return null
+    }
+  }
+
   const handleSelectChat = (chatId: string) => {
+    setIsCaseDraftChat(false)
     setSelectedChatId(chatId)
     onChatSelect?.(chatId)
   }
 
-  // Show empty state if no chats exist
-  if (chats && chats.length === 0) {
+  // Show loading while chats are loading or being auto-created
+  if (
+    chatsLoading ||
+    (entityType !== "case" && chats && chats.length === 0 && createChatPending)
+  ) {
     return (
-      <div className="flex h-full flex-col">
-        {/* Empty State */}
-        <div className="flex h-full items-center justify-center p-8">
-          <div className="text-center max-w-sm">
-            <MessageSquare className="mx-auto h-8 w-8 text-gray-400 mb-3" />
-            <h4 className="text-sm font-medium text-gray-900 mb-1">
-              No chat sessions
-            </h4>
-            <p className="text-xs text-gray-500 mb-4">
-              Create a chat session to start conversing with the AI assistant
-              about this {entityType}.
-            </p>
-            <Button onClick={handleCreateChat} disabled={createChatPending}>
-              <Plus className="h-3 w-3 mr-1" />
-              Create chat session
-            </Button>
-          </div>
-        </div>
+      <div className="flex h-full items-center justify-center">
+        <CenteredSpinner />
       </div>
     )
   }
@@ -123,90 +271,107 @@ export function ChatInterface({
         <div className="flex items-center justify-between">
           {/* Unified New-chat / History dropdown */}
           <div className="flex items-center gap-2">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button size="sm" variant="ghost" className="px-2">
-                  Conversations
-                  <ChevronDown className="size-3 ml-1" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" className="w-64">
-                {chatsLoading ? (
-                  <div className="p-2">
-                    <div className="space-y-2">
-                      <div className="h-8 bg-muted animate-pulse rounded" />
-                      <div className="h-8 bg-muted animate-pulse rounded" />
-                    </div>
-                  </div>
-                ) : chatsError ? (
-                  <DropdownMenuItem disabled>
-                    <span className="text-red-600">Failed to load chats</span>
-                  </DropdownMenuItem>
-                ) : (
-                  <ScrollArea className="max-h-64">
-                    {chats?.map((chat: ChatRead) => (
-                      <DropdownMenuItem
-                        key={chat.id}
-                        onClick={() => handleSelectChat(chat.id)}
-                        className={cn(
-                          "flex items-center justify-between cursor-pointer",
-                          selectedChatId === chat.id && "bg-accent"
-                        )}
-                      >
-                        <div className="flex-1 min-w-0">
-                          <div className="text-sm font-medium truncate">
-                            {chat.title}
-                          </div>
-                          <div className="text-xs text-muted-foreground">
-                            {formatDistanceToNow(new Date(chat.created_at), {
-                              addSuffix: true,
-                            })}
-                          </div>
-                        </div>
-                      </DropdownMenuItem>
-                    ))}
-                  </ScrollArea>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <ChatHistoryDropdown
+              chats={chats}
+              isLoading={chatsLoading}
+              error={chatsError}
+              selectedChatId={selectedChatId}
+              onSelectChat={handleSelectChat}
+            />
 
             {/* (left-side plus removed) */}
           </div>
 
-          {/* Right-side controls: new chat + actions */}
+          {/* Right-side actions */}
           <div className="flex items-center gap-1">
             {/* New chat icon button with tooltip */}
-            <TooltipProvider delayDuration={0}>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="size-6 p-0"
-                    onClick={handleCreateChat}
-                    disabled={createChatPending}
-                  >
-                    <Plus className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">New chat</TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
+            <AlertDialog
+              open={newChatDialogOpen}
+              onOpenChange={setNewChatDialogOpen}
+            >
+              <TooltipProvider delayDuration={0}>
+                <Tooltip>
+                  <AlertDialogTrigger asChild>
+                    <TooltipTrigger asChild>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="size-6 p-0"
+                        disabled={createChatPending}
+                      >
+                        <Plus className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                  </AlertDialogTrigger>
+                  <TooltipContent side="bottom">New chat</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Start a new chat?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    {entityType === "case"
+                      ? "This opens a fresh case chat draft. A new conversation will be created after you send your first message."
+                      : "This will create a new conversation. Your current chat will remain accessible from the conversations menu."}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction onClick={() => void handleCreateChat()}>
+                    Start new chat
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </div>
         </div>
       </div>
 
       {/* Chat Body */}
-      <div className="flex flex-1 min-h-0 flex-col">
+      <div className={cn("flex flex-1 min-h-0 flex-col", bodyClassName)}>
         <ChatBody
           chatId={selectedChatId}
           workspaceId={workspaceId}
           entityType={entityType}
           entityId={entityId}
-          chatReady={chatReady}
-          chatReadyLoading={chatReadyLoading}
-          chatReason={chatReason}
-          modelInfo={modelInfo}
+          chat={chat}
+          chatLoading={chatLoading}
+          chatError={chatError}
+          selectedPreset={activePreset}
+          toolsEnabled={!activePreset}
+          draftMode={
+            entityType === "case" && (isCaseDraftChat || chats?.length === 0)
+          }
+          presetSelector={
+            presetsEnabled
+              ? {
+                  label: presetMenuLabel,
+                  presets: presetOptions,
+                  presetsError,
+                  presetsIsLoading,
+                  selectedPresetId: effectivePresetId,
+                  disabled: presetMenuDisabled,
+                  showSpinner: showPresetSpinner,
+                  noPresetDescription:
+                    "Use workspace default case agent instructions.",
+                  onSelect: (presetId) => void handlePresetChange(presetId),
+                }
+              : undefined
+          }
+          onCreateSessionBeforeSend={
+            entityType === "case" ? handleCreateCaseChatOnFirstSend : undefined
+          }
+          draftInputDisabled={createChatPending}
+          pendingMessage={
+            selectedChatId && pendingFirstMessage?.chatId === selectedChatId
+              ? pendingFirstMessage.text
+              : null
+          }
+          onPendingMessageSent={() =>
+            setPendingFirstMessage((current) =>
+              current?.chatId === selectedChatId ? null : current
+            )
+          }
         />
       </div>
     </div>
@@ -216,12 +381,32 @@ export function ChatInterface({
 interface ChatBodyProps {
   chatId?: string
   workspaceId: string
-  entityType: ChatEntity
+  entityType: AgentSessionEntity
   entityId: string
-  chatReady: boolean
-  chatReadyLoading: boolean
-  chatReason?: string
-  modelInfo?: ModelInfo
+  chat?: AgentSessionsGetSessionVercelResponse
+  chatLoading: boolean
+  chatError: unknown
+  selectedPreset?: PresetConfigLike
+  toolsEnabled: boolean
+  draftMode: boolean
+  presetSelector?: {
+    label: string
+    presets?: AgentPresetReadMinimal[]
+    presetsIsLoading: boolean
+    presetsError: unknown
+    selectedPresetId: string | null
+    onSelect: (presetId: string | null) => void | Promise<void>
+    disabled?: boolean
+    showSpinner?: boolean
+    noPresetDescription?: string
+  }
+  onCreateSessionBeforeSend?: (
+    messageText: string,
+    selectedTools?: string[]
+  ) => Promise<string | null>
+  draftInputDisabled: boolean
+  pendingMessage: string | null
+  onPendingMessageSent: () => void
 }
 
 function ChatBody({
@@ -229,15 +414,34 @@ function ChatBody({
   workspaceId,
   entityType,
   entityId,
-  chatReady,
-  chatReadyLoading,
-  chatReason,
-  modelInfo,
+  chat,
+  chatLoading,
+  chatError,
+  selectedPreset,
+  toolsEnabled,
+  draftMode,
+  presetSelector,
+  onCreateSessionBeforeSend,
+  draftInputDisabled,
+  pendingMessage,
+  onPendingMessageSent,
 }: ChatBodyProps) {
-  const { chat, chatLoading, chatError } = useGetChatVercel({
-    chatId,
-    workspaceId,
-  })
+  const {
+    ready: chatReady,
+    loading: chatReadyLoading,
+    reason: chatReason,
+    modelInfo,
+  } = useChatReadiness(
+    selectedPreset
+      ? {
+          modelOverride: {
+            name: selectedPreset.model_name,
+            provider: selectedPreset.model_provider,
+            baseUrl: selectedPreset.base_url ?? null,
+          },
+        }
+      : undefined
+  )
 
   if (chatError) {
     return (
@@ -247,8 +451,7 @@ function ChatBody({
     )
   }
 
-  // Render loading state while checking if chat is selected
-  if (!chatId || chatReadyLoading || chatLoading || !chat) {
+  if (chatReadyLoading || (chatId && chatLoading)) {
     return (
       <div className="flex h-full items-center justify-center">
         <CenteredSpinner />
@@ -288,6 +491,40 @@ function ChatBody({
     )
   }
 
+  if (!chatId) {
+    if (!draftMode || !onCreateSessionBeforeSend) {
+      return (
+        <div className="flex h-full items-center justify-center">
+          <CenteredSpinner />
+        </div>
+      )
+    }
+
+    return (
+      <ChatSessionPane
+        workspaceId={workspaceId}
+        entityType={entityType}
+        entityId={entityId}
+        placeholder={`Ask about this ${entityType}...`}
+        className="flex-1 min-h-0"
+        modelInfo={modelInfo}
+        toolsEnabled={toolsEnabled}
+        presetSelector={presetSelector}
+        onBeforeSend={onCreateSessionBeforeSend}
+        inputDisabled={draftInputDisabled}
+        inputDisabledPlaceholder="Creating chat..."
+      />
+    )
+  }
+
+  if (!chat) {
+    return (
+      <div className="flex h-full items-center justify-center">
+        <CenteredSpinner />
+      </div>
+    )
+  }
+
   return (
     <ChatSessionPane
       chat={chat}
@@ -297,6 +534,10 @@ function ChatBody({
       placeholder={`Ask about this ${entityType}...`}
       className="flex-1 min-h-0"
       modelInfo={modelInfo}
+      toolsEnabled={toolsEnabled}
+      presetSelector={presetSelector}
+      pendingMessage={pendingMessage ?? undefined}
+      onPendingMessageSent={onPendingMessageSent}
     />
   )
 }

@@ -1,33 +1,67 @@
+import re
 import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from typing import cast as typing_cast
 
 import sqlalchemy as sa
 from asyncpg import UndefinedColumnError
+from pydantic import ValidationError
+from sqlalchemy import and_, cast, func, or_, select
+from sqlalchemy.dialects.postgresql import UUID, insert
 from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.orm import aliased, selectinload
-from sqlmodel import and_, cast, col, desc, func, or_, select
-from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.sql.elements import ColumnElement
 
-from tracecat.auth.models import UserRead
+from tracecat.audit.enums import AuditEventStatus
+from tracecat.audit.logger import audit_log
+from tracecat.audit.service import AuditService
+from tracecat.auth.schemas import UserRead
+from tracecat.auth.types import Role
+from tracecat.authz.controls import get_missing_scopes, require_scope
 from tracecat.cases.attachments import CaseAttachmentService
+from tracecat.cases.dropdowns.schemas import (
+    CaseDropdownValueInput,
+    CaseDropdownValueRead,
+)
+from tracecat.cases.dropdowns.service import CaseDropdownValuesService
+from tracecat.cases.durations.service import CaseDurationService
 from tracecat.cases.enums import (
+    CaseEventType,
     CasePriority,
     CaseSeverity,
     CaseStatus,
+    CaseTaskStatus,
 )
-from tracecat.cases.models import (
+from tracecat.cases.schemas import (
     AssigneeChangedEvent,
     CaseCommentCreate,
+    CaseCommentRead,
+    CaseCommentThreadRead,
     CaseCommentUpdate,
+    CaseCommentWorkflowRead,
+    CaseCommentWorkflowStatus,
     CaseCreate,
     CaseEventVariant,
     CaseFieldCreate,
     CaseFieldUpdate,
     CaseReadMinimal,
+    CaseSearchAggregateRead,
+    CaseStatusGroupCounts,
+    CaseTaskCreate,
+    CaseTaskUpdate,
     CaseUpdate,
+    CaseViewedEvent,
     ClosedEvent,
+    CommentCreatedEvent,
+    CommentDeletedEvent,
+    CommentReplyCreatedEvent,
+    CommentReplyDeletedEvent,
+    CommentReplyUpdatedEvent,
+    CommentUpdatedEvent,
     CreatedEvent,
     FieldDiff,
     FieldsChangedEvent,
@@ -36,32 +70,58 @@ from tracecat.cases.models import (
     ReopenedEvent,
     SeverityChangedEvent,
     StatusChangedEvent,
+    TaskAssigneeChangedEvent,
+    TaskCreatedEvent,
+    TaskDeletedEvent,
+    TaskPriorityChangedEvent,
+    TaskStatusChangedEvent,
+    TaskWorkflowChangedEvent,
     UpdatedEvent,
+    _normalize_case_field_read_type,
 )
-from tracecat.cases.tags.models import CaseTagRead
+from tracecat.cases.tags.schemas import CaseTagRead
 from tracecat.cases.tags.service import CaseTagsService
+from tracecat.cases.triggers.publisher import publish_case_event_payload
 from tracecat.contexts import ctx_run
-from tracecat.db.schemas import (
+from tracecat.custom_fields import CustomFieldsService
+from tracecat.custom_fields.schemas import CustomFieldUpdate
+from tracecat.db.models import (
     Case,
     CaseComment,
+    CaseDropdownDefinition,
+    CaseDropdownOption,
+    CaseDropdownValue,
     CaseEvent,
     CaseFields,
     CaseTagLink,
+    CaseTask,
     User,
+    Workflow,
 )
-from tracecat.service import BaseWorkspaceService
-from tracecat.tables.service import TableEditorService, TablesService
-from tracecat.types.auth import Role
-from tracecat.types.exceptions import (
+from tracecat.db.session_events import add_after_commit_callback
+from tracecat.exceptions import (
+    EntitlementRequired,
+    ScopeDeniedError,
     TracecatAuthorizationError,
     TracecatException,
     TracecatNotFoundError,
+    TracecatValidationError,
 )
-from tracecat.types.pagination import (
+from tracecat.expressions.expectations import (
+    ExpectedField,
+    create_expectation_model,
+)
+from tracecat.identifiers.workflow import AnyWorkflowID, WorkflowUUID, generate_exec_id
+from tracecat.pagination import (
     BaseCursorPaginator,
     CursorPaginatedResponse,
     CursorPaginationParams,
 )
+from tracecat.service import BaseWorkspaceService, requires_entitlement
+from tracecat.tables.common import normalize_column_options
+from tracecat.tables.enums import SqlType
+from tracecat.tables.service import DYNAMIC_WORKSPACE_TENANT_COLUMN, TablesService
+from tracecat.tiers.enums import Entitlement
 
 
 def _normalize_filter_values(values: Any) -> list[Any]:
@@ -79,6 +139,57 @@ def _normalize_filter_values(values: Any) -> list[Any]:
     return [values]
 
 
+_COMMENT_TOMBSTONE_CONTENT = "Comment deleted"
+
+
+def _is_field_value_empty(value: Any) -> bool:
+    """Check if a custom field value is empty for closure validation.
+
+    Empty means None, whitespace-only string, empty list, or empty dict.
+    False and 0 are valid (non-empty) values.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    if isinstance(value, (list, dict)) and not value:
+        return True
+    return False
+
+
+# Semantic sort order for enum-backed case fields.
+CASE_PRIORITY_SORT_ORDER = tuple(priority.value for priority in CasePriority)
+CASE_SEVERITY_SORT_ORDER = tuple(severity.value for severity in CaseSeverity)
+CASE_STATUS_SORT_ORDER = tuple(status.value for status in CaseStatus)
+SHORT_ID_PATTERN = re.compile(r"^(?:CASE-)?(\d{1,10})$", re.IGNORECASE)
+
+
+def _enum_sort_expr(column: Any, ordered_values: Sequence[str]) -> ColumnElement[int]:
+    """Build a SQL expression that sorts enum/text values by semantic order."""
+    return sa.case(
+        *[
+            (column == enum_value, index)
+            for index, enum_value in enumerate(ordered_values)
+        ],
+        else_=len(ordered_values),
+    )
+
+
+def _enum_sort_rank(value: Any, ordered_values: Sequence[str]) -> int:
+    """Map enum/text values to their semantic sort rank."""
+    normalized_value = getattr(value, "value", value)
+    if not isinstance(normalized_value, str):
+        return len(ordered_values)
+    try:
+        return ordered_values.index(normalized_value)
+    except ValueError:
+        return len(ordered_values)
+
+
+# Treat multiple views inside this window as a single "view" to avoid spam.
+CASE_VIEW_EVENT_DEDUP_WINDOW = timedelta(minutes=5)
+
+
 class CasesService(BaseWorkspaceService):
     service_name = "cases"
 
@@ -89,170 +200,405 @@ class CasesService(BaseWorkspaceService):
         self.events = CaseEventsService(session=self.session, role=self.role)
         self.attachments = CaseAttachmentService(session=self.session, role=self.role)
         self.tags = CaseTagsService(session=self.session, role=self.role)
+        self.dropdowns = CaseDropdownValuesService(session=self.session, role=self.role)
 
-    async def list_cases(
-        self,
-        limit: int | None = None,
-        order_by: Literal["created_at", "updated_at", "priority", "severity", "status"]
-        | None = None,
-        sort: Literal["asc", "desc"] | None = None,
-    ) -> Sequence[Case]:
-        statement = select(Case).where(Case.owner_id == self.workspace_id)
-        if limit is not None:
-            statement = statement.limit(limit)
-        if order_by is not None:
-            attr = getattr(Case, order_by)
-            if sort == "asc":
-                statement = statement.order_by(attr.asc())
-            elif sort == "desc":
-                statement = statement.order_by(attr.desc())
-            else:
-                statement = statement.order_by(attr)
-        result = await self.session.exec(statement)
-        return result.all()
+    async def get_task_counts(
+        self, case_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, dict[str, int]]:
+        """Get task counts (completed/total) for cases."""
+        if not case_ids:
+            return {}
 
-    async def list_cases_paginated(
+        stmt = (
+            select(
+                CaseTask.case_id,
+                func.count().label("total"),
+                func.sum(
+                    sa.case((CaseTask.status == CaseTaskStatus.COMPLETED, 1), else_=0)
+                ).label("completed"),
+            )
+            .where(CaseTask.case_id.in_(case_ids))
+            .group_by(CaseTask.case_id)
+        )
+
+        result = await self.session.execute(stmt)
+        rows = result.tuples().all()
+
+        # Build result dict with defaults for cases without tasks
+        counts = {case_id: {"completed": 0, "total": 0} for case_id in case_ids}
+        for case_id, total, completed in rows:
+            counts[case_id] = {
+                "completed": int(completed or 0),
+                "total": int(total or 0),
+            }
+
+        return counts
+
+    def _build_search_filters(
         self,
-        params: CursorPaginationParams,
+        *,
         search_term: str | None = None,
+        short_id: str | None = None,
         status: CaseStatus | Sequence[CaseStatus] | None = None,
         priority: CasePriority | Sequence[CasePriority] | None = None,
         severity: CaseSeverity | Sequence[CaseSeverity] | None = None,
         assignee_ids: Sequence[uuid.UUID] | None = None,
         include_unassigned: bool = False,
         tag_ids: list[uuid.UUID] | None = None,
-    ) -> CursorPaginatedResponse[CaseReadMinimal]:
-        """List cases with cursor-based pagination and filtering."""
-        paginator = BaseCursorPaginator(self.session)
+        dropdown_filters: dict[str, list[str]] | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        updated_before: datetime | None = None,
+        updated_after: datetime | None = None,
+    ) -> list[Any]:
+        filters: list[Any] = [Case.workspace_id == self.workspace_id]
 
-        # Get estimated total count from table statistics
-        total_estimate = await paginator.get_table_row_estimate("cases")
-
-        # Base query with workspace filter - eagerly load tags and assignee
-        stmt = (
-            select(Case)
-            .where(Case.owner_id == self.workspace_id)
-            .options(selectinload(Case.tags))  # type: ignore
-            .options(selectinload(Case.assignee))  # type: ignore
-            .order_by(col(Case.created_at).desc(), col(Case.id).desc())
-        )
-
-        # Apply search term filter
         if search_term:
-            # Validate search term to prevent abuse
             if len(search_term) > 1000:
                 raise ValueError("Search term cannot exceed 1000 characters")
             if "\x00" in search_term:
                 raise ValueError("Search term cannot contain null bytes")
 
-            # Use SQLAlchemy's concat function for proper parameter binding
             search_pattern = func.concat("%", search_term, "%")
-            stmt = stmt.where(
+            short_id_expr = func.concat(
+                "CASE-", func.lpad(cast(Case.case_number, sa.String), 4, "0")
+            )
+            filters.append(
                 or_(
-                    col(Case.summary).ilike(search_pattern),
-                    col(Case.description).ilike(search_pattern),
+                    Case.summary.ilike(search_pattern),
+                    Case.description.ilike(search_pattern),
+                    short_id_expr.ilike(search_pattern),
                 )
             )
 
+        if short_id:
+            normalized_short_id = short_id.strip().upper()
+            if len(normalized_short_id) > 1000:
+                raise ValueError("Short ID cannot exceed 1000 characters")
+            if "\x00" in normalized_short_id:
+                raise ValueError("Short ID cannot contain null bytes")
+
+            match = SHORT_ID_PATTERN.match(normalized_short_id)
+            if not match:
+                raise ValueError("Short ID must match CASE-<number> or <number>")
+
+            short_id_number = int(match.group(1))
+            filters.append(Case.case_number == short_id_number)
+
         normalized_statuses = _normalize_filter_values(status)
         if normalized_statuses:
-            stmt = stmt.where(col(Case.status).in_(normalized_statuses))
+            filters.append(Case.status.in_(normalized_statuses))
 
-        # Apply priority filter
         normalized_priorities = _normalize_filter_values(priority)
         if normalized_priorities:
-            stmt = stmt.where(col(Case.priority).in_(normalized_priorities))
+            filters.append(Case.priority.in_(normalized_priorities))
 
-        # Apply severity filter
         normalized_severities = _normalize_filter_values(severity)
         if normalized_severities:
-            stmt = stmt.where(col(Case.severity).in_(normalized_severities))
+            filters.append(Case.severity.in_(normalized_severities))
 
-        # Apply assignee filter
-        if include_unassigned or assignee_ids:
-            unique_assignees = list(dict.fromkeys(assignee_ids or []))
-            assignee_conditions: list[Any] = []
+        unique_assignees = list(dict.fromkeys(assignee_ids or []))
+        assignee_conditions: list[Any] = []
+        if unique_assignees:
+            assignee_conditions.append(Case.assignee_id.in_(unique_assignees))
+        if include_unassigned:
+            assignee_conditions.append(Case.assignee_id.is_(None))
+        if assignee_conditions:
+            assignee_clause = (
+                assignee_conditions[0]
+                if len(assignee_conditions) == 1
+                else or_(*assignee_conditions)
+            )
+            filters.append(assignee_clause)
 
-            if unique_assignees:
-                assignee_conditions.append(col(Case.assignee_id).in_(unique_assignees))
-
-            if include_unassigned:
-                assignee_conditions.append(col(Case.assignee_id).is_(None))
-
-            if assignee_conditions:
-                if len(assignee_conditions) == 1:
-                    stmt = stmt.where(assignee_conditions[0])
-                else:
-                    stmt = stmt.where(or_(*assignee_conditions))
-
-        # Apply tag filtering if tag_ids provided (AND logic - case must have all tags)
         if tag_ids:
-            for tag_id in tag_ids:
-                stmt = stmt.where(
-                    col(Case.id).in_(
-                        select(CaseTagLink.case_id).where(CaseTagLink.tag_id == tag_id)
+            filters.append(
+                Case.id.in_(
+                    select(CaseTagLink.case_id).where(CaseTagLink.tag_id.in_(tag_ids))
+                )
+            )
+
+        if dropdown_filters:
+            for def_ref, option_refs in dropdown_filters.items():
+                if not option_refs:
+                    continue
+                filters.append(
+                    Case.id.in_(
+                        select(CaseDropdownValue.case_id)
+                        .join(
+                            CaseDropdownDefinition,
+                            CaseDropdownValue.definition_id
+                            == CaseDropdownDefinition.id,
+                        )
+                        .join(
+                            CaseDropdownOption,
+                            CaseDropdownValue.option_id == CaseDropdownOption.id,
+                        )
+                        .where(
+                            CaseDropdownDefinition.ref == def_ref,
+                            CaseDropdownOption.ref.in_(option_refs),
+                        )
                     )
                 )
 
-        # Apply cursor filtering
+        if start_time is not None:
+            filters.append(Case.created_at >= start_time)
+
+        if end_time is not None:
+            filters.append(Case.created_at <= end_time)
+
+        if updated_after is not None:
+            filters.append(Case.updated_at >= updated_after)
+
+        if updated_before is not None:
+            filters.append(Case.updated_at <= updated_before)
+
+        return filters
+
+    async def search_cases(
+        self,
+        params: CursorPaginationParams,
+        search_term: str | None = None,
+        short_id: str | None = None,
+        status: CaseStatus | Sequence[CaseStatus] | None = None,
+        priority: CasePriority | Sequence[CasePriority] | None = None,
+        severity: CaseSeverity | Sequence[CaseSeverity] | None = None,
+        assignee_ids: Sequence[uuid.UUID] | None = None,
+        include_unassigned: bool = False,
+        tag_ids: list[uuid.UUID] | None = None,
+        dropdown_filters: dict[str, list[str]] | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        updated_before: datetime | None = None,
+        updated_after: datetime | None = None,
+        order_by: Literal[
+            "created_at", "updated_at", "priority", "severity", "status", "tasks"
+        ]
+        | None = None,
+        sort: Literal["asc", "desc"] | None = None,
+    ) -> CursorPaginatedResponse[CaseReadMinimal]:
+        """Search cases with cursor-based pagination and filtering."""
+        paginator = BaseCursorPaginator(self.session)
+        filters = self._build_search_filters(
+            search_term=search_term,
+            short_id=short_id,
+            status=status,
+            priority=priority,
+            severity=severity,
+            assignee_ids=assignee_ids,
+            include_unassigned=include_unassigned,
+            tag_ids=tag_ids,
+            # Search uses parsed filter expressions keyed by dropdown definition ref
+            # (converted from `dropdown=definition_ref:option_ref` query params).
+            dropdown_filters=dropdown_filters,
+            start_time=start_time,
+            end_time=end_time,
+            updated_before=updated_before,
+            updated_after=updated_after,
+        )
+
+        # Base query - eagerly load tags, assignee, and dropdown values
+        stmt = (
+            select(Case)
+            .options(selectinload(Case.tags))
+            .options(selectinload(Case.assignee))
+            .options(
+                selectinload(Case.dropdown_values).selectinload(
+                    CaseDropdownValue.definition
+                )
+            )
+            .options(
+                selectinload(Case.dropdown_values).selectinload(
+                    CaseDropdownValue.option
+                )
+            )
+        )
+
+        for clause in filters:
+            stmt = stmt.where(clause)
+
+        # Compute total count with applied filters (workspace scoped)
+        count_stmt = select(func.count()).select_from(Case)
+        for clause in filters:
+            count_stmt = count_stmt.where(clause)
+
+        total_count = await self.session.scalar(count_stmt)
+        total_estimate = int(total_count or 0)
+
+        # Determine sort column and direction
+        sort_column = order_by or "created_at"
+        sort_direction = sort or "desc"
+
+        # Map computed properties to their underlying columns
+        if sort_column == "short_id":
+            sort_column = "case_number"
+
+        # Validate and get sort attribute
+        # For "tasks", use a correlated subquery; for enum fields, sort by semantic rank.
+        task_count_expr: ColumnElement[int] | None = None
+        enum_sort_values: Sequence[str] | None = None
+        if sort_column == "tasks":
+            task_count_expr = func.coalesce(
+                select(func.count())
+                .where(CaseTask.case_id == Case.id)
+                .correlate(Case)
+                .scalar_subquery(),
+                0,
+            )
+            sort_attr = task_count_expr
+        elif sort_column == "priority":
+            enum_sort_values = CASE_PRIORITY_SORT_ORDER
+            sort_attr = _enum_sort_expr(Case.priority, enum_sort_values)
+        elif sort_column == "severity":
+            enum_sort_values = CASE_SEVERITY_SORT_ORDER
+            sort_attr = _enum_sort_expr(Case.severity, enum_sort_values)
+        elif sort_column == "status":
+            enum_sort_values = CASE_STATUS_SORT_ORDER
+            sort_attr = _enum_sort_expr(Case.status, enum_sort_values)
+        else:
+            sort_attr = getattr(Case, sort_column)
+
+        # Apply cursor-based pagination with sort-column-aware filtering
+        # The cursor stores (sort_column, sort_value, created_at, id) for proper pagination
         if params.cursor:
             cursor_data = paginator.decode_cursor(params.cursor)
-            cursor_time = cursor_data.created_at
             cursor_id = uuid.UUID(cursor_data.id)
 
-            if params.reverse:
-                stmt = stmt.where(
-                    or_(
-                        col(Case.created_at) > cursor_time,
-                        and_(
-                            col(Case.created_at) == cursor_time,
-                            col(Case.id) > cursor_id,
-                        ),
-                    )
-                ).order_by(col(Case.created_at).asc(), col(Case.id).asc())
+            # Check if cursor was created with the same sort column (for proper pagination)
+            cursor_sort_value = cursor_data.sort_value
+            cursor_has_sort_value = (
+                cursor_data.sort_column == sort_column and cursor_sort_value is not None
+            )
+            if cursor_has_sort_value and sort_column == "tasks":
+                cursor_has_sort_value = isinstance(cursor_sort_value, int)
+            elif cursor_has_sort_value and enum_sort_values is not None:
+                cursor_has_sort_value = isinstance(cursor_sort_value, int)
+
+            if cursor_has_sort_value:
+                sort_filter_col = sort_attr
+                sort_cursor_value = cursor_sort_value
+
+                # Composite filtering: (sort_col, id) matches ORDER BY
+                # Use id as tie-breaker since it's always unique
+                if sort_direction == "asc":
+                    if params.reverse:
+                        # Going backward: get records before cursor in sort order
+                        stmt = stmt.where(
+                            or_(
+                                sort_filter_col < sort_cursor_value,
+                                and_(
+                                    sort_filter_col == sort_cursor_value,
+                                    Case.id < cursor_id,
+                                ),
+                            )
+                        )
+                    else:
+                        # Going forward: get records after cursor in sort order
+                        stmt = stmt.where(
+                            or_(
+                                sort_filter_col > sort_cursor_value,
+                                and_(
+                                    sort_filter_col == sort_cursor_value,
+                                    Case.id > cursor_id,
+                                ),
+                            )
+                        )
+                else:
+                    # Descending order
+                    if params.reverse:
+                        # Going backward: get records after cursor in sort order
+                        stmt = stmt.where(
+                            or_(
+                                sort_filter_col > sort_cursor_value,
+                                and_(
+                                    sort_filter_col == sort_cursor_value,
+                                    Case.id > cursor_id,
+                                ),
+                            )
+                        )
+                    else:
+                        # Going forward: get records before cursor in sort order
+                        stmt = stmt.where(
+                            or_(
+                                sort_filter_col < sort_cursor_value,
+                                and_(
+                                    sort_filter_col == sort_cursor_value,
+                                    Case.id < cursor_id,
+                                ),
+                            )
+                        )
+
+        # Apply sorting: (sort_col, id) for stable pagination
+        # Use id as tie-breaker unless we're already sorting by id
+        if sort_column == "id":
+            # No tie-breaker needed when sorting by id (already unique)
+            if sort_direction == "asc":
+                stmt = stmt.order_by(sort_attr.asc())
             else:
-                stmt = stmt.where(
-                    or_(
-                        col(Case.created_at) < cursor_time,
-                        and_(
-                            col(Case.created_at) == cursor_time,
-                            col(Case.id) < cursor_id,
-                        ),
-                    )
-                )
+                stmt = stmt.order_by(sort_attr.desc())
+        else:
+            # Add id as tie-breaker for non-unique columns
+            if sort_direction == "asc":
+                stmt = stmt.order_by(sort_attr.asc(), Case.id.asc())
+            else:
+                stmt = stmt.order_by(sort_attr.desc(), Case.id.desc())
 
         # Fetch limit + 1 to determine if there are more items
         stmt = stmt.limit(params.limit + 1)
-        result = await self.session.exec(stmt)
-        all_cases = result.all()
+        result = await self.session.execute(stmt)
+        all_cases = result.scalars().all()
 
         # Check if there are more items
         has_more = len(all_cases) > params.limit
         cases = all_cases[: params.limit] if has_more else all_cases
 
-        # Generate cursors
+        # Fetch task counts for all cases in one query (needed for cursor generation if sorting by tasks)
+        task_counts = await self.get_task_counts([case.id for case in cases])
+
+        # Generate cursors with sort column info for proper pagination
         next_cursor = None
         prev_cursor = None
         has_previous = params.cursor is not None
 
+        def get_cursor_sort_value(case: Case) -> datetime | str | int | float | None:
+            """Encode cursor sort values using the same semantics as ORDER BY."""
+            if sort_column == "tasks":
+                return task_counts.get(case.id, {}).get("total", 0)
+            if enum_sort_values is not None:
+                return _enum_sort_rank(
+                    getattr(case, sort_column, None), enum_sort_values
+                )
+            return getattr(case, sort_column, None)
+
         if has_more and cases:
             last_case = cases[-1]
-            next_cursor = paginator.encode_cursor(last_case.created_at, last_case.id)
+            sort_value = get_cursor_sort_value(last_case)
+            next_cursor = paginator.encode_cursor(
+                last_case.id,
+                sort_column=sort_column,
+                sort_value=sort_value,
+            )
 
         if params.cursor and cases:
             first_case = cases[0]
+            sort_value = get_cursor_sort_value(first_case)
             # For reverse pagination, swap the cursor meaning
             if params.reverse:
                 next_cursor = paginator.encode_cursor(
-                    first_case.created_at, first_case.id
+                    first_case.id,
+                    sort_column=sort_column,
+                    sort_value=sort_value,
                 )
             else:
                 prev_cursor = paginator.encode_cursor(
-                    first_case.created_at, first_case.id
+                    first_case.id,
+                    sort_column=sort_column,
+                    sort_value=sort_value,
                 )
 
-        # Convert to CaseReadMinimal objects with tags
+        # Convert to CaseReadMinimal objects with tags and dropdown values
         case_items = []
+        include_dropdown_values = await self.has_entitlement(Entitlement.CASE_ADDONS)
         for case in cases:
             # Tags are already loaded via selectinload
             tag_reads = [
@@ -260,12 +606,30 @@ class CasesService(BaseWorkspaceService):
                 for tag in case.tags
             ]
 
+            dropdown_reads = []
+            if include_dropdown_values:
+                # Dropdown values are already loaded via selectinload
+                dropdown_reads = [
+                    CaseDropdownValueRead(
+                        id=dv.id,
+                        definition_id=dv.definition_id,
+                        definition_ref=dv.definition.ref,
+                        definition_name=dv.definition.name,
+                        option_id=dv.option.id if dv.option else None,
+                        option_label=dv.option.label if dv.option else None,
+                        option_ref=dv.option.ref if dv.option else None,
+                        option_icon_name=dv.option.icon_name if dv.option else None,
+                        option_color=dv.option.color if dv.option else None,
+                    )
+                    for dv in case.dropdown_values
+                ]
+
             case_items.append(
                 CaseReadMinimal(
                     id=case.id,
                     created_at=case.created_at,
                     updated_at=case.updated_at,
-                    short_id=f"CASE-{case.case_number:04d}",
+                    short_id=case.short_id,
                     summary=case.summary,
                     status=case.status,
                     priority=case.priority,
@@ -276,6 +640,9 @@ class CasesService(BaseWorkspaceService):
                     if case.assignee
                     else None,
                     tags=tag_reads,
+                    dropdown_values=dropdown_reads,
+                    num_tasks_completed=task_counts[case.id]["completed"],
+                    num_tasks_total=task_counts[case.id]["total"],
                 )
             )
 
@@ -288,120 +655,126 @@ class CasesService(BaseWorkspaceService):
             total_estimate=total_estimate,
         )
 
-    async def search_cases(
+    async def get_search_case_aggregates(
         self,
+        *,
         search_term: str | None = None,
         status: CaseStatus | Sequence[CaseStatus] | None = None,
         priority: CasePriority | Sequence[CasePriority] | None = None,
         severity: CaseSeverity | Sequence[CaseSeverity] | None = None,
+        assignee_ids: Sequence[uuid.UUID] | None = None,
+        include_unassigned: bool = False,
         tag_ids: list[uuid.UUID] | None = None,
+        dropdown_filters: dict[str, list[str]] | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         updated_before: datetime | None = None,
         updated_after: datetime | None = None,
-        order_by: Literal["created_at", "updated_at", "priority", "severity", "status"]
-        | None = None,
-        sort: Literal["asc", "desc"] | None = None,
-        limit: int | None = None,
-    ) -> Sequence[Case]:
-        """Search cases based on various criteria.
-
-        Args:
-            search_term: Text to search for in case summary and description
-            status: Filter by case status
-            priority: Filter by case priority
-            severity: Filter by case severity
-            start_time: Filter by case creation time
-            end_time: Filter by case creation time
-            updated_before: Filter by case update time
-            updated_after: Filter by case update time
-            order_by: Field to order the cases by
-            sort: Direction to sort (asc or desc)
-            limit: Maximum number of cases to return
-
-        Returns:
-            Sequence of cases matching the search criteria
-        """
-        statement = (
-            select(Case)
-            .where(Case.owner_id == self.workspace_id)
-            .options(selectinload(Case.tags))  # type: ignore
+    ) -> CaseSearchAggregateRead:
+        """Return global totals for the current case search filter set."""
+        filters = self._build_search_filters(
+            search_term=search_term,
+            status=status,
+            priority=priority,
+            severity=severity,
+            assignee_ids=assignee_ids,
+            include_unassigned=include_unassigned,
+            tag_ids=tag_ids,
+            dropdown_filters=dropdown_filters,
+            start_time=start_time,
+            end_time=end_time,
+            updated_before=updated_before,
+            updated_after=updated_after,
         )
 
-        # Apply search term filter (search in summary and description)
-        if search_term:
-            # Validate search term to prevent abuse
-            if len(search_term) > 1000:
-                raise ValueError("Search term cannot exceed 1000 characters")
-            if "\x00" in search_term:
-                raise ValueError("Search term cannot contain null bytes")
+        aggregate_stmt = select(
+            func.count(Case.id).label("total"),
+            func.coalesce(
+                func.sum(sa.case((Case.status == CaseStatus.NEW, 1), else_=0)),
+                0,
+            ).label("new"),
+            func.coalesce(
+                func.sum(sa.case((Case.status == CaseStatus.IN_PROGRESS, 1), else_=0)),
+                0,
+            ).label("in_progress"),
+            func.coalesce(
+                func.sum(sa.case((Case.status == CaseStatus.ON_HOLD, 1), else_=0)),
+                0,
+            ).label("on_hold"),
+            func.coalesce(
+                func.sum(sa.case((Case.status == CaseStatus.RESOLVED, 1), else_=0)),
+                0,
+            ).label("resolved"),
+            func.coalesce(
+                func.sum(sa.case((Case.status == CaseStatus.CLOSED, 1), else_=0)),
+                0,
+            ).label("closed"),
+            func.coalesce(
+                func.sum(sa.case((Case.status == CaseStatus.UNKNOWN, 1), else_=0)),
+                0,
+            ).label("unknown"),
+            func.coalesce(
+                func.sum(
+                    sa.case(
+                        (Case.status == CaseStatus.OTHER, 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("other"),
+        )
 
-            # Use SQLAlchemy's concat function for proper parameter binding
-            search_pattern = func.concat("%", search_term, "%")
-            statement = statement.where(
-                or_(
-                    col(Case.summary).ilike(search_pattern),
-                    col(Case.description).ilike(search_pattern),
-                )
-            )
+        for clause in filters:
+            aggregate_stmt = aggregate_stmt.where(clause)
 
-        # Apply status filter
-        normalized_statuses = _normalize_filter_values(status)
-        if normalized_statuses:
-            statement = statement.where(col(Case.status).in_(normalized_statuses))
+        row = (await self.session.execute(aggregate_stmt)).one()
 
-        # Apply priority filter
-        normalized_priorities = _normalize_filter_values(priority)
-        if normalized_priorities:
-            statement = statement.where(col(Case.priority).in_(normalized_priorities))
+        return CaseSearchAggregateRead(
+            total=int(row.total or 0),
+            status_groups=CaseStatusGroupCounts(
+                new=int(row.new or 0),
+                in_progress=int(row.in_progress or 0),
+                on_hold=int(row.on_hold or 0),
+                resolved=int(row.resolved or 0),
+                closed=int(row.closed or 0),
+                unknown=int(row.unknown or 0),
+                other=int(row.other or 0),
+            ),
+        )
 
-        # Apply severity filter
-        normalized_severities = _normalize_filter_values(severity)
-        if normalized_severities:
-            statement = statement.where(col(Case.severity).in_(normalized_severities))
+    async def list_cases(
+        self,
+        limit: int,
+        cursor: str | None = None,
+        reverse: bool = False,
+        order_by: Literal[
+            "created_at", "updated_at", "priority", "severity", "status", "tasks"
+        ]
+        | None = None,
+        sort: Literal["asc", "desc"] | None = None,
+    ) -> CursorPaginatedResponse[CaseReadMinimal]:
+        """List cases with a simplified default search query."""
+        return await self.search_cases(
+            params=CursorPaginationParams(limit=limit, cursor=cursor, reverse=reverse),
+            order_by=order_by,
+            sort=sort,
+        )
 
-        # Apply tag filtering if specified (AND logic for multiple tags)
-        if tag_ids:
-            for tag_id in tag_ids:
-                # Self-join for each tag to ensure case has ALL specified tags
-                tag_alias = aliased(CaseTagLink)
-                statement = statement.join(
-                    tag_alias,
-                    and_(tag_alias.case_id == Case.id, tag_alias.tag_id == tag_id),
-                )
-
-        # Apply date filters
-        if start_time:
-            statement = statement.where(Case.created_at >= start_time)
-        if end_time:
-            statement = statement.where(Case.created_at <= end_time)
-        if updated_after:
-            statement = statement.where(Case.updated_at >= updated_after)
-        if updated_before:
-            statement = statement.where(Case.updated_at <= updated_before)
-
-        # Apply limit
-        if limit is not None:
-            statement = statement.limit(limit)
-
-        # Apply ordering
-        if order_by is not None:
-            attr = getattr(Case, order_by)
-            if sort == "asc":
-                statement = statement.order_by(attr.asc())
-            elif sort == "desc":
-                statement = statement.order_by(attr.desc())
-            else:
-                statement = statement.order_by(attr)
-
-        result = await self.session.exec(statement)
-        return result.all()
-
-    async def get_case(self, case_id: uuid.UUID) -> Case | None:
+    async def get_case(
+        self,
+        case_id: uuid.UUID,
+        *,
+        track_view: bool = False,
+        for_update: bool = False,
+    ) -> Case | None:
         """Get a case with its associated custom fields.
 
         Args:
             case_id: UUID of the case to retrieve
+            track_view: Whether to record a view event
+            for_update: Whether to acquire a row-level exclusive lock (SELECT FOR UPDATE).
+                Use this when the caller intends to modify the case, to prevent
+                concurrent updates from racing and causing database errors.
 
         Returns:
             Tuple containing the case and its fields (or None if no fields exist)
@@ -412,20 +785,44 @@ class CasesService(BaseWorkspaceService):
         statement = (
             select(Case)
             .where(
-                Case.owner_id == self.workspace_id,
+                Case.workspace_id == self.workspace_id,
                 Case.id == case_id,
             )
-            .options(selectinload(Case.tags))  # type: ignore
+            .options(selectinload(Case.tags))
         )
+        if for_update:
+            statement = statement.with_for_update()
 
-        result = await self.session.exec(statement)
-        return result.first()
+        result = await self.session.execute(statement)
+        case = result.scalars().first()
 
+        if case and track_view:
+            try:
+                await self.events.create_case_viewed_event(case)
+                await self.session.commit()
+            except Exception:
+                await self.session.rollback()
+                self.logger.exception(
+                    "Failed to record case viewed event",
+                    case_id=case_id,
+                    user_id=self.role.user_id,
+                )
+
+        return case
+
+    @require_scope("case:create")
+    @audit_log(resource_type="case", action="create")
     async def create_case(self, params: CaseCreate) -> Case:
         try:
-            # Create the base case first
+            # Ensure the workspace-scoped `case_fields` schema/table exists before we
+            # take locks on the `case` table (e.g. via INSERT/UPDATE). This avoids
+            # deadlocks under concurrency when schema initialization requires a
+            # ShareRowExclusiveLock on the referenced `case` table.
+            await self.fields._ensure_schema_ready()
+
+            now = datetime.now(UTC)
             case = Case(
-                owner_id=self.workspace_id,
+                workspace_id=self.workspace_id,
                 summary=params.summary,
                 description=params.description,
                 priority=params.priority,
@@ -433,6 +830,8 @@ class CasesService(BaseWorkspaceService):
                 status=params.status,
                 assignee_id=params.assignee_id,
                 payload=params.payload,
+                created_at=now,
+                updated_at=now,
             )
 
             self.session.add(case)
@@ -440,13 +839,22 @@ class CasesService(BaseWorkspaceService):
 
             # Always create the fields row to ensure defaults are applied
             # Pass empty dict if no fields provided to trigger default value application
-            await self.fields.create_field_values(case, params.fields or {})
+            await self.fields.upsert_field_values(case, params.fields or {})
 
             run_ctx = ctx_run.get()
             await self.events.create_event(
                 case=case,
                 event=CreatedEvent(wf_exec_id=run_ctx.wf_exec_id if run_ctx else None),
             )
+
+            if params.dropdown_values is not None:
+                # Write paths use `dropdown_values` because they persist per-case
+                # selections (definition_id -> option_id) on the case record.
+                await self.dropdowns.apply_values(
+                    case.id,
+                    params.dropdown_values,
+                    commit=False,
+                )
 
             # Commit once to persist case, fields, and event atomically
             await self.session.commit()
@@ -457,6 +865,95 @@ class CasesService(BaseWorkspaceService):
             await self.session.rollback()
             raise
 
+    async def _validate_closure_requirements(
+        self,
+        case: Case,
+        pending_fields: dict[str, Any] | None,
+        pending_dropdown_values: list[dict[str, Any]] | None,
+    ) -> None:
+        """Validate that all required-on-closure fields and dropdowns are non-empty.
+
+        Checks the merged state of current values + pending updates. Only runs
+        when the CASE_ADDONS entitlement is active.
+
+        Args:
+            case: The case being updated.
+            pending_fields: Field values from the update request (merged on top of current).
+            pending_dropdown_values: Dropdown values from the update request.
+
+        Raises:
+            TracecatValidationError: If any required field or dropdown is empty.
+        """
+        if not await self.has_entitlement(Entitlement.CASE_ADDONS):
+            return
+
+        missing_fields: list[str] = []
+        missing_dropdowns: list[str] = []
+
+        # --- Custom fields ---
+        field_schema = await self.fields.get_field_schema()
+        required_field_names = [
+            name
+            for name, meta in field_schema.items()
+            if meta.get("required_on_closure")
+        ]
+        if required_field_names:
+            current_fields = await self.fields.get_fields(case) or {}
+            merged_fields = {**current_fields, **(pending_fields or {})}
+            for name in required_field_names:
+                value = merged_fields.get(name)
+                if _is_field_value_empty(value):
+                    missing_fields.append(name)
+
+        # --- Dropdown definitions ---
+        stmt = (
+            select(CaseDropdownDefinition)
+            .where(
+                CaseDropdownDefinition.workspace_id == self.workspace_id,
+                CaseDropdownDefinition.required_on_closure.is_(True),
+            )
+            .options(selectinload(CaseDropdownDefinition.options))
+        )
+        result = await self.session.execute(stmt)
+        required_defs = result.scalars().all()
+
+        if required_defs:
+            # Build map of current dropdown values for this case
+            current_dropdown_map: dict[uuid.UUID, uuid.UUID | None] = {
+                dv.definition_id: dv.option_id for dv in case.dropdown_values
+            }
+            # Overlay pending dropdown values
+            if pending_dropdown_values:
+                for pdv in pending_dropdown_values:
+                    validated = CaseDropdownValueInput.model_validate(pdv)
+                    def_id = validated.definition_id
+                    if def_id is None:
+                        # Resolve by ref
+                        for rd in required_defs:
+                            if rd.ref == validated.definition_ref:
+                                def_id = rd.id
+                                break
+                    if def_id is not None:
+                        current_dropdown_map[def_id] = validated.option_id
+
+            for defn in required_defs:
+                if not current_dropdown_map.get(defn.id):
+                    missing_dropdowns.append(defn.name)
+
+        if missing_fields or missing_dropdowns:
+            import orjson
+
+            detail = orjson.dumps(
+                {
+                    "code": "closure_requirements_not_met",
+                    "missing_fields": missing_fields,
+                    "missing_dropdowns": missing_dropdowns,
+                }
+            ).decode()
+            raise TracecatValidationError(detail)
+
+    @require_scope("case:update")
+    @audit_log(resource_type="case", action="update")
     async def update_case(self, case: Case, params: CaseUpdate) -> Case:
         """Update a case and optionally its custom fields.
 
@@ -477,6 +974,16 @@ class CasesService(BaseWorkspaceService):
 
         # Update case parameters if provided
         set_fields = params.model_dump(exclude_unset=True)
+        dropdown_values = set_fields.pop("dropdown_values", None)
+
+        # Validate closure requirements before any mutations
+        if (peek_status := set_fields.get("status")) and peek_status != case.status:
+            if peek_status in (CaseStatus.CLOSED, CaseStatus.RESOLVED):
+                await self._validate_closure_requirements(
+                    case,
+                    pending_fields=set_fields.get("fields"),
+                    pending_dropdown_values=dropdown_values,
+                )
 
         # Check for status changes
         if new_status := set_fields.pop("status", None):
@@ -527,20 +1034,16 @@ class CasesService(BaseWorkspaceService):
         if fields := set_fields.pop("fields", None):
             # If fields was set, we need to update the fields row
             # It must be a dictionary because we validated it in the model
-            # Get existing fields
             if not isinstance(fields, dict):
                 raise ValueError("Fields must be a dict")
 
-            if case_fields := case.fields:
-                # Merge existing fields with new fields
-                existing_fields = await self.fields.get_fields(case) or {}
-                await self.fields.update_field_values(
-                    case_fields.id, existing_fields | fields
-                )
-            else:
-                # Case has no fields row yet, create one
-                existing_fields: dict[str, Any] = {}
-                await self.fields.create_field_values(case, fields)
+            # Get existing fields for diff calculation
+            existing_fields = await self.fields.get_fields(case) or {}
+
+            # Upsert the field values (handles both create and update)
+            await self.fields.upsert_field_values(case, fields)
+
+            # Calculate diffs for event
             diffs = []
             for field, value in fields.items():
                 old_value = existing_fields.get(field)
@@ -549,6 +1052,19 @@ class CasesService(BaseWorkspaceService):
             await self.events.create_event(
                 case=case,
                 event=FieldsChangedEvent(changes=diffs, wf_exec_id=wf_exec_id),
+            )
+
+        if dropdown_values is not None:
+            # Update paths keep the same persisted payload shape as create:
+            # `dropdown_values` contains concrete selections to set/clear.
+            normalized_dropdown_values = [
+                CaseDropdownValueInput.model_validate(value)
+                for value in dropdown_values
+            ]
+            await self.dropdowns.apply_values(
+                case.id,
+                normalized_dropdown_values,
+                commit=False,
             )
 
         # Handle the rest of the field updates
@@ -584,6 +1100,8 @@ class CasesService(BaseWorkspaceService):
             await self.session.rollback()
             raise
 
+    @require_scope("case:delete")
+    @audit_log(resource_type="case", action="delete")
     async def delete_case(self, case: Case) -> None:
         """Delete a case and optionally its associated field data.
 
@@ -600,117 +1118,301 @@ class CasesService(BaseWorkspaceService):
         await self.session.commit()
 
 
-class CaseFieldsService(BaseWorkspaceService):
-    """Service that manages the fields table."""
+class CaseFieldsService(CustomFieldsService):
+    """Service that manages workspace-scoped case fields.
+
+    CaseFields is the workspace-level definition storing schema metadata.
+    The actual per-case values are stored in the workspace's custom fields schema in the `case_fields` table.
+    """
 
     service_name = "case_fields"
-    _table = CaseFields.__tablename__
-    _schema = "public"
+    # Hardcoded to preserve existing workspace-scoped table names
+    # (metadata table was renamed from case_fields to case_field)
+    _table = "case_fields"
+    _reserved_columns = {
+        "id",
+        "case_id",
+        "created_at",
+        "updated_at",
+        DYNAMIC_WORKSPACE_TENANT_COLUMN,
+    }
 
-    def __init__(self, session: AsyncSession, role: Role | None = None):
-        super().__init__(session, role)
-        self.editor = TableEditorService(
-            session=self.session,
-            role=self.role,
-            table_name=self._table,
-            schema_name=self._schema,
+    @require_scope("case:create")
+    async def create_field(self, params: CaseFieldCreate) -> None:  # type: ignore[override]
+        """Create a new case field column and update the schema.
+
+        Extends the parent to persist the optional ``kind`` metadata
+        (e.g. LONG_TEXT, URL) that controls UI rendering.
+        """
+        await self._ensure_schema_ready()
+        params.nullable = True
+        await self.editor.create_column(params)
+
+        field_def: dict[str, Any] = {"type": params.type.value}
+
+        if params.type in (SqlType.SELECT, SqlType.MULTI_SELECT) and params.options:
+            field_def["options"] = normalize_column_options(params.options)
+
+        if params.kind is not None:
+            field_def["kind"] = params.kind.value
+
+        if params.required_on_closure:
+            field_def["required_on_closure"] = True
+
+        await self._update_field_schema(params.name, field_def)
+        await self.session.commit()
+
+    def _table_definition(self) -> sa.Table:
+        """Return the SQLAlchemy Table definition for the case_fields workspace table."""
+        return sa.Table(
+            self.sanitized_table_name,
+            sa.MetaData(),
+            sa.Column("id", UUID(as_uuid=True), primary_key=True),
+            sa.Column("case_id", UUID(as_uuid=True), unique=True, nullable=False),
+            sa.Column(
+                "created_at",
+                sa.TIMESTAMP(timezone=True),
+                nullable=False,
+                server_default=sa.func.now(),
+            ),
+            sa.Column(
+                "updated_at",
+                sa.TIMESTAMP(timezone=True),
+                nullable=False,
+                server_default=sa.func.now(),
+            ),
+            sa.Column(
+                DYNAMIC_WORKSPACE_TENANT_COLUMN,
+                UUID(as_uuid=True),
+                nullable=False,
+                server_default=self._workspace_tenant_default_sql(),
+            ),
+            # Use the actual Case table column to avoid metadata resolution issues
+            sa.ForeignKeyConstraint(
+                ["case_id"],
+                [Case.__table__.c.id],
+                name="fk_case_fields_case",
+                ondelete="CASCADE",
+            ),
+            schema=self.schema_name,
         )
 
-    async def list_fields(
-        self,
-    ) -> Sequence[sa.engine.interfaces.ReflectedColumn]:
-        """List all case fields.
+    async def get_field_schema(self) -> dict[str, Any]:
+        """Get the field schema (column definitions) for this workspace.
 
-        Returns:
-            The case fields
+        Returns a dict mapping field_id -> {type, options (only for SELECT/MULTI_SELECT)}
         """
+        stmt = sa.select(CaseFields.schema).where(
+            CaseFields.workspace_id == self.workspace_id
+        )
+        result = await self.session.execute(stmt)
+        schema = result.scalar_one_or_none()
+        return schema or {}
 
-        return await self.editor.get_columns()
-
-    async def create_field(self, params: CaseFieldCreate) -> None:
-        """Create a new case field.
+    async def _update_field_schema(
+        self, field_id: str, field_def: dict[str, Any] | None
+    ) -> None:
+        """Update the field schema for a specific field.
 
         Args:
-            params: The parameters for the field to create
+            field_id: The field name/id
+            field_def: The field definition dict {type, options (for SELECT/MULTI_SELECT only)} or None to remove
         """
-        params.nullable = True  # For now, all fields are nullable
-        await self.editor.create_column(params)
-        await self.session.commit()
+        stmt = sa.select(CaseFields).where(CaseFields.workspace_id == self.workspace_id)
+        result = await self.session.execute(stmt)
+        definition = result.scalar_one_or_none()
 
-    async def update_field(self, field_id: str, params: CaseFieldUpdate) -> None:
-        """Update a case field.
+        if definition is None:
+            definition = CaseFields(workspace_id=self.workspace_id, schema={})
+            self.session.add(definition)
+            await self.session.flush()
 
-        Args:
-            field_id: The name of the field to update
-            params: The parameters for the field to update
-        """
+        current_schema = definition.schema or {}
+
+        if field_def is None:
+            current_schema.pop(field_id, None)
+        else:
+            current_schema[field_id] = field_def
+
+        definition.schema = current_schema
+        flag_modified(definition, "schema")
+        await self.session.flush()
+
+    @require_scope("case:update")
+    async def update_field(
+        self, field_id: str, params: CaseFieldUpdate | CustomFieldUpdate
+    ) -> None:
+        """Update a custom field column and update the schema if needed."""
+        await self._ensure_schema_ready()
+
+        # Get current schema to preserve type info
+        current_schema = await self.get_field_schema()
+        current_field_def = current_schema.get(field_id, {})
+
+        # Update the physical column (name, default, etc.)
         await self.editor.update_column(field_id, params)
+
+        # Determine the new field name (if renamed)
+        new_field_id = params.name if params.name is not None else field_id
+
+        # Build updated field definition
+        # Preserve the type from current schema, or use params.type if provided
+        field_type = params.type.value if params.type else current_field_def.get("type")
+
+        # If field_type is still unknown (field exists physically but has no
+        # schema entry), resolve from the physical column so that
+        # metadata-only updates (e.g. required_on_closure) are not silently
+        # dropped.
+        if field_type is None:
+            for col in await self.editor.get_columns():
+                if col["name"] == new_field_id:
+                    field_type = _normalize_case_field_read_type(col["type"]).value
+                    break
+
+        if field_type:
+            new_field_def: dict[str, Any] = {"type": field_type}
+
+            # Update options if provided (even empty list clears options)
+            if params.options is not None:
+                normalized = normalize_column_options(params.options)
+                if normalized:
+                    new_field_def["options"] = normalized
+            elif "options" in current_field_def:
+                # Preserve existing options if not being updated
+                new_field_def["options"] = current_field_def["options"]
+
+            # Preserve kind metadata across updates
+            if "kind" in current_field_def:
+                new_field_def["kind"] = current_field_def["kind"]
+
+            # Handle required_on_closure metadata
+            if (
+                isinstance(params, CaseFieldUpdate)
+                and params.required_on_closure is not None
+            ):
+                if params.required_on_closure:
+                    new_field_def["required_on_closure"] = True
+            elif current_field_def.get("required_on_closure"):
+                new_field_def["required_on_closure"] = True
+
+            # If field was renamed, remove old entry
+            if new_field_id != field_id:
+                await self._update_field_schema(field_id, None)
+
+            # Update/add the field definition
+            await self._update_field_schema(new_field_id, new_field_def)
+
         await self.session.commit()
 
+    @require_scope("case:delete")
     async def delete_field(self, field_id: str) -> None:
-        """Delete a case field.
-
-        Args:
-            field_id: The name of the field to delete
-        """
-        if field_id in CaseFields.model_fields:
+        """Delete a custom field and remove it from the schema."""
+        await self._ensure_schema_ready()
+        if field_id in self._reserved_columns:
             raise ValueError(f"Field {field_id} is a reserved field")
+
+        # Remove from schema first
+        await self._update_field_schema(field_id, None)
 
         await self.editor.delete_column(field_id)
         await self.session.commit()
 
-    async def get_fields(self, case: Case) -> dict[str, Any] | None:
-        """Get the fields for a case.
+    async def ensure_workspace_row(self, case_id: uuid.UUID) -> uuid.UUID:
+        """Ensure a workspace data row exists for the given case.
 
         Args:
-            case: The case to get fields for
-        """
-        if case.fields is None:
-            return None
-        return await self.editor.get_row(case.fields.id)
+            case_id: The case ID to ensure a row exists for
 
-    async def create_field_values(
+        Returns:
+            The row ID for the case's field values
+
+        Raises:
+            TracecatException: If the row could not be created or retrieved
+        """
+        await self._ensure_schema_ready()
+        table = self._table_definition()
+        row_id = uuid.uuid4()
+
+        # Use ON CONFLICT DO UPDATE SET id = id to ensure we always get a row ID back,
+        # even if the row already exists. This prevents race conditions where two
+        # concurrent requests both try to insert the same row.
+        insert_stmt = insert(table).values(id=row_id, case_id=case_id)
+        stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[table.c.case_id],
+            set_={table.c.id: table.c.id},  # No-op update to ensure RETURNING works
+        ).returning(table.c.id)
+
+        result = await self.session.execute(stmt)
+        inserted_id = result.scalar_one_or_none()
+
+        if inserted_id is None:
+            raise TracecatException(
+                "Failed to ensure case fields workspace row for the given case."
+            )
+
+        return inserted_id
+
+    async def get_fields(self, case: Case) -> dict[str, Any] | None:
+        """Retrieve custom field values for a case."""
+        await self._ensure_schema_ready()
+        table = self._table_definition()
+        row_id = await self.session.scalar(
+            sa.select(table.c.id).where(table.c.case_id == case.id)
+        )
+        return await self.editor.get_row(row_id) if row_id else None
+
+    @require_scope("case:create", "case:update", require_all=False)
+    async def upsert_field_values(
         self, case: Case, fields: dict[str, Any]
     ) -> dict[str, Any]:
-        """Add fields to a case. Non-transactional.
+        """Upsert custom field values for a case.
+
+        This method ensures the workspace row exists and updates field values.
+        It does NOT commit - the caller is responsible for committing the transaction
+        to ensure atomicity with other operations (e.g., case creation/update).
 
         Args:
-            case: The case to add fields to
-            fields: The fields to add
-        """
-        # Create a new CaseFields record with case_id
-        case_fields = CaseFields(case_id=case.id)
-        self.session.add(case_fields)
-        await self.session.flush()  # Populate the ID
+            case: The case to upsert field values for
+            fields: Dictionary of field names to values
 
-        # This will use the created case_fields ID
+        Returns:
+            Dictionary containing the updated row data
+
+        Raises:
+            TracecatException: If the case has no workspace or if field operations fail
+            TracecatNotFoundError: If the row is not found after ensuring it exists
+        """
+        if case.workspace_id is None:
+            raise TracecatException(
+                "Cannot upsert case fields without an owning workspace."
+            )
+        for field_name in fields:
+            self._assert_user_field_name_allowed(field_name)
+        row_id = await self.ensure_workspace_row(case.id)
+
         try:
             if fields:
-                # If fields provided, update the row with those values
-                res = await self.editor.update_row(row_id=case_fields.id, data=fields)
+                res = await self.editor.update_row(row_id=row_id, data=fields)
                 await self.session.flush()
                 return res
-            else:
-                # If no fields provided, just get the row to return defaults
-                res = await self.editor.get_row(row_id=case_fields.id)
-                return res
+            return await self.editor.get_row(row_id=row_id)
+        except TracecatValidationError:
+            raise
         except TracecatNotFoundError as e:
-            # This happens when UPDATE/SELECT finds no row - shouldn't occur after INSERT
             self.logger.error(
-                "Case fields row not found after creation",
-                case_fields_id=case_fields.id,
+                "Case fields row not found after upsert",
+                row_id=row_id,
                 case_id=case.id,
                 fields=fields,
                 error=str(e),
             )
-            # Extract field names for better error message
             field_names = list(fields.keys()) if fields else []
             field_info = (
                 f" Fields attempted: {', '.join(field_names)}." if field_names else ""
             )
             raise TracecatException(
-                f"Failed to save custom field values for case. The field row was created but could not be updated.{field_info} "
-                "Please verify all custom fields exist in Settings > Cases > Custom Fields and have correct data types."
+                "Failed to save custom field values for case. The field row was upserted but could not be updated."
+                f"{field_info} Please verify all custom fields exist in Settings > Cases > Custom Fields and have correct data types."
             ) from e
         except ProgrammingError as e:
             while cause := e.__cause__:
@@ -723,31 +1425,244 @@ class CaseFieldsService(BaseWorkspaceService):
                 "Failed to create case fields due to an unexpected error."
             ) from e
 
-    async def update_field_values(self, id: uuid.UUID, fields: dict[str, Any]) -> None:
-        """Update a case field value. Non-transactional.
-
-        Args:
-            id: The id of the case field to update
-            fields: The fields to update
-        """
-        try:
-            await self.editor.update_row(id, fields)
-        except ProgrammingError as e:
-            while cause := e.__cause__:
-                e = cause
-            if isinstance(e, UndefinedColumnError):
-                raise TracecatException(
-                    "Failed to update case fields. One or more custom fields do not exist. Please ensure these fields have been created and try again."
-                ) from e
-            raise TracecatException(
-                "Failed to update case fields due to an unexpected error."
-            ) from e
-
 
 class CaseCommentsService(BaseWorkspaceService):
     """Service for managing case comments."""
 
     service_name = "case_comments"
+
+    async def _get_case(self, case_id: uuid.UUID) -> Case:
+        statement = select(Case).where(
+            Case.workspace_id == self.workspace_id,
+            Case.id == case_id,
+        )
+        result = await self.session.execute(statement)
+        if (case := result.scalar_one_or_none()) is None:
+            raise TracecatNotFoundError(f"Case {case_id} not found")
+        return case
+
+    def _thread_root_id(
+        self, *, comment_id: uuid.UUID, parent_id: uuid.UUID | None
+    ) -> uuid.UUID:
+        return parent_id or comment_id
+
+    def _comment_event(
+        self,
+        *,
+        comment_id: uuid.UUID,
+        parent_id: uuid.UUID | None,
+        wf_exec_id: str | None = None,
+    ) -> CommentCreatedEvent | CommentReplyCreatedEvent:
+        kwargs = {
+            "comment_id": comment_id,
+            "parent_id": parent_id,
+            "thread_root_id": self._thread_root_id(
+                comment_id=comment_id, parent_id=parent_id
+            ),
+            "wf_exec_id": wf_exec_id,
+        }
+        if parent_id is None:
+            return CommentCreatedEvent(**kwargs)
+        return CommentReplyCreatedEvent(**kwargs)
+
+    def _comment_updated_event(
+        self,
+        *,
+        comment_id: uuid.UUID,
+        parent_id: uuid.UUID | None,
+        wf_exec_id: str | None = None,
+    ) -> CommentUpdatedEvent | CommentReplyUpdatedEvent:
+        kwargs = {
+            "comment_id": comment_id,
+            "parent_id": parent_id,
+            "thread_root_id": self._thread_root_id(
+                comment_id=comment_id, parent_id=parent_id
+            ),
+            "wf_exec_id": wf_exec_id,
+        }
+        if parent_id is None:
+            return CommentUpdatedEvent(**kwargs)
+        return CommentReplyUpdatedEvent(**kwargs)
+
+    def _comment_deleted_event(
+        self,
+        *,
+        comment_id: uuid.UUID,
+        parent_id: uuid.UUID | None,
+        delete_mode: Literal["soft", "hard"],
+        wf_exec_id: str | None = None,
+    ) -> CommentDeletedEvent | CommentReplyDeletedEvent:
+        kwargs = {
+            "comment_id": comment_id,
+            "parent_id": parent_id,
+            "thread_root_id": self._thread_root_id(
+                comment_id=comment_id, parent_id=parent_id
+            ),
+            "delete_mode": delete_mode,
+            "wf_exec_id": wf_exec_id,
+        }
+        if parent_id is None:
+            return CommentDeletedEvent(**kwargs)
+        return CommentReplyDeletedEvent(**kwargs)
+
+    def _comment_audit_data(
+        self,
+        *,
+        case_id: uuid.UUID,
+        comment_id: uuid.UUID,
+        parent_id: uuid.UUID | None,
+        content: str | None = None,
+        delete_mode: Literal["soft", "hard"] | None = None,
+        workflow: Workflow | None = None,
+        wf_exec_id: str | None = None,
+        workflow_status: CaseCommentWorkflowStatus | None = None,
+    ) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "case_id": str(case_id),
+            "comment_id": str(comment_id),
+            "parent_id": str(parent_id) if parent_id is not None else None,
+            "thread_root_id": str(
+                self._thread_root_id(comment_id=comment_id, parent_id=parent_id)
+            ),
+            "is_reply": parent_id is not None,
+        }
+        if content is not None:
+            data["content"] = content
+        if delete_mode is not None:
+            data["delete_mode"] = delete_mode
+        if workflow is not None:
+            data["workflow_id"] = str(workflow.id)
+            data["workflow_alias"] = workflow.alias
+            data["is_workflow_comment"] = True
+            data["uses_case_addons"] = True
+        if wf_exec_id is not None:
+            data["wf_exec_id"] = wf_exec_id
+        if workflow_status is not None:
+            data["workflow_status"] = workflow_status.value
+        return data
+
+    def _comment_workflow_data(
+        self, comment: CaseComment
+    ) -> CaseCommentWorkflowRead | None:
+        workflow_id = getattr(comment, "workflow_id", None)
+        workflow_title = getattr(comment, "workflow_title", None)
+        workflow_status = getattr(comment, "workflow_status", None)
+        if workflow_title is None or workflow_status is None:
+            return None
+        return CaseCommentWorkflowRead(
+            workflow_id=workflow_id,
+            title=workflow_title,
+            alias=getattr(comment, "workflow_alias", None),
+            wf_exec_id=getattr(comment, "workflow_wf_exec_id", None),
+            status=CaseCommentWorkflowStatus(workflow_status),
+        )
+
+    async def _require_workflow_execute_scope(self) -> None:
+        user_scopes = self.role.scopes if self.role.scopes is not None else frozenset()
+        required = {"workflow:execute"}
+        if missing := get_missing_scopes(user_scopes, required):
+            raise ScopeDeniedError(
+                required_scopes=list(required),
+                missing_scopes=list(missing),
+            )
+
+    async def _get_comment_workflow(self, workflow_id: AnyWorkflowID) -> Workflow:
+        workflow_uuid = WorkflowUUID.new(workflow_id)
+        result = await self.session.execute(
+            select(Workflow).where(
+                Workflow.workspace_id == self.workspace_id,
+                Workflow.id == workflow_uuid,
+            )
+        )
+        if (workflow := result.scalar_one_or_none()) is None:
+            raise TracecatValidationError("Workflow not found")
+        return workflow
+
+    async def _audit_workflow_execution_event(
+        self,
+        *,
+        workflow: Workflow,
+        status: AuditEventStatus,
+        case_id: uuid.UUID,
+        comment_id: uuid.UUID,
+        parent_id: uuid.UUID | None,
+        wf_exec_id: str,
+    ) -> None:
+        async with AuditService.with_session(
+            role=self.role, session=self.session
+        ) as svc:
+            await svc.create_event(
+                resource_type="workflow_execution",
+                action="create",
+                resource_id=workflow.id,
+                status=status,
+                data={
+                    "case_id": str(case_id),
+                    "comment_id": str(comment_id),
+                    "parent_id": str(parent_id) if parent_id is not None else None,
+                    "workflow_id": str(workflow.id),
+                    "workflow_alias": workflow.alias,
+                    "wf_exec_id": wf_exec_id,
+                    "trigger_type": "case",
+                },
+            )
+
+    async def _mark_comment_workflow_status(
+        self,
+        *,
+        comment_id: uuid.UUID,
+        status: CaseCommentWorkflowStatus,
+    ) -> None:
+        await self.session.execute(
+            sa.update(CaseComment)
+            .where(
+                CaseComment.workspace_id == self.workspace_id,
+                CaseComment.id == comment_id,
+            )
+            .values(workflow_status=status.value)
+        )
+
+    async def _audit_comment_event(
+        self,
+        *,
+        action: Literal["create", "update", "delete"],
+        comment_id: uuid.UUID,
+        status: AuditEventStatus,
+        data: dict[str, Any],
+    ) -> None:
+        async with AuditService.with_session(
+            role=self.role, session=self.session
+        ) as svc:
+            await svc.create_event(
+                resource_type="case_comment",
+                action=action,
+                resource_id=comment_id,
+                status=status,
+                data=data,
+            )
+
+    async def _audit_comment_success_event(
+        self,
+        *,
+        action: Literal["create", "update", "delete"],
+        comment_id: uuid.UUID,
+        data: dict[str, Any],
+    ) -> None:
+        """Emit post-commit success audits without failing the mutation."""
+        try:
+            await self._audit_comment_event(
+                action=action,
+                comment_id=comment_id,
+                status=AuditEventStatus.SUCCESS,
+                data=data,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to emit post-commit comment audit",
+                action=action,
+                comment_id=comment_id,
+                error=str(exc),
+            )
 
     async def get_comment(self, comment_id: uuid.UUID) -> CaseComment | None:
         """Get a comment by ID.
@@ -760,45 +1675,195 @@ class CaseCommentsService(BaseWorkspaceService):
             The comment if found, None otherwise
         """
         statement = select(CaseComment).where(
-            CaseComment.owner_id == self.workspace_id,
+            CaseComment.workspace_id == self.workspace_id,
             CaseComment.id == comment_id,
         )
 
-        result = await self.session.exec(statement)
-        return result.first()
+        result = await self.session.execute(statement)
+        return result.scalars().first()
 
-    async def list_comments(
-        self, case: Case, *, with_users: bool = True
+    async def get_comment_in_case(
+        self, case_id: uuid.UUID, comment_id: uuid.UUID
+    ) -> CaseComment | None:
+        """Get a comment by ID scoped to a specific case."""
+        statement = select(CaseComment).where(
+            CaseComment.workspace_id == self.workspace_id,
+            CaseComment.case_id == case_id,
+            CaseComment.id == comment_id,
+        )
+
+        result = await self.session.execute(statement)
+        return result.scalars().first()
+
+    def serialize_comment(
+        self,
+        comment: CaseComment,
+        *,
+        user: User | None = None,
+    ) -> CaseCommentRead:
+        """Serialize a comment for API responses with tombstone semantics."""
+        comment_data = CaseCommentRead.model_validate(comment, from_attributes=True)
+        comment_data.workflow = self._comment_workflow_data(comment)
+        comment_data.user = (
+            UserRead.model_validate(user, from_attributes=True) if user else None
+        )
+        if comment.deleted_at is not None:
+            comment_data.content = _COMMENT_TOMBSTONE_CONTENT
+            comment_data.is_deleted = True
+        return comment_data
+
+    async def _list_comment_rows(
+        self,
+        *,
+        case_id: uuid.UUID,
+        thread_root_id: uuid.UUID | None = None,
     ) -> list[tuple[CaseComment, User | None]]:
-        """List all comments for a case with optional user information.
-
-        Args:
-            case: The case to get comments for
-            with_users: Whether to include user information (default: True)
-
-        Returns:
-            A list of tuples containing comments and their associated users (or None if no user)
-        """
-
-        if with_users:
-            statement = (
-                select(CaseComment, User)
-                .outerjoin(User, cast(CaseComment.user_id, sa.UUID) == User.id)
-                .where(CaseComment.case_id == case.id)
-                .order_by(cast(CaseComment.created_at, sa.DateTime))
+        """List case comments with user information."""
+        predicates: list[ColumnElement[bool]] = [CaseComment.case_id == case_id]
+        if thread_root_id is not None:
+            predicates.append(
+                sa.or_(
+                    CaseComment.id == thread_root_id,
+                    CaseComment.parent_id == thread_root_id,
+                )
             )
-            result = await self.session.exec(statement)
-            return list(result.all())
-        else:
-            statement = (
-                select(CaseComment)
-                .where(CaseComment.case_id == case.id)
-                .order_by(cast(CaseComment.created_at, sa.DateTime))
-            )
-            result = await self.session.exec(statement)
-            # Return in the same format as the join query for consistency
-            return [(comment, None) for comment in result.all()]
 
+        statement = (
+            select(CaseComment, User)
+            .outerjoin(User, cast(CaseComment.user_id, sa.UUID) == User.id)
+            .where(*predicates)
+            .order_by(CaseComment.created_at, CaseComment.surrogate_id)
+        )
+        result = await self.session.execute(statement)
+        rows = result.tuples().all()
+        return typing_cast(list[tuple[CaseComment, User | None]], rows)
+
+    async def list_comments(self, case: Case) -> list[CaseCommentRead]:
+        """List all comments for a case as a flat compatibility view."""
+        rows = await self._list_comment_rows(case_id=case.id)
+        return [self.serialize_comment(comment, user=user) for comment, user in rows]
+
+    async def list_comment_threads(self, case: Case) -> list[CaseCommentThreadRead]:
+        """List comments grouped by top-level thread."""
+        await self._require_replies_entitlement()
+        rows = await self._list_comment_rows(case_id=case.id)
+        threads_by_id: dict[uuid.UUID, CaseCommentThreadRead] = {}
+        ordered_threads: list[CaseCommentThreadRead] = []
+
+        for comment, user in rows:
+            serialized = self.serialize_comment(comment, user=user)
+            if comment.parent_id is None:
+                if (thread := threads_by_id.get(comment.id)) is not None:
+                    if thread.comment.parent_id is not None:
+                        thread.replies.insert(0, thread.comment)
+                        thread.reply_count = len(thread.replies)
+                    thread.comment = serialized
+                    if comment.updated_at > thread.last_activity_at:
+                        thread.last_activity_at = comment.updated_at
+                    continue
+
+                thread = CaseCommentThreadRead(
+                    comment=serialized,
+                    replies=[],
+                    reply_count=0,
+                    last_activity_at=comment.updated_at,
+                )
+                threads_by_id[comment.id] = thread
+                ordered_threads.append(thread)
+                continue
+
+            if (thread := threads_by_id.get(comment.parent_id)) is None:
+                fallback_thread = CaseCommentThreadRead(
+                    comment=serialized,
+                    replies=[],
+                    reply_count=0,
+                    last_activity_at=comment.updated_at,
+                )
+                threads_by_id[comment.parent_id] = fallback_thread
+                ordered_threads.append(fallback_thread)
+                continue
+
+            thread.replies.append(serialized)
+            thread.reply_count += 1
+            if comment.updated_at > thread.last_activity_at:
+                thread.last_activity_at = comment.updated_at
+
+        return ordered_threads
+
+    async def get_comment_thread(
+        self, comment_id: uuid.UUID
+    ) -> CaseCommentThreadRead | None:
+        """Get the containing thread for a comment ID."""
+        await self._require_replies_entitlement()
+        if (comment := await self.get_comment(comment_id)) is None:
+            return None
+
+        thread_root_id = comment.parent_id or comment.id
+        rows = await self._list_comment_rows(
+            case_id=comment.case_id,
+            thread_root_id=thread_root_id,
+        )
+        if not rows:
+            return None
+
+        thread_comment: CaseCommentRead | None = None
+        replies: list[CaseCommentRead] = []
+        last_activity_at: datetime | None = None
+
+        for row_comment, user in rows:
+            serialized = self.serialize_comment(row_comment, user=user)
+            if row_comment.id == thread_root_id:
+                thread_comment = serialized
+            else:
+                replies.append(serialized)
+            if last_activity_at is None or row_comment.updated_at > last_activity_at:
+                last_activity_at = row_comment.updated_at
+
+        if thread_comment is None or last_activity_at is None:
+            return None
+
+        return CaseCommentThreadRead(
+            comment=thread_comment,
+            replies=replies,
+            reply_count=len(replies),
+            last_activity_at=last_activity_at,
+        )
+
+    async def _require_replies_entitlement(self) -> None:
+        """Require case add-ons entitlement for reply/thread capabilities."""
+        if not await self.has_entitlement(Entitlement.CASE_ADDONS):
+            raise EntitlementRequired(Entitlement.CASE_ADDONS.value)
+
+    async def _validate_parent_comment(
+        self,
+        *,
+        case: Case,
+        parent_id: uuid.UUID | None,
+    ) -> None:
+        """Validate one-level reply threading constraints."""
+        if parent_id is None:
+            return
+        if (parent := await self.get_comment(parent_id)) is None:
+            raise TracecatValidationError("Parent comment not found")
+        if parent.case_id != case.id or parent.workspace_id != self.workspace_id:
+            raise TracecatValidationError("Parent comment must belong to the same case")
+        if parent.parent_id is not None:
+            raise TracecatValidationError("Replies cannot have replies")
+        if parent.deleted_at is not None:
+            raise TracecatValidationError("Cannot reply to a deleted comment")
+
+    async def _comment_has_replies(self, comment_id: uuid.UUID) -> bool:
+        """Check whether a comment has replies."""
+        statement = select(
+            sa.exists().where(
+                CaseComment.workspace_id == self.workspace_id,
+                CaseComment.parent_id == comment_id,
+            )
+        )
+        result = await self.session.execute(statement)
+        return bool(result.scalar())
+
+    @require_scope("case:update")
     async def create_comment(
         self, case: Case, params: CaseCommentCreate
     ) -> CaseComment:
@@ -811,22 +1876,154 @@ class CaseCommentsService(BaseWorkspaceService):
         Returns:
             The created comment
         """
-        comment = CaseComment(
-            owner_id=self.workspace_id,
+        comment_id = uuid.uuid4()
+        workflow: Workflow | None = None
+        workflow_status: CaseCommentWorkflowStatus | None = None
+        wf_exec_id: str | None = None
+        workflow_trigger_publish: dict[str, Any] | None = None
+        if params.workflow_id is not None:
+            await self._require_replies_entitlement()
+            await self._require_workflow_execute_scope()
+            workflow = await self._get_comment_workflow(params.workflow_id)
+            workflow_status = CaseCommentWorkflowStatus.RUNNING
+            wf_exec_id = generate_exec_id(WorkflowUUID.new(workflow.id))
+
+        audit_data = self._comment_audit_data(
             case_id=case.id,
-            content=params.content,
+            comment_id=comment_id,
             parent_id=params.parent_id,
-            user_id=self.role.user_id,
+            content=params.content,
+            workflow=workflow,
+            wf_exec_id=wf_exec_id,
+            workflow_status=workflow_status,
+        )
+        await self._audit_comment_event(
+            action="create",
+            comment_id=comment_id,
+            status=AuditEventStatus.ATTEMPT,
+            data=audit_data,
         )
 
-        self.session.add(comment)
-        await self.session.commit()
-        await self.session.refresh(comment)
+        try:
+            if params.parent_id is not None:
+                await self._require_replies_entitlement()
+            await self._validate_parent_comment(case=case, parent_id=params.parent_id)
+            comment = CaseComment(
+                id=comment_id,
+                workspace_id=self.workspace_id,
+                case_id=case.id,
+                content=params.content,
+                parent_id=params.parent_id,
+                user_id=self.role.user_id,
+                workflow_id=workflow.id if workflow is not None else None,
+                workflow_title=workflow.title if workflow is not None else None,
+                workflow_alias=workflow.alias if workflow is not None else None,
+                workflow_wf_exec_id=wf_exec_id,
+                workflow_status=workflow_status.value
+                if workflow_status is not None
+                else None,
+            )
 
+            self.session.add(comment)
+            db_event = await CaseEventsService(
+                session=self.session, role=self.role
+            ).create_event(
+                case=case,
+                event=self._comment_event(
+                    comment_id=comment.id,
+                    parent_id=comment.parent_id,
+                ),
+                publish_case_trigger=workflow is None or wf_exec_id is None,
+            )
+            if workflow is not None and wf_exec_id is not None:
+                await self._audit_workflow_execution_event(
+                    workflow=workflow,
+                    status=AuditEventStatus.ATTEMPT,
+                    case_id=case.id,
+                    comment_id=comment.id,
+                    parent_id=comment.parent_id,
+                    wf_exec_id=wf_exec_id,
+                )
+                workflow_trigger_publish = {
+                    "event_id": str(db_event.id),
+                    "case_id": str(case.id),
+                    "workspace_id": str(case.workspace_id),
+                    "event_type": (
+                        db_event.type.value
+                        if hasattr(db_event.type, "value")
+                        else db_event.type
+                    ),
+                    "created_at": db_event.created_at or datetime.now(UTC),
+                    "extra_fields": {
+                        "comment_id": str(comment.id),
+                        "parent_id": (
+                            str(comment.parent_id)
+                            if comment.parent_id is not None
+                            else None
+                        ),
+                        "comment": comment.content,
+                        "text": comment.content,
+                        "workflow_id": str(workflow.id),
+                        "wf_exec_id": wf_exec_id,
+                        "triggered_by_type": self.role.type,
+                        "triggered_by_user_id": (
+                            str(self.role.user_id)
+                            if self.role.user_id is not None
+                            else None
+                        ),
+                        "triggered_by_service_id": self.role.service_id,
+                    },
+                }
+            await self.session.commit()
+            await self.session.refresh(comment)
+        except Exception:
+            await self._audit_comment_event(
+                action="create",
+                comment_id=comment_id,
+                status=AuditEventStatus.FAILURE,
+                data=audit_data,
+            )
+            raise
+
+        if workflow is not None and wf_exec_id is not None and workflow_trigger_publish:
+            try:
+                await publish_case_event_payload(**workflow_trigger_publish)
+            except Exception as e:
+                self.logger.error(
+                    "Failed to publish workflow-backed case comment trigger",
+                    case_id=str(case.id),
+                    comment_id=str(comment.id),
+                    workflow_id=str(workflow.id),
+                    wf_exec_id=wf_exec_id,
+                    error=str(e),
+                )
+                await self._mark_comment_workflow_status(
+                    comment_id=comment.id,
+                    status=CaseCommentWorkflowStatus.FAILED,
+                )
+                await self._audit_workflow_execution_event(
+                    workflow=workflow,
+                    status=AuditEventStatus.FAILURE,
+                    case_id=case.id,
+                    comment_id=comment.id,
+                    parent_id=comment.parent_id,
+                    wf_exec_id=wf_exec_id,
+                )
+                await self.session.commit()
+                await self.session.refresh(comment)
+
+        await self._audit_comment_success_event(
+            action="create",
+            comment_id=comment_id,
+            data=audit_data,
+        )
         return comment
 
+    @require_scope("case:update")
     async def update_comment(
-        self, comment: CaseComment, params: CaseCommentUpdate
+        self,
+        comment: CaseComment,
+        params: CaseCommentUpdate,
     ) -> CaseComment:
         """Update an existing comment.
 
@@ -841,22 +2038,71 @@ class CaseCommentsService(BaseWorkspaceService):
             TracecatNotFoundError: If the comment doesn't exist
             TracecatAuthorizationError: If the user doesn't own the comment
         """
-        # Check if the user owns the comment
-        if comment.user_id != self.role.user_id:
-            raise TracecatAuthorizationError("You cannot update this comment")
+        audit_data = self._comment_audit_data(
+            case_id=comment.case_id,
+            comment_id=comment.id,
+            parent_id=comment.parent_id,
+            content=params.content,
+        )
+        await self._audit_comment_event(
+            action="update",
+            comment_id=comment.id,
+            status=AuditEventStatus.ATTEMPT,
+            data=audit_data,
+        )
 
-        set_fields = params.model_dump(exclude_unset=True)
-        for key, value in set_fields.items():
-            setattr(comment, key, value)
+        try:
+            if comment.user_id != self.role.user_id:
+                raise TracecatAuthorizationError("You cannot update this comment")
+            if comment.deleted_at is not None:
+                raise TracecatValidationError("Deleted comments cannot be updated")
+            if comment.workflow_id is not None:
+                raise TracecatValidationError(
+                    "Workflow-backed comments cannot be edited"
+                )
+            if "parent_id" in params.model_fields_set:
+                raise TracecatValidationError(
+                    "Changing a comment parent is not supported"
+                )
+            if "content" not in params.model_fields_set:
+                await self._audit_comment_event(
+                    action="update",
+                    comment_id=comment.id,
+                    status=AuditEventStatus.SUCCESS,
+                    data=audit_data,
+                )
+                return comment
+            if params.content is None:
+                raise TracecatValidationError("Comment content is required")
+            comment.content = params.content
+            comment.last_edited_at = datetime.now(UTC)
+            case = await self._get_case(comment.case_id)
+            await CaseEventsService(session=self.session, role=self.role).create_event(
+                case=case,
+                event=self._comment_updated_event(
+                    comment_id=comment.id,
+                    parent_id=comment.parent_id,
+                ),
+            )
+            await self.session.commit()
+            await self.session.refresh(comment)
+        except Exception:
+            await self._audit_comment_event(
+                action="update",
+                comment_id=comment.id,
+                status=AuditEventStatus.FAILURE,
+                data=audit_data,
+            )
+            raise
 
-        # Set last_edited_at
-        comment.last_edited_at = datetime.now(UTC)
-
-        await self.session.commit()
-        await self.session.refresh(comment)
-
+        await self._audit_comment_success_event(
+            action="update",
+            comment_id=comment.id,
+            data=audit_data,
+        )
         return comment
 
+    @require_scope("case:delete")
     async def delete_comment(self, comment: CaseComment) -> None:
         """Delete a comment.
 
@@ -869,12 +2115,72 @@ class CaseCommentsService(BaseWorkspaceService):
             TracecatAuthorizationError: If the user doesn't own the comment
         """
 
-        # Check if the user owns the comment
         if comment.user_id != self.role.user_id:
             raise TracecatAuthorizationError("You can only delete your own comments")
 
-        await self.session.delete(comment)
-        await self.session.commit()
+        has_replies = comment.parent_id is None and await self._comment_has_replies(
+            comment.id
+        )
+        if has_replies and comment.deleted_at is not None:
+            return
+
+        delete_mode: Literal["soft", "hard"] = "soft" if has_replies else "hard"
+        delete_audit_data = self._comment_audit_data(
+            case_id=comment.case_id,
+            comment_id=comment.id,
+            parent_id=comment.parent_id,
+            delete_mode=delete_mode,
+        )
+        await self._audit_comment_event(
+            action="delete",
+            comment_id=comment.id,
+            status=AuditEventStatus.ATTEMPT,
+            data=delete_audit_data,
+        )
+
+        try:
+            case = await self._get_case(comment.case_id)
+            if has_replies:
+                if comment.deleted_at is None:
+                    comment.deleted_at = datetime.now(UTC)
+                await CaseEventsService(
+                    session=self.session, role=self.role
+                ).create_event(
+                    case=case,
+                    event=self._comment_deleted_event(
+                        comment_id=comment.id,
+                        parent_id=comment.parent_id,
+                        delete_mode=delete_mode,
+                    ),
+                )
+                await self.session.commit()
+            else:
+                await CaseEventsService(
+                    session=self.session, role=self.role
+                ).create_event(
+                    case=case,
+                    event=self._comment_deleted_event(
+                        comment_id=comment.id,
+                        parent_id=comment.parent_id,
+                        delete_mode=delete_mode,
+                    ),
+                )
+                await self.session.delete(comment)
+                await self.session.commit()
+        except Exception:
+            await self._audit_comment_event(
+                action="delete",
+                comment_id=comment.id,
+                status=AuditEventStatus.FAILURE,
+                data=delete_audit_data,
+            )
+            raise
+
+        await self._audit_comment_success_event(
+            action="delete",
+            comment_id=comment.id,
+            data=delete_audit_data,
+        )
 
 
 class CaseEventsService(BaseWorkspaceService):
@@ -882,25 +2188,43 @@ class CaseEventsService(BaseWorkspaceService):
 
     service_name = "case_events"
 
+    def __init__(self, session: AsyncSession, role: Role | None = None):
+        super().__init__(session, role)
+
     async def list_events(self, case: Case) -> Sequence[CaseEvent]:
         """List all events for a case."""
         statement = (
             select(CaseEvent)
             .where(CaseEvent.case_id == case.id)
-            .order_by(desc(col(CaseEvent.created_at)))
+            # Order by creation time (newest first) and fall back to surrogate_id
+            # to ensure deterministic ordering when timestamps are equal.
+            .order_by(
+                CaseEvent.created_at.desc(),
+                CaseEvent.surrogate_id.desc(),
+            )
         )
-        result = await self.session.exec(statement)
-        return result.all()
+        result = await self.session.execute(statement)
+        return result.scalars().all()
 
-    async def create_event(self, case: Case, event: CaseEventVariant) -> CaseEvent:
+    async def create_event(
+        self,
+        case: Case,
+        event: CaseEventVariant,
+        *,
+        publish_case_trigger: bool = True,
+    ) -> CaseEvent:
         """Create a new activity record for a case with variant-specific data.
 
         Note: This method is non-committing. The caller is responsible for
         wrapping operations in a transaction and committing once at the end
         to preserve atomicity across multi-step updates.
+
+        Duration sync is performed automatically after each event is created,
+        so callers do not need to call sync_case_durations separately.
         """
+
         db_event = CaseEvent(
-            owner_id=self.workspace_id,
+            workspace_id=self.workspace_id,
             case_id=case.id,
             type=event.type,
             data=event.model_dump(exclude={"type"}, mode="json"),
@@ -909,4 +2233,417 @@ class CaseEventsService(BaseWorkspaceService):
         self.session.add(db_event)
         # Flush so that generated fields (e.g., id) are available if needed
         await self.session.flush()
+
+        event_id = str(db_event.id)
+        event_type = (
+            db_event.type.value if hasattr(db_event.type, "value") else db_event.type
+        )
+        created_at = db_event.created_at or datetime.now(UTC)
+        case_id = str(case.id)
+        workspace_id = str(case.workspace_id)
+
+        if publish_case_trigger:
+
+            async def _publish_case_event() -> None:
+                await publish_case_event_payload(
+                    event_id=event_id,
+                    case_id=case_id,
+                    workspace_id=workspace_id,
+                    event_type=event_type,
+                    created_at=created_at,
+                )
+
+            add_after_commit_callback(self.session, _publish_case_event)
+
+        # Auto-sync durations whenever an event is created
+        durations_service = CaseDurationService(session=self.session, role=self.role)
+        await durations_service.sync_case_durations(case)
+
         return db_event
+
+    async def create_case_viewed_event(
+        self,
+        case: Case,
+        *,
+        dedupe_window: timedelta = CASE_VIEW_EVENT_DEDUP_WINDOW,
+    ) -> CaseEvent | None:
+        """Record a case viewed event if the current user hasn't viewed recently."""
+        if not self.role.user_id:
+            return None
+
+        now_utc = datetime.now(UTC)
+        stmt = (
+            select(CaseEvent)
+            .where(
+                CaseEvent.workspace_id == self.workspace_id,
+                CaseEvent.case_id == case.id,
+                CaseEvent.type == CaseEventType.CASE_VIEWED,
+                CaseEvent.user_id == self.role.user_id,
+            )
+            .order_by(CaseEvent.created_at.desc())
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        last_event = result.scalars().first()
+        if last_event:
+            last_created_at = last_event.created_at
+            if last_created_at.tzinfo is None:
+                if datetime.now() - last_created_at < dedupe_window:
+                    return None
+            else:
+                if now_utc - last_created_at < dedupe_window:
+                    return None
+
+        return await self.create_event(case=case, event=CaseViewedEvent())
+
+
+class CaseTasksService(BaseWorkspaceService):
+    """Service for managing case tasks."""
+
+    service_name = "case_tasks"
+
+    @requires_entitlement(Entitlement.CASE_ADDONS)
+    async def list_tasks(self, case_id: uuid.UUID) -> Sequence[CaseTask]:
+        """List all tasks for a case.
+
+        Args:
+            case_id: The ID of the case to get tasks for
+
+        Returns:
+            A sequence of tasks for the case, ordered by priority (highest first) then creation date
+        """
+        statement = (
+            select(CaseTask)
+            .where(
+                CaseTask.workspace_id == self.workspace_id,
+                CaseTask.case_id == case_id,
+            )
+            .order_by(
+                CaseTask.priority.desc(),
+                cast(CaseTask.created_at, sa.DateTime),
+            )
+        )
+        result = await self.session.execute(statement)
+        return result.scalars().all()
+
+    @requires_entitlement(Entitlement.CASE_ADDONS)
+    async def get_task(self, task_id: uuid.UUID) -> CaseTask:
+        """Get a task by ID.
+
+        Args:
+            task_id: The ID of the task to get
+
+        Returns:
+            The task
+
+        Raises:
+            TracecatNotFoundError: If the task is not found
+        """
+        statement = select(CaseTask).where(
+            CaseTask.workspace_id == self.workspace_id,
+            CaseTask.id == task_id,
+        )
+        result = await self.session.execute(statement)
+        task = result.scalars().first()
+        if not task:
+            raise TracecatNotFoundError(f"Task {task_id} not found")
+        return task
+
+    async def _validate_default_trigger_values(
+        self,
+        workflow_id: uuid.UUID | None,
+        default_trigger_values: dict[str, Any],
+    ) -> None:
+        """Validate default_trigger_values against workflow's expects schema.
+
+        Args:
+            workflow_id: The workflow ID to validate against
+            default_trigger_values: The trigger values to validate
+
+        Raises:
+            TracecatNotFoundError: If the workflow is not found
+            TracecatValidationError: If values don't match schema
+        """
+
+        if not workflow_id:
+            raise TracecatValidationError(
+                "Cannot set default_trigger_values without a workflow_id"
+            )
+        # Fetch workflow
+        stmt = select(Workflow).where(
+            Workflow.workspace_id == self.workspace_id,
+            Workflow.id == workflow_id,
+        )
+        result = await self.session.execute(stmt)
+        workflow = result.scalars().first()
+
+        if not workflow:
+            raise TracecatNotFoundError(f"Workflow {workflow_id} not found")
+
+        # Skip validation if workflow has no expects schema
+        if not workflow.expects:
+            return
+
+        expects_schema = {
+            field_name: ExpectedField.model_validate(field_schema)
+            for field_name, field_schema in workflow.expects.items()
+        }
+
+        validator = create_expectation_model(
+            expects_schema, model_name="DefaultTriggerValuesValidator"
+        )
+
+        try:
+            validator(**default_trigger_values)
+        except ValidationError as e:
+            raise TracecatValidationError(
+                f"Invalid default_trigger_values for workflow '{workflow.title}': {e}"
+            ) from e
+
+    @requires_entitlement(Entitlement.CASE_ADDONS)
+    @require_scope("case:create")
+    async def create_task(self, case_id: uuid.UUID, params: CaseTaskCreate) -> CaseTask:
+        """Create a new task for a case.
+
+        Args:
+            case_id: The ID of the case to create a task for
+            params: The task parameters
+
+        Returns:
+            The created task
+
+        Raises:
+            TracecatNotFoundError: If the case is not found in the current workspace
+        """
+        statement = select(Case).where(
+            Case.workspace_id == self.workspace_id,
+            Case.id == case_id,
+        )
+        result = await self.session.execute(statement)
+        case = result.scalars().first()
+        if not case:
+            raise TracecatNotFoundError(f"Case {case_id} not found")
+
+        # Convert workflow_id from AnyWorkflowID to UUID
+        workflow_uuid = (
+            WorkflowUUID.new(params.workflow_id) if params.workflow_id else None
+        )
+
+        if params.default_trigger_values:
+            await self._validate_default_trigger_values(
+                workflow_uuid, params.default_trigger_values
+            )
+
+        task = CaseTask(
+            workspace_id=self.workspace_id,
+            case_id=case_id,
+            title=params.title,
+            description=params.description,
+            priority=params.priority,
+            status=params.status,
+            assignee_id=params.assignee_id,
+            workflow_id=workflow_uuid,
+            default_trigger_values=params.default_trigger_values,
+        )
+        self.session.add(task)
+        # Flush to get task ID before emitting event
+        await self.session.flush()
+
+        run_ctx = ctx_run.get()
+        wf_exec_id = run_ctx.wf_exec_id if run_ctx else None
+
+        # Emit task created event
+        events_svc = CaseEventsService(session=self.session, role=self.role)
+        await events_svc.create_event(
+            case=case,
+            event=TaskCreatedEvent(
+                task_id=task.id, title=task.title, wf_exec_id=wf_exec_id
+            ),
+        )
+
+        # Update parent case's updated_at timestamp
+        case.updated_at = datetime.now(UTC)
+
+        await self.session.commit()
+        await self.session.refresh(task)
+        return task
+
+    @requires_entitlement(Entitlement.CASE_ADDONS)
+    @require_scope("case:update")
+    async def update_task(self, task_id: uuid.UUID, params: CaseTaskUpdate) -> CaseTask:
+        """Update a task.
+
+        Args:
+            task_id: The ID of the task to update
+            params: The task update parameters
+
+        Returns:
+            The updated task
+
+        Raises:
+            TracecatNotFoundError: If the task is not found
+        """
+        task = await self.get_task(task_id)
+
+        # Load case for event context
+        statement = select(Case).where(
+            Case.workspace_id == self.workspace_id,
+            Case.id == task.case_id,
+        )
+        result = await self.session.execute(statement)
+        case = result.scalars().first()
+        if not case:
+            raise TracecatNotFoundError(f"Case {task.case_id} not found")
+
+        run_ctx = ctx_run.get()
+        wf_exec_id = run_ctx.wf_exec_id if run_ctx else None
+        events_svc = CaseEventsService(session=self.session, role=self.role)
+
+        # Update only provided fields and emit events
+        set_fields = params.model_dump(exclude_unset=True)
+
+        # Status change
+        if (new_status := set_fields.pop("status", None)) is not None:
+            old_status = task.status
+            if old_status != new_status:
+                task.status = new_status
+                await events_svc.create_event(
+                    case=case,
+                    event=TaskStatusChangedEvent(
+                        task_id=task.id,
+                        title=task.title,
+                        old=old_status,
+                        new=new_status,
+                        wf_exec_id=wf_exec_id,
+                    ),
+                )
+
+        # Assignee change
+        if (new_assignee := set_fields.pop("assignee_id", None)) is not None:
+            old_assignee = task.assignee_id
+            if old_assignee != new_assignee:
+                task.assignee_id = new_assignee
+                await events_svc.create_event(
+                    case=case,
+                    event=TaskAssigneeChangedEvent(
+                        task_id=task.id,
+                        title=task.title,
+                        old=old_assignee,
+                        new=new_assignee,
+                        wf_exec_id=wf_exec_id,
+                    ),
+                )
+
+        # Priority change
+        if (new_priority := set_fields.pop("priority", None)) is not None:
+            old_priority = task.priority
+            if old_priority != new_priority:
+                task.priority = new_priority
+                await events_svc.create_event(
+                    case=case,
+                    event=TaskPriorityChangedEvent(
+                        task_id=task.id,
+                        title=task.title,
+                        old=old_priority,
+                        new=new_priority,
+                        wf_exec_id=wf_exec_id,
+                    ),
+                )
+
+        # Workflow change - handle separately to allow clearing (setting to None)
+        # Check if the field was provided in the update payload using model_fields_set
+        if "workflow_id" in params.model_fields_set:
+            old_wfid = task.workflow_id
+            new_wfid = None
+            if params.workflow_id is not None:
+                # Convert workflow_id from AnyWorkflowID to UUID
+                new_wfid = WorkflowUUID.new(params.workflow_id)
+
+            # Validate existing default_trigger_values against new workflow if both exist
+            # Only validate if default_trigger_values is NOT being updated in this request
+            # (if it is, the new values will be validated later)
+            if (
+                new_wfid
+                and task.default_trigger_values
+                and "default_trigger_values" not in params.model_fields_set
+            ):
+                await self._validate_default_trigger_values(
+                    new_wfid, task.default_trigger_values
+                )
+
+            if old_wfid != new_wfid:
+                task.workflow_id = new_wfid
+                await events_svc.create_event(
+                    case=case,
+                    event=TaskWorkflowChangedEvent(
+                        task_id=task.id,
+                        title=task.title,
+                        old=WorkflowUUID.new(old_wfid) if old_wfid else None,
+                        new=new_wfid,
+                        wf_exec_id=wf_exec_id,
+                    ),
+                )
+
+        # default_trigger_values change - validate against current workflow if it exists
+        if "default_trigger_values" in params.model_fields_set:
+            new_default_values = set_fields.pop("default_trigger_values", None)
+            if new_default_values:
+                await self._validate_default_trigger_values(
+                    task.workflow_id, new_default_values
+                )
+            task.default_trigger_values = new_default_values
+
+        # Title and description - update silently without events
+        if (new_title := set_fields.pop("title", None)) is not None:
+            task.title = new_title
+
+        if (new_desc := set_fields.pop("description", None)) is not None:
+            task.description = new_desc
+
+        # Update parent case's updated_at timestamp
+        case.updated_at = datetime.now(UTC)
+
+        await self.session.commit()
+        await self.session.refresh(task)
+        return task
+
+    @requires_entitlement(Entitlement.CASE_ADDONS)
+    @require_scope("case:delete")
+    async def delete_task(self, task_id: uuid.UUID) -> None:
+        """Delete a task.
+
+        Args:
+            task_id: The ID of the task to delete
+
+        Raises:
+            TracecatNotFoundError: If the task is not found
+        """
+        task = await self.get_task(task_id)
+
+        # Load case for event context
+        statement = select(Case).where(
+            Case.workspace_id == self.workspace_id,
+            Case.id == task.case_id,
+        )
+        result = await self.session.execute(statement)
+        case = result.scalars().first()
+        if not case:
+            raise TracecatNotFoundError(f"Case {task.case_id} not found")
+
+        run_ctx = ctx_run.get()
+        wf_exec_id = run_ctx.wf_exec_id if run_ctx else None
+        events_svc = CaseEventsService(session=self.session, role=self.role)
+
+        # Emit delete event before deleting to capture title
+        await events_svc.create_event(
+            case=case,
+            event=TaskDeletedEvent(
+                task_id=task.id, title=task.title, wf_exec_id=wf_exec_id
+            ),
+        )
+
+        # Update parent case's updated_at timestamp
+        case.updated_at = datetime.now(UTC)
+
+        await self.session.delete(task)
+        await self.session.commit()

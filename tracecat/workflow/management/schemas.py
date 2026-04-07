@@ -1,132 +1,533 @@
-"""Utilities for working with workflow trigger input schemas."""
-
 from __future__ import annotations
 
-from collections.abc import Mapping
-from copy import deepcopy
-from typing import Any
+import uuid
+from collections.abc import Iterable
+from datetime import datetime
+from enum import StrEnum
+from typing import Any, Literal
 
-from tracecat.expressions.expectations import (
-    ExpectedField,
-    create_expectation_model,
+from fastapi.responses import ORJSONResponse
+from pydantic import BaseModel, Field, field_validator
+
+from tracecat.auth.types import Role
+from tracecat.cases.enums import CaseEventType
+from tracecat.core.schemas import Schema
+from tracecat.db.models import Workflow, WorkflowDefinition
+from tracecat.dsl.common import DSLInput, DSLRunArgs
+from tracecat.dsl.schemas import ActionStatement, DSLConfig
+from tracecat.expressions.expectations import ExpectedField
+from tracecat.identifiers import WorkspaceID
+from tracecat.identifiers.workflow import AnyWorkflowID, WorkflowIDShort, WorkflowUUID
+from tracecat.registry.lock.types import RegistryLock
+from tracecat.tags.schemas import TagRead
+from tracecat.validation.schemas import ValidationResult
+from tracecat.webhooks.schemas import WebhookRead
+from tracecat.workflow.actions.schemas import ActionRead
+from tracecat.workflow.case_triggers.schemas import (
+    CaseTriggerConfig,
+    is_case_trigger_configured,
 )
+from tracecat.workflow.schedules.schemas import ScheduleRead
 
 
-def _inline_schema_refs(node: Any, defs: dict[str, Any] | None) -> bool:
-    """Inline ``$ref`` entries pointing to ``defs`` in-place.
-
-    Returns ``True`` if at least one replacement was made. This helper walks the
-    full JSON schema tree so nested definitions (e.g. inside ``items``) are also
-    inlined.
-    """
-
-    if not defs:
-        return False
-
-    replacement_made = False
-
-    def _walk(value: Any) -> None:
-        nonlocal replacement_made
-
-        if isinstance(value, dict):
-            ref = value.get("$ref")
-            if ref and ref.startswith("#/$defs/"):
-                def_name = ref.split("/")[-1]
-                if def_name in defs:
-                    # Merge the referenced definition into the current node.
-                    referenced = deepcopy(defs[def_name])
-                    value.pop("$ref")
-                    for key, ref_value in referenced.items():
-                        # Preserve explicit field-level overrides.
-                        value.setdefault(key, ref_value)
-                    replacement_made = True
-
-            for child in list(value.values()):
-                _walk(child)
-
-        elif isinstance(value, list):
-            for item in list(value):
-                _walk(item)
-
-    _walk(node)
-    return replacement_made
+class WorkflowRead(Schema):
+    id: WorkflowIDShort
+    title: str
+    description: str
+    status: str
+    actions: dict[str, ActionRead]
+    workspace_id: WorkspaceID
+    version: int | None = None
+    webhook: WebhookRead
+    schedules: list[ScheduleRead]
+    entrypoint: str | None
+    expects: dict[str, ExpectedField] | None = None
+    expects_schema: dict[str, Any] | None = None
+    returns: Any
+    config: DSLConfig | None
+    alias: str | None = None
+    git_sync_branch: str | None = None
+    error_handler: str | None = None
+    trigger_position_x: float = 0.0
+    trigger_position_y: float = 0.0
+    graph_version: int = 1
 
 
-def _schema_contains_refs(node: Any, *, skip_defs: bool = True) -> bool:
-    """Detect remaining ``$ref`` entries.``skip_defs`` ignores ``$defs`` nodes."""
-
-    if isinstance(node, dict):
-        for key, value in node.items():
-            if key == "$ref":
-                return True
-            if skip_defs and key == "$defs":
-                continue
-            if _schema_contains_refs(value, skip_defs=skip_defs):
-                return True
-        return False
-
-    if isinstance(node, list):
-        return any(_schema_contains_refs(item, skip_defs=skip_defs) for item in node)
-
-    return False
+class WorkflowDefinitionReadMinimal(Schema):
+    id: uuid.UUID
+    version: int
+    created_at: datetime
 
 
-def build_trigger_inputs_schema(
-    expects: Mapping[str, ExpectedField | dict[str, Any]] | None,
-    *,
-    model_name: str = "WorkflowTriggerInputs",
-) -> dict[str, Any] | None:
-    """Generate a JSON schema for workflow trigger inputs.
+class WorkflowDefinitionRead(Schema):
+    """API response model for persisted workflow definitions."""
 
-    Parameters
-    ----------
-    expects:
-        Mapping of field names to :class:`ExpectedField` definitions. The mapping
-        can contain either ``ExpectedField`` instances or dictionaries that can
-        be validated into an ``ExpectedField``.
-    model_name:
-        Optional model name used when constructing the underlying Pydantic
-        model. This name surfaces as the ``title`` attribute in the generated
-        JSON schema.
+    id: uuid.UUID
+    workflow_id: WorkflowUUID | None
+    workspace_id: WorkspaceID
+    version: int
+    content: dict[str, Any] | None = None
+    created_at: datetime
+    updated_at: datetime
 
-    Returns
-    -------
-    dict[str, Any] | None
-        JSON schema describing the expected trigger inputs, or ``None`` if no
-        expectations were defined.
-    """
 
-    if not expects:
-        return None
+class WorkflowTriggerSummary(Schema):
+    schedule_count_online: int = 0
+    schedule_cron: str | None = None
+    schedule_natural: str | None = None
+    webhook_active: bool = False
+    case_trigger_events: list[CaseEventType] = Field(default_factory=list)
 
-    # Ensure we are working with validated ``ExpectedField`` instances so we
-    # can safely generate the Pydantic model and downstream schema.
-    validated_fields = {
-        field_name: ExpectedField.model_validate(field_schema)
-        for field_name, field_schema in expects.items()
-    }
 
-    if not validated_fields:
-        return None
+class WorkflowReadMinimal(Schema):
+    """Minimal version of WorkflowRead model for list endpoints."""
 
-    expectation_model = create_expectation_model(
-        validated_fields, model_name=model_name
+    id: WorkflowIDShort
+    title: str
+    description: str
+    status: str
+    icon_url: str | None
+    created_at: datetime
+    updated_at: datetime
+    version: int | None
+    tags: list[TagRead] | None = None
+    alias: str | None = None
+    error_handler: str | None = None
+    latest_definition: WorkflowDefinitionReadMinimal | None = None
+    folder_id: uuid.UUID | None = None
+    trigger_summary: WorkflowTriggerSummary | None = None
+
+
+class WorkflowUpdate(BaseModel):
+    title: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=100,
+        description="Workflow title, between 3 and 100 characters",
     )
-    schema = expectation_model.model_json_schema()
+    description: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="Optional workflow description, up to 1000 characters",
+    )
+    status: Literal["online", "offline"] | None = None
+    version: int | None = None
+    entrypoint: str | None = None
+    icon_url: str | None = None
+    expects: dict[str, ExpectedField] | None = None
+    returns: Any | None = None
+    config: DSLConfig | None = None
+    alias: str | None = None
+    error_handler: str | None = None
 
-    # Inline enum definitions from $defs for simpler schema
-    if schema and "$defs" in schema and isinstance(schema["$defs"], dict):
-        schema_defs = schema["$defs"]
 
-        # Keep inlining until no more replacements are made. This handles nested
-        # references where a referenced definition itself contains another $ref.
-        while _inline_schema_refs(schema, schema_defs):
-            continue
+class WorkflowCreate(BaseModel):
+    title: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=100,
+        description="Workflow title, between 3 and 100 characters",
+    )
+    description: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="Optional workflow description, up to 1000 characters",
+    )
 
-        # Clean up $defs only if there are no remaining $ref entries outside of
-        # the $defs block. Leaving $defs in place avoids breaking downstream
-        # consumers when nested references are still present.
-        if not _schema_contains_refs(schema):
-            schema.pop("$defs", None)
 
-    return schema
+class GetWorkflowDefinitionActivityInputs(BaseModel):
+    role: Role
+    workflow_id: WorkflowUUID
+    version: int | None = None
+    task: ActionStatement | None = None
+
+    @field_validator("workflow_id", mode="before")
+    @classmethod
+    def validate_workflow_id(cls, v: AnyWorkflowID) -> WorkflowUUID:
+        """Convert any valid workflow ID format to WorkflowUUID."""
+        return WorkflowUUID.new(v)
+
+
+class WorkflowDefinitionActivityResult(BaseModel):
+    """Result from get_workflow_definition_activity.
+
+    Contains both the DSL and the registry lock for this workflow definition.
+    """
+
+    dsl: DSLInput
+    registry_lock: RegistryLock | None = None
+
+
+class ResolveRegistryLockActivityInputs(BaseModel):
+    """Inputs for resolve_registry_lock_activity."""
+
+    role: Role
+    action_names: set[str]
+
+
+class ResolveWorkflowAliasActivityInputs(BaseModel):
+    workflow_alias: str
+    """Possibly a templated expression"""
+    role: Role
+    use_committed: bool = True
+    """Use committed WorkflowDefinition alias (True) or draft Workflow alias (False)."""
+
+
+class GetErrorHandlerWorkflowIDActivityInputs(BaseModel):
+    role: Role
+    args: DSLRunArgs
+
+
+WorkflowExportFormat = Literal["json", "yaml"]
+
+
+class ExternalWorkflowDefinition(BaseModel):
+    """External interchange format for workflow definitions.
+
+    Lets you restore a workflow from a JSON or YAML file."""
+
+    workspace_id: WorkspaceID | None = Field(
+        default=None,
+        description=(
+            "If provided, can only be restored in the same workspace (TBD)."
+            "Otherwise, can be added to any workspace."
+            "This will be set to `workspace_id`"
+        ),
+    )
+    workflow_id: WorkflowUUID | None = Field(
+        default=None,
+        description="Workflow ID. If not provided, a new workflow ID will be created.",
+    )
+    created_at: datetime | None = Field(
+        default=None,
+        description="Creation datetime of the workflow, will be set to current time if not provided.",
+    )
+    updated_at: datetime | None = Field(
+        default=None,
+        description="Last update datetime of the workflow, will be set to current time if not provided.",
+    )
+    version: int = Field(default=1, gt=0)
+    definition: DSLInput
+    layout: WorkflowLayout | None = None
+    case_trigger: CaseTriggerConfig | None = None
+
+    @staticmethod
+    def from_database(
+        defn: WorkflowDefinition,
+        *,
+        case_trigger: CaseTriggerConfig | None = None,
+    ) -> ExternalWorkflowDefinition:
+        if case_trigger is None and defn.workflow and defn.workflow.case_trigger:
+            workflow_case_trigger = defn.workflow.case_trigger
+            if is_case_trigger_configured(
+                status=workflow_case_trigger.status,
+                event_types=workflow_case_trigger.event_types,
+                tag_filters=workflow_case_trigger.tag_filters,
+            ):
+                case_trigger = CaseTriggerConfig.model_validate(
+                    {
+                        "status": workflow_case_trigger.status,
+                        "event_types": workflow_case_trigger.event_types,
+                        "tag_filters": workflow_case_trigger.tag_filters,
+                    }
+                )
+        return ExternalWorkflowDefinition(
+            workspace_id=defn.workspace_id,
+            workflow_id=WorkflowUUID.new(defn.workflow_id),
+            created_at=defn.created_at,
+            updated_at=defn.updated_at,
+            version=defn.version,
+            definition=DSLInput.model_validate(defn.content),
+            layout=WorkflowLayout.from_workflow(defn.workflow)
+            if defn.workflow
+            else None,
+            case_trigger=case_trigger,
+        )
+
+    @field_validator("workflow_id", mode="before")
+    @classmethod
+    def validate_workflow_id(cls, v: AnyWorkflowID | None) -> WorkflowUUID | None:
+        """Convert any valid workflow ID format to WorkflowUUID."""
+        if v is None:
+            return None
+        return WorkflowUUID.new(v)
+
+    def extract_layout_positions(
+        self,
+    ) -> tuple[
+        tuple[float, float] | None,
+        tuple[float, float, float] | None,
+        dict[str, tuple[float, float]] | None,
+    ]:
+        if self.layout is None:
+            return None, None, None
+        return self.layout.extract_positions()
+
+
+class WorkflowLayoutPosition(BaseModel):
+    x: float | None = None
+    y: float | None = None
+    position: dict[str, float] | None = None
+
+    @field_validator("position")
+    @classmethod
+    def validate_position(
+        cls, value: dict[str, float] | None
+    ) -> dict[str, float] | None:
+        if value is None:
+            return None
+        return {
+            key: coordinate for key, coordinate in value.items() if key in {"x", "y"}
+        }
+
+    @field_validator("x", "y", mode="before")
+    @classmethod
+    def coerce_coordinate(cls, value: Any) -> float | None:
+        if value is None:
+            return None
+        return float(value)
+
+    def resolved(self) -> tuple[float, float]:
+        x = self.x
+        y = self.y
+        if self.position is not None:
+            if x is None:
+                x = self.position.get("x")
+            if y is None:
+                y = self.position.get("y")
+        return (x if x is not None else 0.0, y if y is not None else 0.0)
+
+
+class WorkflowLayoutViewport(BaseModel):
+    x: float | None = None
+    y: float | None = None
+    zoom: float | None = None
+
+
+class WorkflowLayoutActionPosition(WorkflowLayoutPosition):
+    ref: str
+
+
+class WorkflowLayout(BaseModel):
+    trigger: WorkflowLayoutPosition | None = None
+    viewport: WorkflowLayoutViewport | None = None
+    actions: list[WorkflowLayoutActionPosition] = Field(default_factory=list)
+
+    @classmethod
+    def from_workflow(cls, workflow: Workflow) -> WorkflowLayout:
+        return cls(
+            trigger=WorkflowLayoutPosition(
+                x=workflow.trigger_position_x,
+                y=workflow.trigger_position_y,
+            ),
+            viewport=WorkflowLayoutViewport(
+                x=workflow.viewport_x,
+                y=workflow.viewport_y,
+                zoom=workflow.viewport_zoom,
+            ),
+            actions=[
+                WorkflowLayoutActionPosition(
+                    ref=action.ref,
+                    x=action.position_x,
+                    y=action.position_y,
+                )
+                for action in _iter_sorted_actions(workflow.actions or [])
+            ],
+        )
+
+    def extract_positions(
+        self,
+    ) -> tuple[
+        tuple[float, float] | None,
+        tuple[float, float, float] | None,
+        dict[str, tuple[float, float]] | None,
+    ]:
+        trigger_position = self.trigger.resolved() if self.trigger is not None else None
+        viewport = (
+            (
+                self.viewport.x if self.viewport.x is not None else 0.0,
+                self.viewport.y if self.viewport.y is not None else 0.0,
+                self.viewport.zoom if self.viewport.zoom is not None else 1.0,
+            )
+            if self.viewport is not None
+            else None
+        )
+        action_positions = (
+            {action.ref: action.resolved() for action in self.actions}
+            if self.actions
+            else None
+        )
+        return trigger_position, viewport, action_positions
+
+
+def _iter_sorted_actions(actions: Iterable[Any]) -> list[Any]:
+    return sorted(actions, key=lambda action: action.ref)
+
+
+class WorkflowCommitResponse(BaseModel):
+    workflow_id: WorkflowIDShort
+    status: Literal["success", "failure"]
+    message: str
+    errors: list[ValidationResult] | None = None
+    metadata: dict[str, Any] | None = None
+
+    def to_orjson(self, status_code: int) -> ORJSONResponse:
+        return ORJSONResponse(
+            status_code=status_code, content=self.model_dump(exclude_none=True)
+        )
+
+
+class WorkflowDSLCreateResponse(Schema):
+    workflow: Workflow | None = None
+    errors: list[ValidationResult] | None = None
+
+
+class WorkflowEntrypointValidationRequest(BaseModel):
+    expects: dict[str, ExpectedField] | None = None
+
+
+class WorkflowEntrypointValidationResponse(BaseModel):
+    valid: bool
+    errors: list[ValidationResult] = Field(default_factory=list)
+
+
+class WorkflowMoveToFolder(BaseModel):
+    folder_path: str | None = None
+
+
+# =============================================================================
+# Graph API Schemas
+# =============================================================================
+
+
+class GraphResponse(Schema):
+    """Response for GET /workflows/{id}/graph.
+
+    Returns the canonical graph projection from Actions.
+    """
+
+    version: int = Field(description="Graph version for optimistic concurrency")
+    nodes: list[dict[str, Any]] = Field(description="React Flow nodes")
+    edges: list[dict[str, Any]] = Field(description="React Flow edges")
+    viewport: dict[str, Any] = Field(
+        default_factory=lambda: {"x": 0, "y": 0, "zoom": 1}
+    )
+
+
+class GraphOperationType(StrEnum):
+    """Graph operation types."""
+
+    ADD_NODE = "add_node"
+    UPDATE_NODE = "update_node"
+    DELETE_NODE = "delete_node"
+    ADD_EDGE = "add_edge"
+    DELETE_EDGE = "delete_edge"
+    MOVE_NODES = "move_nodes"
+    UPDATE_TRIGGER_POSITION = "update_trigger_position"
+    UPDATE_VIEWPORT = "update_viewport"
+
+
+class GraphOperation(Schema):
+    """A single graph operation."""
+
+    type: GraphOperationType
+    payload: dict[str, Any] = Field(description="Operation-specific payload")
+
+
+class GraphOperationsRequest(Schema):
+    """Request for PATCH /workflows/{id}/graph.
+
+    Applies a batch of graph operations with optimistic concurrency.
+    """
+
+    base_version: int = Field(
+        description="Expected current graph_version. Returns 409 if mismatched."
+    )
+    operations: list[GraphOperation] = Field(
+        description="List of operations to apply atomically"
+    )
+
+
+class AddNodePayload(Schema):
+    """Payload for add_node operation."""
+
+    type: str = Field(description="Action type (UDF key)")
+    title: str = Field(description="Action title")
+    description: str | None = Field(default="", description="Action description")
+    inputs: str | None = Field(
+        default=None,
+        description="YAML inputs for the action. Defaults to None.",
+    )
+    control_flow: dict[str, Any] | None = Field(
+        default=None,
+        description="Control flow configuration for the action",
+    )
+    position_x: float = 0.0
+    position_y: float = 0.0
+
+
+class UpdateNodePayload(Schema):
+    """Payload for update_node operation."""
+
+    action_id: uuid.UUID
+    title: str | None = None
+    description: str | None = None
+    inputs: str | None = None
+    control_flow: dict[str, Any] | None = None
+
+
+class DeleteNodePayload(Schema):
+    """Payload for delete_node operation."""
+
+    action_id: uuid.UUID
+
+
+class AddEdgePayload(Schema):
+    """Payload for add_edge operation."""
+
+    source_id: str = Field(
+        description="Source node ID. For trigger: 'trigger-{uuid}', for action: action UUID"
+    )
+    source_type: Literal["trigger", "udf"] = Field(description="Type of source node")
+    target_id: uuid.UUID = Field(description="Target action ID")
+    source_handle: Literal["success", "error"] | None = Field(
+        default=None,
+        description="Edge handle type. Required for 'udf' source, ignored for 'trigger'",
+    )
+
+
+class DeleteEdgePayload(Schema):
+    """Payload for delete_edge operation."""
+
+    source_id: str = Field(
+        description="Source node ID. For trigger: 'trigger-{uuid}', for action: action UUID"
+    )
+    source_type: Literal["trigger", "udf"] = Field(description="Type of source node")
+    target_id: uuid.UUID
+    source_handle: Literal["success", "error"] | None = Field(
+        default=None,
+        description="Edge handle type. Required for 'udf' source, ignored for 'trigger'",
+    )
+
+
+class MoveNodesPayload(Schema):
+    """Payload for move_nodes operation (layout only)."""
+
+    positions: list[dict[str, Any]] = Field(
+        description="List of {action_id, x, y} positions"
+    )
+
+
+class UpdateTriggerPositionPayload(Schema):
+    """Payload for update_trigger_position operation."""
+
+    x: float
+    y: float
+
+
+class UpdateViewportPayload(Schema):
+    """Payload for update_viewport operation."""
+
+    x: float
+    y: float
+    zoom: float

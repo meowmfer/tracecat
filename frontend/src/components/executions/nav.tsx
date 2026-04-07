@@ -14,6 +14,7 @@ import {
   workflowExecutionsTerminateWorkflowExecution,
 } from "@/client"
 import NoContent from "@/components/no-content"
+import { Badge } from "@/components/ui/badge"
 import { buttonVariants } from "@/components/ui/button"
 import {
   HoverCard,
@@ -91,8 +92,8 @@ export function WorkflowExecutionNav({
   }
 
   return (
-    <div className="group flex flex-col gap-4 py-2">
-      <nav className="grid gap-1 px-2">
+    <div className="group flex h-full flex-col">
+      <nav className="grid">
         {workflowExecutions.map((execution, index) => {
           const executionId = parseExecutionId(execution.id)[1]
           return (
@@ -101,8 +102,9 @@ export function WorkflowExecutionNav({
                 href={`${baseUrl}/executions/${executionId}`}
                 className={cn(
                   buttonVariants({ variant: "default", size: "sm" }),
-                  "justify-start bg-background text-muted-foreground shadow-none hover:cursor-default hover:bg-gray-100",
-                  executionId === currExecutionIdDecoded && "bg-gray-200"
+                  "h-11 justify-start rounded-none bg-background px-3 text-muted-foreground shadow-none hover:cursor-default hover:bg-muted/50",
+                  executionId === currExecutionIdDecoded &&
+                    "bg-muted-foreground/10"
                 )}
               >
                 <div className="flex items-center">
@@ -110,6 +112,14 @@ export function WorkflowExecutionNav({
                     status={execution.status}
                     className="size-4"
                   />
+                  {execution.execution_type === "draft" && (
+                    <Badge
+                      variant="outline"
+                      className="ml-2 h-4 px-1 py-0 text-[10px] font-normal text-muted-foreground"
+                    >
+                      Draft
+                    </Badge>
+                  )}
                   <span className="ml-2">
                     {new Date(execution.start_time).toLocaleString()}
                   </span>
@@ -132,7 +142,7 @@ export function WorkflowExecutionNav({
                             side="left"
                             className="flex items-center gap-4  shadow-lg"
                           >
-                            <span>Terminate Run</span>
+                            <span>Terminate run</span>
                           </TooltipContent>
                         </Tooltip>
                       ) : (
@@ -152,19 +162,19 @@ export function WorkflowExecutionNav({
                 <div className="flex flex-col items-start justify-between space-y-2 text-start text-xs">
                   <div className="flex flex-col">
                     <Label className="text-xs text-muted-foreground">
-                      Execution ID
+                      Execution id
                     </Label>
                     <span>{executionId}</span>
                   </div>
                   <div className="flex flex-col">
                     <Label className="text-xs text-muted-foreground">
-                      Run ID
+                      Run id
                     </Label>
                     <span>{execution.run_id}</span>
                   </div>
                   <div className="flex flex-col">
                     <Label className="text-xs text-muted-foreground">
-                      Start Time
+                      Start time
                     </Label>
                     <span>
                       {new Date(execution.start_time).toLocaleString()}
@@ -172,7 +182,7 @@ export function WorkflowExecutionNav({
                   </div>
                   <div className="flex flex-col">
                     <Label className="text-xs text-muted-foreground">
-                      End Time
+                      End time
                     </Label>
                     <span>
                       {execution.close_time

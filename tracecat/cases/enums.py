@@ -64,6 +64,7 @@ class CaseEventType(StrEnum):
     CASE_UPDATED = "case_updated"
     CASE_CLOSED = "case_closed"
     CASE_REOPENED = "case_reopened"
+    CASE_VIEWED = "case_viewed"
     PRIORITY_CHANGED = "priority_changed"
     SEVERITY_CHANGED = "severity_changed"
     STATUS_CHANGED = "status_changed"
@@ -71,4 +72,56 @@ class CaseEventType(StrEnum):
     ASSIGNEE_CHANGED = "assignee_changed"
     ATTACHMENT_CREATED = "attachment_created"
     ATTACHMENT_DELETED = "attachment_deleted"
+    TAG_ADDED = "tag_added"
+    TAG_REMOVED = "tag_removed"
     PAYLOAD_CHANGED = "payload_changed"
+    TASK_CREATED = "task_created"
+    TASK_DELETED = "task_deleted"
+    TASK_STATUS_CHANGED = "task_status_changed"
+    TASK_PRIORITY_CHANGED = "task_priority_changed"
+    TASK_WORKFLOW_CHANGED = "task_workflow_changed"
+    TASK_ASSIGNEE_CHANGED = "task_assignee_changed"
+    DROPDOWN_VALUE_CHANGED = "dropdown_value_changed"
+    TABLE_ROW_LINKED = "table_row_linked"
+    TABLE_ROW_UNLINKED = "table_row_unlinked"
+    COMMENT_CREATED = "comment_created"
+    COMMENT_UPDATED = "comment_updated"
+    COMMENT_DELETED = "comment_deleted"
+    COMMENT_REPLY_CREATED = "comment_reply_created"
+    COMMENT_REPLY_UPDATED = "comment_reply_updated"
+    COMMENT_REPLY_DELETED = "comment_reply_deleted"
+
+
+class CaseTaskStatus(StrEnum):
+    """Case task status values."""
+
+    TODO = "todo"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+
+
+class CaseFieldKind(StrEnum):
+    """Semantic kind for case custom fields.
+
+    Controls how the field is rendered in the UI without changing the underlying
+    SQL storage type.
+    """
+
+    LONG_TEXT = "LONG_TEXT"
+    URL = "URL"
+
+
+class CaseFieldReadType(StrEnum):
+    """Read-only type for case field metadata."""
+
+    TEXT = "TEXT"
+    INTEGER = "INTEGER"
+    NUMERIC = "NUMERIC"
+    DATE = "DATE"
+    BOOLEAN = "BOOLEAN"
+    TIMESTAMPTZ = "TIMESTAMPTZ"
+    JSONB = "JSONB"
+    SELECT = "SELECT"
+    MULTI_SELECT = "MULTI_SELECT"
+    UUID = "UUID"

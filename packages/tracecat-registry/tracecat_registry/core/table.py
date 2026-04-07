@@ -1,23 +1,11 @@
 from datetime import datetime
 from typing import Annotated, Any, Literal
-from uuid import UUID
 
-import orjson
-from pydantic_core import to_jsonable_python
 from typing_extensions import Doc
 
-from tracecat.config import TRACECAT__MAX_ROWS_CLIENT_POSTGRES
-from tracecat.tables.enums import SqlType
-from tracecat.tables.models import (
-    TableColumnCreate,
-    TableColumnRead,
-    TableCreate,
-    TableRead,
-    TableRowInsert,
-)
-from tracecat.tables.service import TablesService
-from tracecat_registry import registry
-from tracecat.expressions.functions import tabulate
+from tracecat_registry import config, registry, types
+from tracecat_registry.context import get_context
+from tracecat_registry.sdk.exceptions import TracecatConflictError
 
 
 @registry.register(
@@ -40,15 +28,30 @@ async def lookup(
         Doc("The value to lookup."),
     ],
 ) -> dict[str, Any] | None:
-    async with TablesService.with_session() as service:
-        rows = await service.lookup_rows(
-            table_name=table,
-            columns=[column],
-            values=[value],
-            limit=min(1, TRACECAT__MAX_ROWS_CLIENT_POSTGRES),
-        )
-    # Since we set limit=1, we know there will be at most one row
-    return rows[0] if rows else None
+    return await get_context().tables.lookup(table=table, column=column, value=value)
+
+
+@registry.register(
+    default_title="Is in table",
+    description="Check if a value exists in a table column.",
+    display_group="Tables",
+    namespace="core.table",
+)
+async def is_in(
+    table: Annotated[
+        str,
+        Doc("The table to check."),
+    ],
+    column: Annotated[
+        str,
+        Doc("The column to check in."),
+    ],
+    value: Annotated[
+        Any,
+        Doc("The value to check for."),
+    ],
+) -> bool:
+    return await get_context().tables.exists(table=table, column=column, value=value)
 
 
 @registry.register(
@@ -75,19 +78,19 @@ async def lookup_many(
         Doc("The maximum number of rows to return."),
     ] = 100,
 ) -> list[dict[str, Any]]:
-    if limit > TRACECAT__MAX_ROWS_CLIENT_POSTGRES:
+    if limit > config.TRACECAT__LIMIT_CURSOR_MAX:
         raise ValueError(
-            f"Limit cannot be greater than {TRACECAT__MAX_ROWS_CLIENT_POSTGRES}"
+            f"Limit cannot be greater than {config.TRACECAT__LIMIT_CURSOR_MAX}"
         )
 
-    async with TablesService.with_session() as service:
-        rows = await service.lookup_rows(
-            table_name=table,
-            columns=[column],
-            values=[value],
-            limit=limit,
-        )
-    return rows
+    params: dict[str, Any] = {
+        "table": table,
+        "column": column,
+        "value": value,
+    }
+    if limit is not None:
+        params["limit"] = limit
+    return await get_context().tables.lookup_many(**params)
 
 
 @registry.register(
@@ -121,34 +124,50 @@ async def search_rows(
         datetime | None,
         Doc("Filter rows updated after this time."),
     ] = None,
-    offset: Annotated[
-        int,
-        Doc("The number of rows to skip."),
-    ] = 0,
+    cursor: Annotated[
+        str | None,
+        Doc("Cursor for pagination."),
+    ] = None,
+    reverse: Annotated[
+        bool,
+        Doc("Reverse pagination direction."),
+    ] = False,
     limit: Annotated[
         int,
         Doc("The maximum number of rows to return."),
     ] = 100,
-) -> list[dict[str, Any]]:
-    if limit > TRACECAT__MAX_ROWS_CLIENT_POSTGRES:
+    paginate: Annotated[
+        bool,
+        Doc("If true, return cursor pagination metadata along with items."),
+    ] = False,
+) -> types.TableSearchResponse | list[dict[str, Any]]:
+    if limit > config.TRACECAT__LIMIT_CURSOR_MAX:
         raise ValueError(
-            f"Limit cannot be greater than {TRACECAT__MAX_ROWS_CLIENT_POSTGRES}"
+            f"Limit cannot be greater than {config.TRACECAT__LIMIT_CURSOR_MAX}"
         )
 
-    async with TablesService.with_session() as service:
-        db_table = await service.get_table_by_name(table)
-
-        rows = await service.search_rows(
-            table=db_table,
-            search_term=search_term,
-            start_time=start_time,
-            end_time=end_time,
-            updated_before=updated_before,
-            updated_after=updated_after,
-            limit=limit,
-            offset=offset,
-        )
-        return rows
+    params: dict[str, Any] = {"table": table}
+    if search_term is not None:
+        params["search_term"] = search_term
+    if start_time is not None:
+        params["start_time"] = start_time
+    if end_time is not None:
+        params["end_time"] = end_time
+    if updated_before is not None:
+        params["updated_before"] = updated_before
+    if updated_after is not None:
+        params["updated_after"] = updated_after
+    if limit is not None:
+        params["limit"] = limit
+    if cursor is not None:
+        params["cursor"] = cursor
+    params["reverse"] = reverse
+    response = await get_context().tables.search_rows(**params)
+    if paginate:
+        return response
+    if isinstance(response, dict):
+        return response.get("items")
+    return response
 
 
 @registry.register(
@@ -170,12 +189,12 @@ async def insert_row(
         bool,
         Doc("If true, update the row if it already exists (based on primary key)."),
     ] = False,
-) -> Any:
-    params = TableRowInsert(data=row_data, upsert=upsert)
-    async with TablesService.with_session() as service:
-        db_table = await service.get_table_by_name(table)
-        row = await service.insert_row(table=db_table, params=params)
-    return row
+) -> dict[str, Any]:
+    return await get_context().tables.insert_row(
+        table=table,
+        row_data=row_data,
+        upsert=upsert,
+    )
 
 
 @registry.register(
@@ -198,12 +217,11 @@ async def insert_rows(
         Doc("If true, update the rows if they already exist (based on primary key)."),
     ] = False,
 ) -> int:
-    async with TablesService.with_session() as service:
-        db_table = await service.get_table_by_name(table)
-        count = await service.batch_insert_rows(
-            table=db_table, rows=rows_data, upsert=upsert
-        )
-    return count
+    return await get_context().tables.insert_rows(
+        table=table,
+        rows_data=rows_data,
+        upsert=upsert,
+    )
 
 
 @registry.register(
@@ -225,13 +243,12 @@ async def update_row(
         dict[str, Any],
         Doc("The new data for the row."),
     ],
-) -> Any:
-    async with TablesService.with_session() as service:
-        db_table = await service.get_table_by_name(table)
-        row = await service.update_row(
-            table=db_table, row_id=UUID(row_id), data=row_data
-        )
-    return row
+) -> dict[str, Any]:
+    return await get_context().tables.update_row(
+        table=table,
+        row_id=row_id,
+        row_data=row_data,
+    )
 
 
 @registry.register(
@@ -250,9 +267,7 @@ async def delete_row(
         Doc("The ID of the row to delete."),
     ],
 ) -> None:
-    async with TablesService.with_session() as service:
-        db_table = await service.get_table_by_name(table)
-        await service.delete_row(table=db_table, row_id=UUID(row_id))
+    await get_context().tables.delete_row(table=table, row_id=row_id)
 
 
 @registry.register(
@@ -269,26 +284,29 @@ async def create_table(
     columns: Annotated[
         list[dict[str, Any]] | None,
         Doc(
-            "List of column definitions. Each column should have 'name', 'type', and optionally 'nullable' and 'default' fields."
+            "List of column definitions. Each item is an object with required "
+            "`name` and uppercase `type`, plus optional `nullable`, `default`, "
+            "and `options` fields. Use `TEXT`, `INTEGER`, `NUMERIC`, "
+            "`BOOLEAN`, `DATE`, `TIMESTAMPTZ`, `JSONB`, `SELECT`, or "
+            "`MULTI_SELECT`. `options` is required for `SELECT` and "
+            "`MULTI_SELECT`, and invalid for other types."
         ),
     ] = None,
-) -> dict[str, Any]:
-    column_objects = []
-    if columns:
-        for col in columns:
-            column_objects.append(
-                TableColumnCreate(
-                    name=col["name"],
-                    type=SqlType(col["type"]),
-                    nullable=col.get("nullable", True),
-                    default=col.get("default"),
-                )
-            )
-
-    params = TableCreate(name=name, columns=column_objects)
-    async with TablesService.with_session() as service:
-        table = await service.create_table(params)
-    return table.model_dump()
+    raise_on_duplicate: Annotated[
+        bool,
+        Doc("If true, raise an error if the table already exists."),
+    ] = True,
+) -> types.Table:
+    client_params: dict[str, Any] = {
+        "name": name,
+        "raise_on_duplicate": raise_on_duplicate,
+    }
+    if columns is not None:
+        client_params["columns"] = columns
+    try:
+        return await get_context().tables.create_table(**client_params)
+    except TracecatConflictError as exc:
+        raise ValueError("Table already exists") from exc
 
 
 @registry.register(
@@ -297,10 +315,8 @@ async def create_table(
     display_group="Tables",
     namespace="core.table",
 )
-async def list_tables() -> list[dict[str, Any]]:
-    async with TablesService.with_session() as service:
-        tables = await service.list_tables()
-    return [table.model_dump() for table in tables]
+async def list_tables() -> list[types.Table]:
+    return await get_context().tables.list_tables()
 
 
 @registry.register(
@@ -311,30 +327,8 @@ async def list_tables() -> list[dict[str, Any]]:
 )
 async def get_table_metadata(
     name: Annotated[str, Doc("The name of the table to get.")],
-) -> dict[str, Any]:
-    async with TablesService.with_session() as service:
-        table = await service.get_table_by_name(name)
-
-        # Get unique index info or default to empty dict if not present
-        index_columns = await service.get_index(table)
-
-        # Convert to response model (includes is_index field)
-        res = TableRead(
-            id=table.id,
-            name=table.name,
-            columns=[
-                TableColumnRead(
-                    id=column.id,
-                    name=column.name,
-                    type=SqlType(column.type),
-                    nullable=column.nullable,
-                    default=column.default,
-                    is_index=column.name in index_columns,
-                )
-                for column in table.columns
-            ],
-        )
-    return res.model_dump(mode="json")
+) -> types.TableRead:
+    return await get_context().tables.get_table_metadata(name)
 
 
 @registry.register(
@@ -349,24 +343,18 @@ async def download(
         Literal["json", "ndjson", "csv", "markdown"] | None,
         Doc("The format to download the table data in."),
     ] = None,
-    limit: Annotated[int, Doc("The maximum number of rows to download.")] = 1000,
+    limit: Annotated[
+        int, Doc("The maximum number of rows to download.")
+    ] = config.TRACECAT__LIMIT_TABLE_DOWNLOAD_MAX,
 ) -> list[dict[str, Any]] | str:
-    if limit > 1000:
-        raise ValueError("Cannot return more than 1000 rows")
+    if limit > config.TRACECAT__LIMIT_TABLE_DOWNLOAD_MAX:
+        raise ValueError(
+            f"Cannot return more than {config.TRACECAT__LIMIT_TABLE_DOWNLOAD_MAX} rows"
+        )
 
-    async with TablesService.with_session() as service:
-        table = await service.get_table_by_name(name)
-        rows = await service.list_rows(table=table, limit=limit)
-
-        # Convert rows to JSON-safe format (handles UUID and other non-serializable types)
-        json_safe_rows = to_jsonable_python(rows, fallback=str)
-
-        if format is None:
-            return json_safe_rows
-        elif format == "json":
-            return orjson.dumps(json_safe_rows).decode()
-        elif format == "ndjson":
-            return "\n".join([orjson.dumps(row).decode() for row in json_safe_rows])
-        elif format in ["csv", "markdown"]:
-            return tabulate(json_safe_rows, format)
-        return tabulate(json_safe_rows, format)
+    params: dict[str, Any] = {"table": name}
+    if format is not None:
+        params["format"] = format
+    if limit is not None:
+        params["limit"] = limit
+    return await get_context().tables.download(**params)

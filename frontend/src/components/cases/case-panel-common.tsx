@@ -1,3 +1,5 @@
+"use client"
+
 import { Clock } from "lucide-react"
 import type React from "react"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
@@ -14,6 +16,8 @@ import {
 } from "@/components/ui/tooltip"
 import type { User } from "@/lib/auth"
 import { cn, shortTimeAgo } from "@/lib/utils"
+
+export const CASE_WORKFLOW_TRIGGER_EVENT = "tracecat:open-case-workflow-trigger"
 
 export function UserHoverCard({
   user,
@@ -40,11 +44,6 @@ export function UserHoverCard({
             <div className="flex items-center gap-2">
               <span className="text-base font-medium">{displayName}</span>
               <span className="text-muted-foreground">({username})</span>
-              {user.role && (
-                <span className="rounded-md bg-primary/10 px-2 py-0.5 text-xs font-medium capitalize text-primary">
-                  {user.role}
-                </span>
-              )}
             </div>
             <span className="text-xs text-muted-foreground">{user.email}</span>
           </div>

@@ -2,8 +2,8 @@
 
 from typing import ClassVar
 
-from tracecat.integrations.models import ProviderMetadata, ProviderScopes
 from tracecat.integrations.providers.base import MCPAuthProvider
+from tracecat.integrations.schemas import ProviderMetadata, ProviderScopes
 
 
 class RunRevealMCPProvider(MCPAuthProvider):
@@ -21,7 +21,7 @@ class RunRevealMCPProvider(MCPAuthProvider):
     id: ClassVar[str] = "runreveal_mcp"
 
     # MCP server endpoint - OAuth endpoints discovered automatically
-    _mcp_server_uri: ClassVar[str] = "https://api.runreveal.com/mcp"
+    mcp_server_uri: ClassVar[str] = "https://api.runreveal.com/mcp"
 
     # No default scopes - authorization server determines based on user/workspace permissions
     scopes: ClassVar[ProviderScopes] = ProviderScopes(default=[])
@@ -37,11 +37,5 @@ class RunRevealMCPProvider(MCPAuthProvider):
             "Connect to RunReveal MCP to access queries, detections, and table schemas. "
             "Permissions are automatically determined based on your workspace role."
         ),
-        setup_steps=[
-            "Click 'Connect' to begin OAuth authorization",
-            "Select your RunReveal workspace",
-            "Review and approve the OAuth client permissions",
-            "Complete authorization to enable MCP integration",
-        ],
         api_docs_url="https://docs.runreveal.com/ai-chat/model-context-protocol",
     )
