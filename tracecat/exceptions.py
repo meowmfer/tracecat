@@ -31,6 +31,10 @@ class TracecatValidationError(TracecatException):
     """Tracecat user-facing validation error"""
 
 
+class TracecatConflictError(TracecatException):
+    """Tracecat user-facing resource conflict error"""
+
+
 class TracecatDSLError(TracecatValidationError):
     """Tracecat user-facing DSL error"""
 
@@ -121,6 +125,10 @@ class TracecatServiceError(TracecatException):
 
 class RegistryError(TracecatException):
     """Generic exception raised when a registry error occurs."""
+
+
+class BuiltinRegistryHasNoSelectionError(RegistryError):
+    """Raised when the builtin platform registry has no selected version yet."""
 
 
 class RegistryActionError(RegistryError):

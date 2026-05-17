@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import aioboto3
 import aiofiles
+from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
 from tracecat import config
@@ -26,6 +27,9 @@ if TYPE_CHECKING:
 
 
 DEFAULT_DOWNLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024  # 8MB
+DEFAULT_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024  # 8MB
+DEFAULT_UPLOAD_MAX_CONCURRENCY = 4
+DEFAULT_UPLOAD_MAX_IO_QUEUE_SIZE = 2
 
 
 @asynccontextmanager
@@ -350,6 +354,101 @@ async def upload_file(
         raise
 
 
+async def upload_file_from_path(
+    path: Path,
+    key: str,
+    bucket: str,
+    content_type: str | None = None,
+) -> None:
+    """Stream a file from disk to S3 using multipart upload.
+
+    Avoids loading the entire file into memory, which matters for large
+    artifacts like registry venv tarballs.
+
+    Args:
+        path: Local file to upload
+        key: S3 object key
+        bucket: Bucket name (required)
+        content_type: Optional MIME type
+
+    Raises:
+        FileNotFoundError: If `path` does not exist
+        ClientError: If the upload fails
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    extra_args = {"ContentType": content_type} if content_type else None
+    transfer_config = TransferConfig(
+        multipart_threshold=DEFAULT_UPLOAD_CHUNK_SIZE_BYTES,
+        multipart_chunksize=DEFAULT_UPLOAD_CHUNK_SIZE_BYTES,
+        max_concurrency=DEFAULT_UPLOAD_MAX_CONCURRENCY,
+        max_io_queue=DEFAULT_UPLOAD_MAX_IO_QUEUE_SIZE,
+    )
+
+    try:
+        async with get_storage_client() as s3_client:
+            await s3_client.upload_file(
+                Filename=str(path),
+                Bucket=bucket,
+                Key=key,
+                ExtraArgs=extra_args,
+                Config=transfer_config,
+            )
+            logger.info(
+                "File uploaded successfully",
+                key=key,
+                bucket=bucket,
+                size=path.stat().st_size,
+            )
+    except ClientError as e:
+        logger.error(
+            "Failed to upload file",
+            key=key,
+            bucket=bucket,
+            error=str(e),
+        )
+        raise
+
+
+async def copy_file(
+    *,
+    source_key: str,
+    destination_key: str,
+    bucket: str,
+    content_type: str | None = None,
+) -> None:
+    """Copy an object within a bucket without routing bytes through the app."""
+
+    try:
+        async with get_storage_client() as s3_client:
+            kwargs = {
+                "Bucket": bucket,
+                "Key": destination_key,
+                "CopySource": {"Bucket": bucket, "Key": source_key},
+            }
+            if content_type:
+                kwargs["ContentType"] = content_type
+                kwargs["MetadataDirective"] = "REPLACE"
+
+            await s3_client.copy_object(**kwargs)
+            logger.info(
+                "File copied successfully",
+                source_key=source_key,
+                destination_key=destination_key,
+                bucket=bucket,
+            )
+    except ClientError as e:
+        logger.error(
+            "Failed to copy file",
+            source_key=source_key,
+            destination_key=destination_key,
+            bucket=bucket,
+            error=str(e),
+        )
+        raise
+
+
 async def download_file(key: str, bucket: str) -> bytes:
     """Download a file from S3.
 
@@ -470,7 +569,7 @@ async def open_download_stream(
         bucket: Bucket name (required).
 
     Yields:
-        Tuple of (StreamingBody, content_length).
+        Tuple of (streaming body, content_length).
 
     Raises:
         ClientError: If the download fails.
@@ -481,8 +580,8 @@ async def open_download_stream(
             response = await s3_client.get_object(Bucket=bucket, Key=key)
             body: StreamingBody = response["Body"]
             content_length: int | None = response.get("ContentLength")
-            async with body as stream:
-                yield stream, content_length
+            async with body:
+                yield body, content_length
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "NoSuchKey":
             logger.warning(

@@ -7,12 +7,14 @@ from tracecat.agent.common.types import (
     MCPServerConfig,
     MCPStdioServerConfig,
 )
+from tracecat.agent.skill.types import ResolvedSkillRef
 from tracecat.agent.types import AgentConfig
 from tracecat.agent.workflow_schemas import (
     AgentConfigPayload,
     MCPHttpServerConfigPayload,
     MCPServerConfigPayload,
     MCPStdioServerConfigPayload,
+    ResolvedSkillRefPayload,
 )
 
 
@@ -32,6 +34,7 @@ def _mcp_server_to_payload(
                 args=server.get("args"),
                 env=server.get("env"),
                 timeout=server.get("timeout"),
+                id=server.get("id"),
             )
         case {
             "name": str(name),
@@ -44,6 +47,7 @@ def _mcp_server_to_payload(
                 headers=server.get("headers"),
                 transport=server.get("transport"),
                 timeout=server.get("timeout"),
+                id=server.get("id"),
             )
         case _:
             raise ValueError(f"Unsupported MCP server config: {server!r}")
@@ -63,6 +67,8 @@ def _mcp_server_from_payload(server: MCPServerConfigPayload) -> MCPServerConfig:
                 stdio_server["env"] = server.env
             if server.timeout is not None:
                 stdio_server["timeout"] = server.timeout
+            if server.id is not None:
+                stdio_server["id"] = server.id
             return stdio_server
         case MCPHttpServerConfigPayload():
             http_server: MCPHttpServerConfig = {
@@ -76,7 +82,31 @@ def _mcp_server_from_payload(server: MCPServerConfigPayload) -> MCPServerConfig:
                 http_server["transport"] = server.transport
             if server.timeout is not None:
                 http_server["timeout"] = server.timeout
+            if server.id is not None:
+                http_server["id"] = server.id
             return http_server
+
+
+def _resolved_skill_to_payload(skill: ResolvedSkillRef) -> ResolvedSkillRefPayload:
+    """Convert a resolved skill ref into a workflow-safe payload."""
+
+    return ResolvedSkillRefPayload(
+        skill_id=skill.skill_id,
+        skill_name=skill.skill_name,
+        skill_version_id=skill.skill_version_id,
+        manifest_sha256=skill.manifest_sha256,
+    )
+
+
+def _resolved_skill_from_payload(skill: ResolvedSkillRefPayload) -> ResolvedSkillRef:
+    """Convert a workflow-safe skill ref back into a runtime dataclass."""
+
+    return ResolvedSkillRef(
+        skill_id=skill.skill_id,
+        skill_name=skill.skill_name,
+        skill_version_id=skill.skill_version_id,
+        manifest_sha256=skill.manifest_sha256,
+    )
 
 
 def agent_config_to_payload(config: AgentConfig) -> AgentConfigPayload:
@@ -84,7 +114,9 @@ def agent_config_to_payload(config: AgentConfig) -> AgentConfigPayload:
     return AgentConfigPayload(
         model_name=config.model_name,
         model_provider=config.model_provider,
+        catalog_id=config.catalog_id,
         base_url=config.base_url,
+        passthrough=config.passthrough,
         instructions=config.instructions,
         output_type=config.output_type,
         actions=config.actions,
@@ -96,8 +128,15 @@ def agent_config_to_payload(config: AgentConfig) -> AgentConfigPayload:
             if config.mcp_servers
             else None
         ),
+        agents=config.agents,
         retries=config.retries,
+        enable_thinking=config.enable_thinking,
         enable_internet_access=config.enable_internet_access,
+        resolved_skills=(
+            [_resolved_skill_to_payload(skill) for skill in config.resolved_skills]
+            if config.resolved_skills
+            else None
+        ),
     )
 
 
@@ -106,7 +145,9 @@ def agent_config_from_payload(payload: AgentConfigPayload) -> AgentConfig:
     return AgentConfig(
         model_name=payload.model_name,
         model_provider=payload.model_provider,
+        catalog_id=payload.catalog_id,
         base_url=payload.base_url,
+        passthrough=payload.passthrough,
         instructions=payload.instructions,
         output_type=payload.output_type,
         actions=payload.actions,
@@ -118,6 +159,13 @@ def agent_config_from_payload(payload: AgentConfigPayload) -> AgentConfig:
             if payload.mcp_servers
             else None
         ),
+        agents=payload.agents,
         retries=payload.retries,
+        enable_thinking=payload.enable_thinking,
         enable_internet_access=payload.enable_internet_access,
+        resolved_skills=(
+            [_resolved_skill_from_payload(skill) for skill in payload.resolved_skills]
+            if payload.resolved_skills
+            else None
+        ),
     )

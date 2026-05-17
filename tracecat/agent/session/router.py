@@ -4,10 +4,9 @@ This router consolidates chat and session endpoints into a unified /agent/sessio
 """
 
 import uuid
-from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from tracecat import config
 from tracecat.agent.adapter import vercel
@@ -23,9 +22,8 @@ from tracecat.agent.session.service import AgentSessionService
 from tracecat.agent.session.types import AgentSessionEntity
 from tracecat.agent.stream.connector import AgentStream
 from tracecat.agent.stream.events import StreamFormat
-from tracecat.agent.types import StreamKey
-from tracecat.auth.credentials import RoleACL
-from tracecat.auth.types import Role
+from tracecat.agent.subagents import ResolvedAgentsConfig
+from tracecat.auth.dependencies import WorkspaceUserRouteRole
 from tracecat.authz.controls import require_scope
 from tracecat.chat.schemas import (
     ChatRead,
@@ -40,21 +38,12 @@ from tracecat.logger import logger
 
 router = APIRouter(prefix="/agent/sessions", tags=["agent-sessions"])
 
-WorkspaceUser = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="yes",
-    ),
-]
-
 
 @router.post("")
 @require_scope("agent:execute")
 async def create_session(
     request: AgentSessionCreate,
-    role: WorkspaceUser,
+    role: WorkspaceUserRouteRole,
     session: AsyncDBSession,
 ) -> AgentSessionRead:
     """Create a new agent session associated with an entity."""
@@ -66,7 +55,7 @@ async def create_session(
 @router.get("")
 @require_scope("agent:read")
 async def list_sessions(
-    role: WorkspaceUser,
+    role: WorkspaceUserRouteRole,
     session: AsyncDBSession,
     entity_type: AgentSessionEntity | None = Query(
         None, description="Filter by entity type"
@@ -111,7 +100,7 @@ async def list_sessions(
 @require_scope("agent:read")
 async def get_session(
     session_id: uuid.UUID,
-    role: WorkspaceUser,
+    role: WorkspaceUserRouteRole,
     session: AsyncDBSession,
 ) -> AgentSessionReadWithMessages | ChatRead:
     """Get an agent session or legacy chat with its message history.
@@ -136,6 +125,11 @@ async def get_session(
             tools=agent_session.tools,
             agent_preset_id=agent_session.agent_preset_id,
             agent_preset_version_id=agent_session.agent_preset_version_id,
+            agents_binding=(
+                ResolvedAgentsConfig.model_validate(agent_session.agents_binding)
+                if agent_session.agents_binding is not None
+                else None
+            ),
             harness_type=agent_session.harness_type,
             created_at=agent_session.created_at,
             updated_at=agent_session.updated_at,
@@ -175,7 +169,7 @@ async def get_session(
 @require_scope("agent:read")
 async def get_session_vercel(
     session_id: uuid.UUID,
-    role: WorkspaceUser,
+    role: WorkspaceUserRouteRole,
     session: AsyncDBSession,
 ) -> AgentSessionReadVercel | ChatReadVercel:
     """Get an agent session or legacy chat with message history in Vercel format.
@@ -200,6 +194,11 @@ async def get_session_vercel(
             tools=agent_session.tools,
             agent_preset_id=agent_session.agent_preset_id,
             agent_preset_version_id=agent_session.agent_preset_version_id,
+            agents_binding=(
+                ResolvedAgentsConfig.model_validate(agent_session.agents_binding)
+                if agent_session.agents_binding is not None
+                else None
+            ),
             harness_type=agent_session.harness_type,
             created_at=agent_session.created_at,
             updated_at=agent_session.updated_at,
@@ -238,7 +237,7 @@ async def get_session_vercel(
 async def update_session(
     session_id: uuid.UUID,
     params: AgentSessionUpdate,
-    role: WorkspaceUser,
+    role: WorkspaceUserRouteRole,
     session: AsyncDBSession,
 ) -> AgentSessionRead:
     """Update session properties."""
@@ -266,7 +265,7 @@ async def update_session(
 @require_scope("agent:execute")
 async def delete_session(
     session_id: uuid.UUID,
-    role: WorkspaceUser,
+    role: WorkspaceUserRouteRole,
     session: AsyncDBSession,
 ) -> None:
     """Delete an agent session."""
@@ -294,8 +293,7 @@ async def delete_session(
 async def send_message(
     session_id: uuid.UUID,
     request: ChatRequest,
-    role: WorkspaceUser,
-    session: AsyncDBSession,
+    role: WorkspaceUserRouteRole,
     http_request: Request,
 ) -> StreamingResponse:
     """Send a message to the agent session with streaming response.
@@ -307,7 +305,6 @@ async def send_message(
     3. Streams the response back in Vercel's data protocol format
     """
     try:
-        svc = AgentSessionService(session, role)
         workspace_id = role.workspace_id
         if workspace_id is None:
             raise HTTPException(
@@ -315,34 +312,47 @@ async def send_message(
                 detail="Workspace access required",
             )
 
-        # Check if this is a legacy chat (read-only)
-        if await svc.is_legacy_session(session_id):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Legacy chat sessions are read-only and cannot receive new messages",
-            )
-
-        await svc.validate_turn_request(session_id=session_id, request=request)
-
         stream = await AgentStream.new(session_id, workspace_id)
-        if isinstance(request, ContinueRunRequest):
-            # Continuations should follow only newly appended events. Resuming
-            # from the persisted DB cursor can replay the approval request that
-            # the active client already rendered before clicking approve/deny.
-            start_id = "$"
-        else:
-            # Each fresh execution turn gets a new Redis stream buffer so
-            # stale events from the prior turn are never replayed.
-            await stream.reset_for_new_turn()
-            # Read from the beginning of the freshly cleared stream so we still
-            # pick up events emitted before the SSE response starts consuming.
-            start_id = "0-0"
+        async with AgentSessionService.with_session(role=role) as svc:
+            # Check if this is a legacy chat (read-only)
+            if await svc.is_legacy_session(session_id):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Legacy chat sessions are read-only and cannot receive new messages",
+                )
 
-        # Run session turn (spawns DurableAgentWorkflow)
-        await svc.run_turn(
-            session_id=session_id,
-            request=request,
-        )
+            await svc.validate_turn_request(session_id=session_id, request=request)
+
+            if isinstance(request, ContinueRunRequest):
+                # Continuations should follow only newly appended events. Resuming
+                # from the persisted DB cursor can replay the approval request that
+                # the active client already rendered before clicking approve/deny.
+                start_id = "$"
+            else:
+                # Each fresh execution turn gets a new Redis stream buffer so
+                # stale events from the prior turn are never replayed.
+                await stream.reset_for_new_turn()
+                # Read from the beginning of the freshly cleared stream so we still
+                # pick up events emitted before the SSE response starts consuming.
+                start_id = "0-0"
+
+            # Run session turn (spawns DurableAgentWorkflow)
+            try:
+                await svc.run_turn(
+                    session_id=session_id,
+                    request=request,
+                )
+            except Exception:
+                if not isinstance(request, ContinueRunRequest):
+                    try:
+                        await stream.abort_new_turn()
+                    except Exception as rollback_exc:
+                        logger.warning(
+                            "Failed to clear stream state after turn startup failure",
+                            session_id=session_id,
+                            error=str(rollback_exc),
+                        )
+                raise
 
         logger.info(
             "Starting Vercel streaming session",
@@ -390,7 +400,7 @@ async def send_message(
 @router.get("/{session_id}/stream")
 @require_scope("agent:read")
 async def stream_session_events(
-    role: WorkspaceUser,
+    role: WorkspaceUserRouteRole,
     request: Request,
     session_id: uuid.UUID,
     format: StreamFormat = Query(
@@ -418,11 +428,12 @@ async def stream_session_events(
         if agent_session is not None:
             last_stream_id = agent_session.last_stream_id
 
-    start_id = last_stream_id or request.headers.get("Last-Event-ID", "0-0")
-    stream_key = StreamKey(workspace_id, session_id)
+    last_event_id = request.headers.get("Last-Event-ID")
+    if last_stream_id is None and not last_event_id:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    start_id = last_event_id or last_stream_id or "0-0"
     logger.info(
         "Starting session stream",
-        stream_key=stream_key,
         last_id=start_id,
         session_id=session_id,
     )
@@ -448,7 +459,7 @@ async def stream_session_events(
 @require_scope("agent:execute")
 async def fork_session(
     session_id: uuid.UUID,
-    role: WorkspaceUser,
+    role: WorkspaceUserRouteRole,
     session: AsyncDBSession,
     request: AgentSessionForkRequest | None = None,
 ) -> AgentSessionRead:

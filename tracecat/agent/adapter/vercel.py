@@ -59,6 +59,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_core import to_json
 
+from tracecat.agent.approvals.enums import ApprovalStatus
 from tracecat.agent.common.stream_types import StreamEventType, UnifiedStreamEvent
 from tracecat.agent.mcp.metadata import strip_proxy_tool_metadata
 from tracecat.agent.mcp.utils import normalize_mcp_tool_name
@@ -74,6 +75,7 @@ from tracecat.agent.types import UnifiedMessage
 from tracecat.chat.constants import (
     APPROVAL_DATA_PART_TYPE,
     APPROVAL_REQUEST_HEADER,
+    COMPACTION_DATA_PART_TYPE,
 )
 from tracecat.chat.enums import MessageKind
 from tracecat.logger import logger
@@ -687,6 +689,12 @@ class ToolOutputAvailableEventPayload:
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
+class CompactionDataPayload:
+    phase: Literal["started", "completed", "failed"]
+    pre_tokens: int | None = None
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
 class DataEventPayload:
     type: str
     data: Any
@@ -952,21 +960,37 @@ class VercelStreamContext:
 
             case StreamEventType.TOOL_RESULT:
                 tool_call_id = event.tool_call_id or "unknown"
+                has_known_tool_input = self.tool_input_emitted.get(tool_call_id, False)
+                has_cached_tool_metadata = tool_call_id in self.approval_tool_name
 
                 # Close any open part for this tool
                 if tool_call_id in self.tool_index:
                     index = self.tool_index[tool_call_id]
                     for message in self.collect_current_part_end_events(index=index):
                         yield message
+                    has_known_tool_input = True
+
+                if (
+                    not has_known_tool_input
+                    and not has_cached_tool_metadata
+                    and event.tool_name is None
+                ):
+                    logger.debug(
+                        "Skipping uncorrelated tool result without tool metadata",
+                        tool_call_id=tool_call_id,
+                    )
+                    return
 
                 # Ensure input-available before output
                 if not self.tool_input_emitted.get(tool_call_id, False):
-                    tool_name = self.approval_tool_name.get(
-                        tool_call_id, event.tool_name or "tool"
+                    tool_name = (
+                        self.approval_tool_name.get(tool_call_id)
+                        or event.tool_name
+                        or "tool"
                     )
                     yield ToolInputAvailableEventPayload(
                         toolCallId=tool_call_id,
-                        toolName=str(tool_name),
+                        toolName=tool_name,
                         input=self.approval_input.get(tool_call_id, {}),
                     )
                     self.tool_input_emitted[tool_call_id] = True
@@ -994,6 +1018,17 @@ class VercelStreamContext:
                         toolCallId=tool_call_id,
                         output=event.tool_output,
                     )
+
+            case StreamEventType.COMPACTION:
+                metadata = event.metadata or {}
+                payload = CompactionDataPayload(
+                    phase=metadata["phase"],
+                    pre_tokens=metadata.get("pre_tokens"),
+                )
+                yield DataEventPayload(
+                    type=COMPACTION_DATA_PART_TYPE,
+                    data=payload,
+                )
 
             case StreamEventType.ERROR:
                 yield ErrorEventPayload(errorText=event.error or "Unknown error")
@@ -1492,10 +1527,27 @@ def convert_chat_messages_to_ui(
     tool_entries: dict[str, MutableToolPart] = {}
 
     for chat_message in messages:
+        # Handle compaction status badges from DB (kind=COMPACTION)
+        # These show when a conversation was compacted
+        if chat_message.kind == MessageKind.COMPACTION and chat_message.compaction:
+            compaction_data = chat_message.compaction
+            # Create a system message with the compaction data part
+            mutable_message = MutableMessage(
+                id=chat_message.id,
+                role="system",
+                parts=[
+                    DataUIPart(type=COMPACTION_DATA_PART_TYPE, data=compaction_data)
+                ],
+            )
+            mutable_messages.append(mutable_message)
+            continue
+
         # Handle approval request bubbles from DB (kind=APPROVAL_REQUEST)
         # These are inserted by list_messages() when loading session history
         if chat_message.kind == MessageKind.APPROVAL_REQUEST and chat_message.approval:
             approval = chat_message.approval
+            if approval.status != ApprovalStatus.PENDING:
+                continue
             # Create an assistant message with the approval data part
             # Normalize tool name for display
             tool_name = normalize_mcp_tool_name(approval.tool_name)

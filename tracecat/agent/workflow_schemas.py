@@ -6,9 +6,12 @@ across Temporal workflow/activity boundaries predictably.
 
 from __future__ import annotations
 
+import uuid
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, model_validator
+
+from tracecat.agent.subagents import AgentSubagentsConfig
 
 _LEGACY_AGENT_CONFIG_KEYS = frozenset({"deps_type", "custom_tools"})
 
@@ -38,6 +41,10 @@ class MCPHttpServerConfigPayload(BaseModel):
     headers: dict[str, str] | None = Field(default=None)
     transport: Literal["http", "sse"] | None = Field(default=None)
     timeout: int | None = Field(default=None)
+    id: str | None = Field(default=None)
+    """UUID of the source ``mcp_integrations`` row. Lets trusted callers
+    re-resolve secrets per use without carrying them through workflow
+    history."""
 
 
 class MCPStdioServerConfigPayload(BaseModel):
@@ -51,12 +58,26 @@ class MCPStdioServerConfigPayload(BaseModel):
     args: list[str] | None = Field(default=None)
     env: dict[str, str] | None = Field(default=None)
     timeout: int | None = Field(default=None)
+    id: str | None = Field(default=None)
+    """UUID of the source ``mcp_integrations`` row. See
+    :class:`MCPHttpServerConfigPayload.id`."""
 
 
 type MCPServerConfigPayload = Annotated[
     MCPHttpServerConfigPayload | MCPStdioServerConfigPayload,
     Discriminator("type"),
 ]
+
+
+class ResolvedSkillRefPayload(BaseModel):
+    """Workflow-safe resolved skill version reference."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    skill_id: uuid.UUID
+    skill_name: str
+    skill_version_id: uuid.UUID
+    manifest_sha256: str
 
 
 class AgentConfigPayload(BaseModel):
@@ -88,7 +109,9 @@ class AgentConfigPayload(BaseModel):
 
     model_name: str
     model_provider: str
+    catalog_id: uuid.UUID | None = Field(default=None)
     base_url: str | None = Field(default=None)
+    passthrough: bool = Field(default=False)
     instructions: str | None = Field(default=None)
     output_type: str | dict[str, Any] | None = Field(default=None)
     actions: list[str] | None = Field(default=None)
@@ -96,5 +119,8 @@ class AgentConfigPayload(BaseModel):
     tool_approvals: dict[str, bool] | None = Field(default=None)
     model_settings: dict[str, Any] | None = Field(default=None)
     mcp_servers: list[MCPServerConfigPayload] | None = Field(default=None)
+    agents: AgentSubagentsConfig = Field(default_factory=AgentSubagentsConfig)
     retries: int
+    enable_thinking: bool = Field(default=True)
     enable_internet_access: bool = Field(default=False)
+    resolved_skills: list[ResolvedSkillRefPayload] | None = Field(default=None)

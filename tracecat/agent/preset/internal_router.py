@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from collections.abc import Mapping
+from typing import Annotated, cast
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, StringConstraints
@@ -11,9 +12,12 @@ from tracecat.agent.preset.schemas import (
     AgentPresetCreate,
     AgentPresetRead,
     AgentPresetReadMinimal,
+    AgentPresetSkillBindingBase,
     AgentPresetUpdate,
+    build_subagent_eligibility,
 )
 from tracecat.agent.preset.service import AgentPresetService
+from tracecat.agent.subagents import AgentSubagentsConfig, has_manual_tool_approvals
 from tracecat.agent.types import OutputType
 from tracecat.auth.dependencies import ExecutorWorkspaceRole
 from tracecat.authz.controls import require_scope
@@ -52,6 +56,9 @@ class PresetCreateRequest(BaseModel):
     base_url: str | None = Field(default=None, max_length=500)
     output_type: OutputType | None = Field(default=None)
     actions: list[str] | None = Field(default=None)
+    enable_thinking: bool = Field(default=True)
+    enable_internet_access: bool = Field(default=False)
+    skills: list[AgentPresetSkillBindingBase] | None = Field(default=None)
 
 
 class PresetUpdateRequest(BaseModel):
@@ -66,6 +73,9 @@ class PresetUpdateRequest(BaseModel):
     base_url: str | None = Field(default=None, max_length=500)
     output_type: OutputType | None = Field(default=None)
     actions: list[str] | None = Field(default=None)
+    enable_thinking: bool | None = Field(default=None)
+    enable_internet_access: bool | None = Field(default=None)
+    skills: list[AgentPresetSkillBindingBase] | None = Field(default=None)
 
 
 @router.get("", response_model=list[AgentPresetReadMinimal])
@@ -78,7 +88,30 @@ async def list_presets(
     """List all agent presets for the workspace."""
     service = AgentPresetService(session, role=role)
     presets = await service.list_presets()
-    return [AgentPresetReadMinimal.model_validate(preset) for preset in presets]
+    results: list[AgentPresetReadMinimal] = []
+    for preset in presets:
+        read = AgentPresetReadMinimal.model_validate(preset)
+        agents = AgentSubagentsConfig.model_validate(preset.agents or {})
+        tool_approvals = cast(Mapping[str, bool] | None, preset.tool_approvals)
+        capabilities = []
+        if has_manual_tool_approvals(tool_approvals):
+            capabilities.append("approvals")
+        if agents.enabled:
+            capabilities.append("subagents")
+        if preset.enable_internet_access:
+            capabilities.append("internet_access")
+        results.append(
+            read.model_copy(
+                update={
+                    "capabilities": capabilities,
+                    "current_version_subagent_eligibility": build_subagent_eligibility(
+                        agents_config=agents,
+                        tool_approvals=tool_approvals,
+                    ),
+                }
+            )
+        )
+    return results
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -88,14 +121,14 @@ async def create_preset(
     role: ExecutorWorkspaceRole,
     session: AsyncDBSession,
     params: PresetCreateRequest,
-) -> dict[str, Any]:
+) -> AgentPresetRead:
     """Create a new agent preset."""
     service = AgentPresetService(session, role=role)
     try:
         preset = await service.create_preset(
             AgentPresetCreate(**params.model_dump(exclude_unset=True))
         )
-        return AgentPresetRead.model_validate(preset).model_dump(mode="json")
+        return await service.build_preset_read(preset)
     except TracecatValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -110,7 +143,7 @@ async def get_preset_by_slug(
     role: ExecutorWorkspaceRole,
     session: AsyncDBSession,
     slug: str,
-) -> dict[str, Any]:
+) -> AgentPresetRead:
     """Get an agent preset by slug."""
     service = AgentPresetService(session, role=role)
     preset = await service.get_preset_by_slug(slug)
@@ -119,7 +152,7 @@ async def get_preset_by_slug(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent preset with slug '{slug}' not found",
         )
-    return AgentPresetRead.model_validate(preset).model_dump(mode="json")
+    return await service.build_preset_read(preset)
 
 
 @router.patch("/by-slug/{slug}")
@@ -130,7 +163,7 @@ async def update_preset_by_slug(
     session: AsyncDBSession,
     slug: str,
     params: PresetUpdateRequest,
-) -> dict[str, Any]:
+) -> AgentPresetRead:
     """Update an agent preset by slug."""
     service = AgentPresetService(session, role=role)
     preset = await service.get_preset_by_slug(slug)
@@ -143,7 +176,7 @@ async def update_preset_by_slug(
         updated_preset = await service.update_preset(
             preset, AgentPresetUpdate(**params.model_dump(exclude_unset=True))
         )
-        return AgentPresetRead.model_validate(updated_preset).model_dump(mode="json")
+        return await service.build_preset_read(updated_preset)
     except TracecatValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

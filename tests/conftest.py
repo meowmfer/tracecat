@@ -1,23 +1,36 @@
 import asyncio
 import importlib
 import os
+import socket
+import subprocess
+import sys
+import tempfile
 import time
+import urllib.request
 import uuid
 from collections.abc import AsyncGenerator, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-# Set workflow return strategy BEFORE importing tracecat modules
-# test_workflows.py was written when we returned the full context by default
-# This must happen before any tracecat imports to ensure config reads the correct value
+from dotenv import dotenv_values, load_dotenv
+
+# Set test defaults BEFORE importing tracecat modules so config reads them.
+# test_workflows.py was written when we returned the full context by default.
 os.environ.setdefault("TRACECAT__WORKFLOW_RETURN_STRATEGY", "context")
+os.environ.setdefault(
+    "TRACECAT__SERVICE_KEY",
+    dotenv_values(Path(__file__).resolve().parents[1] / ".env").get(
+        "TRACECAT__SERVICE_KEY"
+    )
+    or "test-service-key",
+)
 
 import aioboto3
 import pytest
 import redis
 import tracecat_registry.integrations.aws_boto3 as boto3_module
-from dotenv import load_dotenv
 from minio import Minio
 from minio.error import S3Error
 from sqlalchemy import create_engine, select, text
@@ -136,6 +149,26 @@ def _lock_test_db_setup(conn: Any, db_uri: str) -> None:
         text("SELECT pg_advisory_xact_lock(hashtext(:lock_key)::bigint)"),
         {"lock_key": f"tests:db-setup:{db_name}"},
     )
+
+
+def _get_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_http_ok(url: str, *, timeout: float = 45.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1.0) as response:
+                if 200 <= response.getcode() < 300:
+                    return
+        except Exception as exc:
+            last_error = exc
+        time.sleep(0.2)
+    raise RuntimeError(f"Timed out waiting for {url}: {last_error}")
 
 
 PG_PORT = int(os.environ.get("PG_PORT", "5432"))
@@ -856,13 +889,15 @@ def registry_version_with_manifest(default_org: None) -> Iterator[None]:
                     RegistryVersion.version == version,
                 )
             )
+            fake_tarball_uri = "s3://test/test.tar.gz"
+
             if rv is None:
                 rv = RegistryVersion(
                     organization_id=TEST_ORG_ID,
                     repository_id=repo.id,
                     version=version,
                     manifest=manifest,
-                    tarball_uri="s3://test/test.tar.gz",
+                    tarball_uri=fake_tarball_uri,
                 )
                 session.add(rv)
                 try:
@@ -882,7 +917,7 @@ def registry_version_with_manifest(default_org: None) -> Iterator[None]:
                     session.refresh(rv)
             else:
                 rv.manifest = manifest
-                rv.tarball_uri = "s3://test/test.tar.gz"
+                rv.tarball_uri = fake_tarball_uri
                 session.commit()
 
             # Set current_version_id on the repository for lock resolution
@@ -933,7 +968,7 @@ def registry_version_with_manifest(default_org: None) -> Iterator[None]:
                     repository_id=platform_repo.id,
                     version=version,
                     manifest=manifest,
-                    tarball_uri="s3://test/test.tar.gz",
+                    tarball_uri=fake_tarball_uri,
                 )
                 session.add(platform_rv)
                 try:
@@ -952,11 +987,31 @@ def registry_version_with_manifest(default_org: None) -> Iterator[None]:
                     session.refresh(platform_rv)
             else:
                 platform_rv.manifest = manifest
-                platform_rv.tarball_uri = "s3://test/test.tar.gz"
+                platform_rv.tarball_uri = fake_tarball_uri
                 session.commit()
 
-            platform_repo.current_version_id = platform_rv.id
-            session.commit()
+            # Do not replace an already-selected live platform registry version.
+            # Integration tests run against Docker services that sync a real
+            # builtin tarball; clobbering it with this fixture's fake tarball can
+            # make unrelated workflow executions try to download s3://test/test.tar.gz.
+            current_platform_version = (
+                session.scalar(
+                    select(PlatformRegistryVersion).where(
+                        PlatformRegistryVersion.id == platform_repo.current_version_id
+                    )
+                )
+                if platform_repo.current_version_id is not None
+                else None
+            )
+            if _should_select_fixture_platform_current(
+                sync_db_uri,
+                current_version=current_platform_version.version
+                if current_platform_version is not None
+                else None,
+                fixture_version=version,
+            ):
+                platform_repo.current_version_id = platform_rv.id
+                session.commit()
 
             # Create PlatformRegistryIndex entries for each action in the manifest
             # This is required for get_actions_from_index to work in agent tools
@@ -1016,6 +1071,24 @@ def registry_version_with_manifest(default_org: None) -> Iterator[None]:
 
     yield
     # No cleanup needed - the database is dropped at the end of the session
+
+
+def _should_select_fixture_platform_current(
+    sync_db_uri: str,
+    *,
+    current_version: str | None,
+    fixture_version: str,
+) -> bool:
+    """Return whether the fixture platform version should be current.
+
+    The fake fixture tarball is safe as the selected version when no platform
+    current exists yet. The shared/default DB may also be used by live executor
+    services, so preserve any existing live current selection instead of
+    clobbering it with the fixture version.
+    """
+    if sync_db_uri == TEST_DB_CONFIG.test_url_sync:
+        return True
+    return current_version is None or current_version == fixture_version
 
 
 @pytest.fixture(scope="function")
@@ -1137,7 +1210,9 @@ def env_sandbox(monkeysession: pytest.MonkeyPatch):
         monkeysession.setattr(config, "TRACECAT__EXECUTOR_BACKEND", "test")
         monkeysession.setenv("TRACECAT__EXECUTOR_BACKEND", "test")
     monkeysession.setenv("TRACECAT__PUBLIC_API_URL", f"http://{api_host}/api")
-    monkeysession.setenv("TRACECAT__SERVICE_KEY", os.environ["TRACECAT__SERVICE_KEY"])
+    service_key = os.environ["TRACECAT__SERVICE_KEY"]
+    monkeysession.setattr(config, "TRACECAT__SERVICE_KEY", service_key)
+    monkeysession.setenv("TRACECAT__SERVICE_KEY", service_key)
     monkeysession.setenv("TRACECAT__SIGNING_SECRET", "test-signing-secret")
     monkeysession.setenv("USER_AUTH_SECRET", "test-user-auth-secret")
     monkeysession.setattr(config, "USER_AUTH_SECRET", "test-user-auth-secret")
@@ -1153,6 +1228,107 @@ def env_sandbox(monkeysession: pytest.MonkeyPatch):
 
     yield
     logger.info("Environment variables cleaned up")
+
+
+@pytest.fixture(scope="session")
+def inprocess_api_server(
+    env_sandbox: None,
+    default_org: None,
+    workflow_bucket: None,
+    redis_server: None,
+    monkeysession: pytest.MonkeyPatch,
+) -> Iterator[str]:
+    """Run the real Tracecat API on localhost without building the Docker image.
+
+    The API runs in a separate local process instead of a thread so SQLAlchemy's
+    async engine/pool is never shared across the pytest and Uvicorn event loops.
+    """
+    port = _get_free_tcp_port()
+    api_url = f"http://127.0.0.1:{port}"
+    monkeysession.setattr(config, "TRACECAT__API_URL", api_url)
+    monkeysession.setenv("TRACECAT__API_URL", api_url)
+    monkeysession.setattr(config, "TRACECAT__PUBLIC_API_URL", f"{api_url}/api")
+    monkeysession.setenv("TRACECAT__PUBLIC_API_URL", f"{api_url}/api")
+
+    api_env = os.environ.copy()
+    api_env["TRACECAT__API_URL"] = api_url
+    api_env["TRACECAT__PUBLIC_API_URL"] = f"{api_url}/api"
+
+    log_file = tempfile.NamedTemporaryFile(
+        mode="w+",
+        prefix=f"tracecat-api-{WORKER_ID}-",
+        suffix=".log",
+        delete=True,
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "tracecat.api.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--log-level",
+            "warning",
+            "--no-access-log",
+        ],
+        env=api_env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        _wait_for_http_ok(f"{api_url}/health")
+        yield api_url
+    except Exception as exc:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+        log_file.seek(0)
+        logs = log_file.read()[-4000:]
+        raise RuntimeError(f"Tracecat API test server failed. Logs:\n{logs}") from exc
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+        log_file.close()
+
+
+@pytest.fixture(autouse=True)
+def api_server_for_requires_api_tests(
+    request: pytest.FixtureRequest,
+    monkeysession: pytest.MonkeyPatch,
+) -> None:
+    """Select the API harness for tests marked ``requires_api``.
+
+    PR CI uses an in-process uvicorn server to keep behavioral coverage without
+    building the API image. Full integration jobs keep using the external API.
+    """
+    if request.node.get_closest_marker("requires_api") is None:
+        return
+
+    mode = os.environ.get("TRACECAT_TEST_API_MODE", "external")
+    if mode == "inprocess":
+        request.getfixturevalue("inprocess_api_server")
+    elif mode == "external":
+        if api_url := os.environ.get("TRACECAT_TEST_EXTERNAL_API_URL"):
+            monkeysession.setattr(config, "TRACECAT__API_URL", api_url)
+            monkeysession.setenv("TRACECAT__API_URL", api_url)
+        return
+    else:
+        pytest.fail(
+            "TRACECAT_TEST_API_MODE must be either 'inprocess' or 'external', "
+            f"got {mode!r}"
+        )
 
 
 @pytest.fixture(scope="session")
@@ -1285,19 +1461,18 @@ async def test_workspace(test_organization, mock_org_id):
     )
 
     async with WorkspaceService.with_session(role=org_role) as svc:
-        # Create new test workspace
         workspace = await svc.create_workspace(name=workspace_name, override_id=ws_id)
 
-        logger.debug("Created test workspace", workspace=workspace)
+    logger.debug("Created test workspace", workspace=workspace)
+    try:
+        yield workspace
+    finally:
+        logger.debug("Teardown test workspace")
         try:
-            yield workspace
-        finally:
-            # Clean up the workspace
-            logger.debug("Teardown test workspace")
-            try:
+            async with WorkspaceService.with_session(role=org_role) as svc:
                 await svc.delete_workspace(ws_id)
-            except Exception as e:
-                logger.warning(f"Error during workspace cleanup: {e}")
+        except Exception as e:
+            logger.warning(f"Error during workspace cleanup: {e}")
 
 
 @pytest.fixture(scope="session")
@@ -1527,12 +1702,13 @@ def minio_server():
 
 @pytest.fixture(scope="session", autouse=True)
 def workflow_bucket(minio_server, env_sandbox):
-    """Create the workflow bucket for result externalization and reset object storage.
+    """Create test storage buckets and reset object storage.
 
     This fixture:
     1. Creates the bucket used by S3ObjectStorage for StoredObject externalization
-    2. Reloads the blob module to pick up the test config
-    3. Resets the object storage singleton so it uses S3ObjectStorage
+    2. Creates API-owned buckets that are needed when tests run without API startup
+    3. Reloads the blob module to pick up the test config
+    4. Resets the object storage singleton so it uses S3ObjectStorage
 
     Session-scoped and autouse to ensure all tests use S3-backed object storage.
     Depends on env_sandbox to ensure config is set before we create the bucket.
@@ -1543,7 +1719,6 @@ def workflow_bucket(minio_server, env_sandbox):
     # Reload blob module to pick up MinIO config
     importlib.reload(blob)
 
-    # Create workflow bucket if it doesn't exist
     access_key, secret_key = _minio_credentials()
     client = Minio(
         f"localhost:{MINIO_PORT}",
@@ -1551,13 +1726,20 @@ def workflow_bucket(minio_server, env_sandbox):
         secret_key=secret_key,
         secure=False,
     )
-    try:
-        if not client.bucket_exists(MINIO_WORKFLOW_BUCKET):
-            client.make_bucket(MINIO_WORKFLOW_BUCKET)
-            logger.info(f"Created workflow bucket: {MINIO_WORKFLOW_BUCKET}")
-    except S3Error as e:
-        if e.code != "BucketAlreadyOwnedByYou":
-            raise
+    bucket_names = {
+        config.TRACECAT__BLOB_STORAGE_BUCKET_ATTACHMENTS,
+        config.TRACECAT__BLOB_STORAGE_BUCKET_REGISTRY,
+        config.TRACECAT__BLOB_STORAGE_BUCKET_SKILLS,
+        config.TRACECAT__BLOB_STORAGE_BUCKET_WORKFLOW,
+    }
+    for bucket_name in sorted(bucket_names):
+        try:
+            if not client.bucket_exists(bucket_name):
+                client.make_bucket(bucket_name)
+                logger.info(f"Created MinIO bucket: {bucket_name}")
+        except S3Error as e:
+            if e.code != "BucketAlreadyOwnedByYou":
+                raise
 
     # Reset object storage singleton so it picks up the test config (S3ObjectStorage)
     object_module.reset_object_storage()

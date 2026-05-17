@@ -22,7 +22,7 @@ import type { ActionType, RegistryActionReadMinimal } from "@/client/types.gen"
 import { CodeEditor } from "@/components/editor/codemirror/code-editor"
 import { YamlStyledEditor } from "@/components/editor/codemirror/yaml-editor"
 import { ExpressionInput } from "@/components/editor/expression-input"
-import { getIcon } from "@/components/icons"
+import { getIcon, ProviderIcon } from "@/components/icons"
 import {
   LockedFeatureChip,
   LockedFeatureModal,
@@ -69,7 +69,11 @@ import {
   useAgentPresetVersions,
 } from "@/hooks/use-agent-presets"
 import { isExpression } from "@/lib/expressions"
-import { useBuilderRegistryActions } from "@/lib/hooks"
+import {
+  useBuilderRegistryActions,
+  useListMcpIntegrations,
+  useWorkspaceAgentModels,
+} from "@/lib/hooks"
 import { getType } from "@/lib/jsonschema"
 import {
   type ExpressionComponent,
@@ -108,10 +112,12 @@ export function formatInlineCode(text: string) {
 export function FormLabelComponent({
   label,
   description,
+  deprecated,
   type = "any",
 }: {
   label?: string
   description?: string
+  deprecated?: boolean
   type?: string
 }) {
   return (
@@ -119,6 +125,11 @@ export function FormLabelComponent({
       <FormLabel className="flex flex-col gap-1 text-xs font-medium">
         <div className="group flex items-center gap-2">
           {label && <span className="font-semibold capitalize">{label}</span>}
+          {deprecated && (
+            <span className="rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase leading-none text-muted-foreground">
+              Deprecated
+            </span>
+          )}
           {type && (
             <span className="font-mono tracking-tighter text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100">
               {type}
@@ -146,6 +157,7 @@ export function ControlledYamlField({
   type,
   info,
   hideType,
+  deprecated,
 }: {
   fieldName: string
   label?: string
@@ -153,6 +165,7 @@ export function ControlledYamlField({
   type?: string
   info?: string
   hideType?: boolean
+  deprecated?: boolean
 }) {
   const methods = useFormContext()
   const forEach = methods.watch("for_each")
@@ -168,6 +181,7 @@ export function ControlledYamlField({
             <FormLabelComponent
               label={label}
               description={description}
+              deprecated={deprecated}
               type={hideType ? undefined : type}
             />
           )}
@@ -207,6 +221,7 @@ export function PolymorphicField({
 }: FormComponentProps) {
   const methods = useFormContext()
   const { description } = fieldDefn
+  const deprecated = fieldDefn.deprecated === true
   const formattedDescription = description?.endsWith(".")
     ? description
     : `${description}.`
@@ -237,6 +252,7 @@ export function PolymorphicField({
         fieldName={fieldName}
         description={formattedDescription}
         type={type}
+        deprecated={deprecated}
       />
     )
   }
@@ -255,6 +271,7 @@ export function PolymorphicField({
                 <FormLabelComponent
                   label={label}
                   description={formattedDescription}
+                  deprecated={deprecated}
                   type={type}
                 />
                 <FormMessage className="whitespace-pre-line" />
@@ -277,6 +294,7 @@ export function PolymorphicField({
                 <FormLabelComponent
                   label={label}
                   description={formattedDescription}
+                  deprecated={deprecated}
                   type={type}
                 />
                 <FormMessage className="whitespace-pre-line" />
@@ -297,6 +315,7 @@ export function PolymorphicField({
             fieldName={fieldName}
             description={formattedDescription}
             type={type}
+            deprecated={deprecated}
           />
         )
       case "action-type":
@@ -309,6 +328,7 @@ export function PolymorphicField({
                 <FormLabelComponent
                   label={label}
                   description={formattedDescription}
+                  deprecated={deprecated}
                   type={type}
                 />
                 <FormMessage className="whitespace-pre-line" />
@@ -317,6 +337,25 @@ export function PolymorphicField({
                   onChange={field.onChange}
                   component={component}
                 />
+              </FormItem>
+            )}
+          />
+        )
+      case "mcp-integration":
+        return (
+          <Controller
+            name={fieldName}
+            control={methods.control}
+            render={({ field }) => (
+              <FormItem>
+                <FormLabelComponent
+                  label={label}
+                  description={formattedDescription}
+                  deprecated={deprecated}
+                  type={type}
+                />
+                <FormMessage className="whitespace-pre-line" />
+                <MCPIntegrationField field={field} />
               </FormItem>
             )}
           />
@@ -407,6 +446,7 @@ export function PolymorphicField({
         fieldName={fieldName}
         description={description}
         type={type}
+        deprecated={deprecated}
       />
     )
   }
@@ -420,6 +460,7 @@ export function PolymorphicField({
           <FormLabelComponent
             label={label}
             description={description}
+            deprecated={deprecated}
             type={type}
           />
           <FormMessage className="whitespace-pre-line" />
@@ -494,6 +535,8 @@ function ComponentContent({
       )
     case "agent-preset":
       return <AgentPresetSelect field={field} />
+    case "agent-model":
+      return <AgentModelSelect field={field} />
     case "tag-input":
       return (
         <CustomTagInput
@@ -574,6 +617,8 @@ function ComponentContent({
           component={component}
         />
       )
+    case "mcp-integration":
+      return <MCPIntegrationField field={field} />
     // Expression, workflow alias, and other fields fallback to expression
     case "workflow-alias":
     case "expression":
@@ -846,6 +891,8 @@ const COMPONENT_LABELS: Record<TracecatComponentId, string> = {
   "action-type": "Action Type",
   "workflow-alias": "Workflow Alias",
   "agent-preset": "Agent Preset",
+  "agent-model": "Agent Model",
+  "mcp-integration": "MCP Integrations",
 }
 
 const COMPONENT_ICONS: Record<TracecatComponentId, LucideIcon> = {
@@ -862,6 +909,8 @@ const COMPONENT_ICONS: Record<TracecatComponentId, LucideIcon> = {
   "action-type": TypeIcon,
   "workflow-alias": WorkflowIcon,
   "agent-preset": WorkflowIcon,
+  "agent-model": WorkflowIcon,
+  "mcp-integration": ListIcon,
 }
 
 function AgentPresetSelect({
@@ -930,6 +979,347 @@ function AgentPresetSelect({
         ))}
       </SelectContent>
     </Select>
+  )
+}
+
+type AgentModelOption = {
+  optionValue: string
+  catalogId: string
+  modelName: string
+  modelProvider: string
+  sourceName: string
+  iconId: string
+}
+
+type ModelSelectionValue = {
+  model_name?: string | null
+  model_provider?: string | null
+  catalog_id?: string | null
+}
+
+function getModelSelectionKey(selection: {
+  catalog_id?: string | null
+  source_id?: string | null
+  model_provider?: string | null
+  model_name?: string | null
+}): string {
+  if (selection.catalog_id) {
+    return selection.catalog_id
+  }
+  return `${selection.source_id ?? "platform"}::${selection.model_provider ?? ""}::${selection.model_name ?? ""}`
+}
+
+function getModelProviderIconId(modelProvider: string): string {
+  switch (modelProvider) {
+    case "anthropic":
+      return "anthropic"
+    case "azure_ai":
+    case "azure_openai":
+      return "microsoft"
+    case "bedrock":
+      return "amazon-bedrock"
+    case "gemini":
+    case "vertex_ai":
+      return "google"
+    case "openai":
+      return "openai"
+    default:
+      return "custom"
+  }
+}
+
+function AgentModelSelect({
+  field,
+}: {
+  field: ControllerRenderProps<FieldValues>
+}) {
+  const workspaceId = useWorkspaceId()
+  const { models, providers, modelsLoading, modelsError } =
+    useWorkspaceAgentModels(workspaceId)
+  const selection = (field.value ?? {}) as ModelSelectionValue
+  const catalogIdValue =
+    typeof selection.catalog_id === "string" ? selection.catalog_id : ""
+  const modelNameValue =
+    typeof selection.model_name === "string" ? selection.model_name : ""
+  const modelProviderValue =
+    typeof selection.model_provider === "string" ? selection.model_provider : ""
+  const options = useMemo<AgentModelOption[]>(() => {
+    const providersById = new Map(
+      (providers ?? []).map((provider) => [provider.id, provider])
+    )
+
+    return (models ?? [])
+      .map((model) => {
+        const provider = model.custom_provider_id
+          ? (providersById.get(model.custom_provider_id) ?? null)
+          : null
+        const sourceName = provider
+          ? provider.display_name
+          : model.organization_id
+            ? "Organization"
+            : "Platform"
+
+        return {
+          optionValue: getModelSelectionKey({
+            catalog_id: model.id,
+            source_id: model.custom_provider_id,
+            model_provider: model.model_provider,
+            model_name: model.model_name,
+          }),
+          catalogId: model.id,
+          modelName: model.model_name,
+          modelProvider: model.model_provider,
+          sourceName,
+          iconId: getModelProviderIconId(model.model_provider),
+        }
+      })
+      .sort((left, right) => {
+        const sourceComparison = left.sourceName.localeCompare(right.sourceName)
+        if (sourceComparison !== 0) {
+          return sourceComparison
+        }
+        return left.modelName.localeCompare(right.modelName)
+      })
+  }, [models, providers])
+  const selectedModel = useMemo(() => {
+    if (catalogIdValue.length > 0) {
+      return (
+        options.find((option) => option.catalogId === catalogIdValue) ?? null
+      )
+    }
+    if (modelNameValue.length === 0 || modelProviderValue.length === 0) {
+      return null
+    }
+    return (
+      options.find(
+        (option) =>
+          option.modelName === modelNameValue &&
+          option.modelProvider === modelProviderValue
+      ) ?? null
+    )
+  }, [catalogIdValue, modelNameValue, modelProviderValue, options])
+  const unavailableSelection = useMemo(() => {
+    if (
+      selectedModel ||
+      modelNameValue.length === 0 ||
+      modelProviderValue.length === 0
+    ) {
+      return null
+    }
+
+    return {
+      optionValue: getModelSelectionKey({
+        catalog_id: catalogIdValue,
+        model_provider: modelProviderValue,
+        model_name: modelNameValue,
+      }),
+      modelName: modelNameValue,
+      modelProvider: modelProviderValue,
+      iconId: getModelProviderIconId(modelProviderValue),
+    }
+  }, [catalogIdValue, modelNameValue, modelProviderValue, selectedModel])
+
+  const handleChange = (value: string) => {
+    const selectedOption = options.find(
+      (option) => option.optionValue === value
+    )
+    if (!selectedOption) {
+      return
+    }
+
+    field.onChange({
+      model_name: selectedOption.modelName,
+      model_provider: selectedOption.modelProvider,
+      catalog_id: selectedOption.catalogId,
+    })
+  }
+
+  const placeholder = !workspaceId
+    ? "Select a workspace to load models"
+    : modelsLoading
+      ? "Loading models..."
+      : modelsError
+        ? "Failed to load models"
+        : "Select a model"
+
+  return (
+    <Select
+      value={selectedModel?.optionValue ?? unavailableSelection?.optionValue}
+      onValueChange={handleChange}
+      disabled={!workspaceId}
+    >
+      <SelectTrigger className="h-12 px-3 [&>svg]:shrink-0">
+        {selectedModel ? (
+          <div className="flex min-w-0 items-center gap-3 text-left">
+            <ProviderIcon
+              className="size-5 rounded-sm p-0.5"
+              providerId={selectedModel.iconId}
+            />
+            <div className="min-w-0 space-y-0.5">
+              <span className="block truncate text-sm font-medium text-foreground">
+                {selectedModel.modelName}
+              </span>
+              <span className="block truncate text-xs text-muted-foreground">
+                {`${selectedModel.sourceName} · ${selectedModel.modelProvider}`}
+              </span>
+            </div>
+          </div>
+        ) : unavailableSelection ? (
+          <div className="flex min-w-0 items-center gap-3 text-left">
+            <ProviderIcon
+              className="size-5 rounded-sm p-0.5"
+              providerId={unavailableSelection.iconId}
+            />
+            <div className="min-w-0 space-y-0.5">
+              <span className="block truncate text-sm font-medium text-foreground">
+                {unavailableSelection.modelName}
+              </span>
+              <span className="block truncate text-xs text-muted-foreground">
+                Unavailable in this workspace
+              </span>
+            </div>
+          </div>
+        ) : (
+          <SelectValue placeholder={placeholder} />
+        )}
+      </SelectTrigger>
+      <SelectContent>
+        {modelsLoading ? (
+          <SelectItem value="__loading" disabled>
+            Loading models...
+          </SelectItem>
+        ) : null}
+        {modelsError ? (
+          <SelectItem value="__error" disabled>
+            Failed to load models
+          </SelectItem>
+        ) : null}
+        {unavailableSelection ? (
+          <SelectItem value={unavailableSelection.optionValue}>
+            <div className="flex min-w-0 items-start gap-3 py-1">
+              <ProviderIcon
+                className="mt-0.5 size-5 rounded-sm p-0.5"
+                providerId={unavailableSelection.iconId}
+              />
+              <div className="min-w-0 space-y-1">
+                <span className="block truncate text-sm font-medium">
+                  {unavailableSelection.modelName}
+                </span>
+                <span className="block truncate text-xs text-muted-foreground">
+                  {`Unavailable in this workspace · ${unavailableSelection.modelProvider}`}
+                </span>
+              </div>
+            </div>
+          </SelectItem>
+        ) : null}
+        {!modelsLoading &&
+        !modelsError &&
+        workspaceId &&
+        options.length === 0 ? (
+          <SelectItem value="__empty" disabled>
+            No models found
+          </SelectItem>
+        ) : null}
+        {options.map((option) => (
+          <SelectItem key={option.optionValue} value={option.optionValue}>
+            <div className="flex min-w-0 items-start gap-3 py-1">
+              <ProviderIcon
+                className="mt-0.5 size-5 rounded-sm p-0.5"
+                providerId={option.iconId}
+              />
+              <div className="min-w-0 space-y-1">
+                <span className="block truncate text-sm font-medium">
+                  {option.modelName}
+                </span>
+                <span className="block truncate text-xs text-muted-foreground">
+                  {`${option.sourceName} · ${option.modelProvider}`}
+                </span>
+              </div>
+            </div>
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+}
+
+/**
+ * Maps an MCP integration slug to its provider icon ID, mirroring the
+ * mapping used by the agent presets builder. Falls back to "custom".
+ */
+function getMcpProviderId(slug: string): string | undefined {
+  const slugMap: Record<string, string> = {
+    "github-copilot": "github_mcp",
+    github: "github_mcp",
+    sentry: "sentry_mcp",
+    notion: "notion_mcp",
+    linear: "linear_mcp",
+    jira: "jira_mcp",
+    runreveal: "runreveal_mcp",
+    "secure-annex": "secureannex_mcp",
+    secureannex: "secureannex_mcp",
+    wiz: "wiz_mcp",
+  }
+  const normalized = slug.toLowerCase()
+  if (slugMap[normalized]) {
+    return slugMap[normalized]
+  }
+  const match = normalized.match(/^([a-z0-9-]+?)[-_]?mcp$/)
+  if (match) {
+    return `${match[1].replace(/-/g, "")}_mcp`
+  }
+  return undefined
+}
+
+/**
+ * Multi-select picker for saved MCP integrations. Stores selected
+ * integration UUIDs on the field; integration metadata is fetched via
+ * `useListMcpIntegrations`.
+ */
+function MCPIntegrationField({
+  field,
+}: {
+  field: ControllerRenderProps<FieldValues>
+}) {
+  const workspaceId = useWorkspaceId()
+  const { mcpIntegrations, mcpIntegrationsIsLoading } = useListMcpIntegrations(
+    workspaceId ?? ""
+  )
+
+  const suggestions: Suggestion[] = useMemo(() => {
+    if (!mcpIntegrations) {
+      return []
+    }
+    return mcpIntegrations
+      .map((integration) => ({
+        id: integration.id,
+        label: integration.name,
+        value: integration.id,
+        description: integration.description || "MCP integration",
+        icon: (
+          <ProviderIcon
+            providerId={getMcpProviderId(integration.slug) ?? "custom"}
+            className="size-3 bg-transparent p-0 mx-1"
+          />
+        ),
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label))
+  }, [mcpIntegrations])
+
+  const value = Array.isArray(field.value) ? (field.value as string[]) : []
+
+  return (
+    <MultiTagCommandInput
+      value={value}
+      onChange={(next) => field.onChange(next)}
+      suggestions={suggestions}
+      searchKeys={["label", "value"]}
+      placeholder={
+        mcpIntegrationsIsLoading
+          ? "Loading integrations..."
+          : "Select MCP integrations"
+      }
+    />
   )
 }
 

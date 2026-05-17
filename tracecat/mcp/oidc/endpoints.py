@@ -13,7 +13,7 @@ import hmac
 import secrets
 import time
 from typing import Annotated, Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import jwt
 from fastapi import APIRouter, Depends, Form, Header, Query, Request
@@ -22,12 +22,28 @@ from starlette.responses import RedirectResponse, Response
 
 from tracecat.auth.users import optional_current_active_user
 from tracecat.config import TRACECAT__PUBLIC_APP_URL
+from tracecat.db.engine import get_async_session_bypass_rls_context_manager
 from tracecat.db.models import User
 from tracecat.logger import logger
 from tracecat.mcp.oidc import config as oidc_config
-from tracecat.mcp.oidc.schemas import AuthCodeData, ResumeTransaction
+from tracecat.mcp.oidc.features import (
+    OFFLINE_ACCESS_SCOPE,
+    get_supported_grant_types,
+    get_supported_scopes,
+    refresh_tokens_enabled,
+    strip_refresh_scope,
+)
+from tracecat.mcp.oidc.refresh_tokens import (
+    RefreshTokenError,
+    issue_refresh_token,
+    rotate_refresh_token,
+)
+from tracecat.mcp.oidc.schemas import (
+    AuthCodeData,
+    RefreshTokenMetadata,
+    ResumeTransaction,
+)
 from tracecat.mcp.oidc.session import (
-    NeedsAction,
     SessionNeedsAction,
     SessionResult,
     resolve_authorize_session,
@@ -73,6 +89,38 @@ def _allowed_redirect_uri() -> str:
     return f"{TRACECAT__PUBLIC_APP_URL.rstrip('/')}/auth/callback"
 
 
+def _normalize_default_port_uri(uri: str) -> str:
+    """Normalize default HTTP(S) ports so equivalent callback URIs compare equal."""
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return uri
+
+    if not parts.scheme or not parts.hostname:
+        return uri
+
+    default_port = {"http": 80, "https": 443}.get(parts.scheme.lower())
+    try:
+        parsed_port = parts.port
+    except ValueError:
+        return uri
+
+    if default_port is None or parsed_port != default_port:
+        return uri
+
+    host = parts.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if parts.username is not None:
+        userinfo = parts.username
+        if parts.password is not None:
+            userinfo = f"{userinfo}:{parts.password}"
+        netloc = f"{userinfo}@{host}"
+    else:
+        netloc = host
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
 def _error_response(
     error: str,
     description: str,
@@ -84,6 +132,32 @@ def _error_response(
         {"error": error, "error_description": description},
         status_code=status_code,
     )
+
+
+def _build_redirect_url(url: str, params: dict[str, str]) -> str:
+    """Return ``url`` with encoded query parameters appended."""
+    parts = urlsplit(url)
+    query = urlencode(
+        [*parse_qsl(parts.query, keep_blank_values=True), *params.items()]
+    )
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+
+
+def _oauth_error_redirect_response(
+    redirect_uri: str,
+    error: str,
+    description: str,
+    *,
+    state: str | None,
+) -> RedirectResponse:
+    """Redirect a validated OAuth authorization request with an error payload."""
+    params = {
+        "error": error,
+        "error_description": description,
+    }
+    if state:
+        params["state"] = state
+    return RedirectResponse(_build_redirect_url(redirect_uri, params), status_code=302)
 
 
 def _validate_pkce_s256(code_verifier: str, code_challenge: str) -> bool:
@@ -152,13 +226,13 @@ async def openid_configuration(request: Request) -> dict[str, Any]:
         "response_types_supported": ["code"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["ES256"],
-        "scopes_supported": ["openid", "profile", "email"],
+        "scopes_supported": get_supported_scopes(),
         "token_endpoint_auth_methods_supported": [
             "client_secret_basic",
             "client_secret_post",
         ],
         "code_challenge_methods_supported": ["S256"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": get_supported_grant_types(),
         "claims_supported": [
             "sub",
             "email",
@@ -204,7 +278,9 @@ async def _handle_authorize(
         return _error_response("unsupported_response_type", "Only 'code' is supported")
     if client_id != oidc_config.INTERNAL_CLIENT_ID:
         return _error_response("invalid_client", "Unknown client_id")
-    if redirect_uri != _allowed_redirect_uri():
+    if _normalize_default_port_uri(redirect_uri) != _normalize_default_port_uri(
+        _allowed_redirect_uri()
+    ):
         return _error_response(
             "invalid_request",
             "redirect_uri does not match the registered callback",
@@ -217,6 +293,14 @@ async def _handle_authorize(
     if not code_challenge:
         return _error_response("invalid_request", "code_challenge is required")
 
+    normalized_scope = strip_refresh_scope(scope)
+    if normalized_scope != scope:
+        logger.warning(
+            "MCP OIDC: stripping offline_access because refresh tokens are disabled",
+            client_id=client_id,
+        )
+        scope = normalized_scope
+
     # Default resource to the MCP endpoint URL when not provided
     # (FastMCP's OIDCProxy does not forward the RFC 8707 resource parameter).
     if not resource:
@@ -226,22 +310,23 @@ async def _handle_authorize(
 
     # --- Session resolution ---
     try:
-        session_result = await resolve_authorize_session(request, user)
+        session_result = await resolve_authorize_session(user)
     except ValueError as exc:
-        # Regular users with zero or multiple org memberships land here.
+        # The OAuth client callback has already been validated at this point.
         logger.warning(
             "MCP OIDC: session resolution failed",
             error=str(exc),
             client_ip=_get_client_ip(request),
         )
-        return _error_response(
+        return _oauth_error_redirect_response(
+            redirect_uri,
             "access_denied",
             "User cannot be resolved to a single organization",
-            status_code=403,
+            state=state,
         )
 
     if isinstance(session_result, SessionNeedsAction):
-        # Store authorize params for replay after login/org-selection.
+        # Store authorize params for replay after login.
         txn_id = secrets.token_urlsafe(32)
         txn = ResumeTransaction(
             transaction_id=txn_id,
@@ -262,25 +347,15 @@ async def _handle_authorize(
         await store_resume_transaction(txn)
 
         frontend_base = TRACECAT__PUBLIC_APP_URL.rstrip("/")
-        match session_result.action:
-            case NeedsAction.LOGIN:
-                logger.info(
-                    "MCP OIDC: no session, redirecting to login",
-                    txn_id=txn_id,
-                )
-                return RedirectResponse(
-                    f"{frontend_base}/oauth/mcp/continue?txn={txn_id}",
-                    status_code=302,
-                )
-            case NeedsAction.ORG_SELECTION:
-                logger.info(
-                    "MCP OIDC: superuser needs org selection",
-                    txn_id=txn_id,
-                )
-                return RedirectResponse(
-                    f"{frontend_base}/oauth/mcp/select-org?txn={txn_id}",
-                    status_code=302,
-                )
+        logger.info(
+            "MCP OIDC: no session, redirecting to login",
+            txn_id=txn_id,
+            action=session_result.action,
+        )
+        return RedirectResponse(
+            f"{frontend_base}/oauth/mcp/continue?txn={txn_id}",
+            status_code=302,
+        )
 
     # --- Issue authorization code ---
     assert isinstance(session_result, SessionResult)
@@ -293,7 +368,7 @@ async def _handle_authorize(
         user_id=resolved_user.id,
         email=resolved_user.email,
         organization_id=org_id,
-        is_platform_superuser=resolved_user.is_superuser,
+        is_platform_superuser=False,
         client_id=client_id,
         redirect_uri=redirect_uri,
         code_challenge=code_challenge,
@@ -313,8 +388,7 @@ async def _handle_authorize(
         client_ip=_get_client_ip(request),
     )
 
-    query = urlencode({"code": code, "state": state})
-    redirect_url = f"{redirect_uri}?{query}"
+    redirect_url = _build_redirect_url(redirect_uri, {"code": code, "state": state})
     return RedirectResponse(redirect_url, status_code=302)
 
 
@@ -410,18 +484,51 @@ async def authorize_resume(
 # ---------------------------------------------------------------------------
 
 
+def _success_headers() -> dict[str, str]:
+    return {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+
+def _mint_access_token(
+    *,
+    user_id: str,
+    organization_id: str,
+    email: str,
+    is_platform_superuser: bool,
+    scope: str,
+    resource: str,
+) -> tuple[str, str, int]:
+    """Mint an access token JWT. Returns (token, jti, exp)."""
+    issuer = oidc_config.get_issuer_url()
+    now = int(time.time())
+    jti = secrets.token_urlsafe(16)
+    claims = {
+        "iss": issuer,
+        "sub": user_id,
+        "aud": resource,
+        "exp": now + oidc_config.ACCESS_TOKEN_LIFETIME_SECONDS,
+        "iat": now,
+        "jti": jti,
+        "scope": scope,
+        "email": email,
+        "organization_id": organization_id,
+        "is_platform_superuser": is_platform_superuser,
+    }
+    return mint_jwt(claims), jti, now
+
+
 @router.post("/token")
 async def token(
     request: Request,
     grant_type: str = Form(...),
-    code: str = Form(...),
-    redirect_uri: str = Form(...),
-    code_verifier: str = Form(...),
+    code: str | None = Form(default=None),
+    redirect_uri: str | None = Form(default=None),
+    code_verifier: str | None = Form(default=None),
+    refresh_token: str | None = Form(default=None),
     client_id: str = Form(default=""),
     client_secret: str = Form(default=""),
     authorization: Annotated[str | None, Header()] = None,
 ) -> Response:
-    """OIDC token endpoint — exchanges an authorization code for tokens."""
+    """OIDC token endpoint — supports authorization_code and refresh_token grants."""
     # --- Content-Type enforcement ---
     content_type = request.headers.get("content-type", "")
     if "application/x-www-form-urlencoded" not in content_type:
@@ -429,13 +536,6 @@ async def token(
             "invalid_request",
             "Content-Type must be application/x-www-form-urlencoded",
             status_code=415,
-        )
-
-    # --- Grant type ---
-    if grant_type != "authorization_code":
-        return _error_response(
-            "unsupported_grant_type",
-            "Only authorization_code is supported",
         )
 
     # --- Client authentication ---
@@ -482,14 +582,43 @@ async def token(
             status_code=429,
         )
 
+    # --- Grant type dispatch ---
+    if grant_type == "authorization_code":
+        return await _handle_authorization_code_grant(
+            code=code,
+            redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
+            auth_client_id=auth_client_id,
+        )
+    if grant_type == "refresh_token":
+        return await _handle_refresh_token_grant(
+            refresh_token=refresh_token,
+            auth_client_id=auth_client_id,
+        )
+    return _error_response(
+        "unsupported_grant_type",
+        "Only authorization_code and refresh_token are supported",
+    )
+
+
+async def _handle_authorization_code_grant(
+    *,
+    code: str | None,
+    redirect_uri: str | None,
+    code_verifier: str | None,
+    auth_client_id: str,
+) -> Response:
+    """Exchange an authorization code for access (+ id, + refresh) tokens."""
+    if not code or not redirect_uri or not code_verifier:
+        return _error_response(
+            "invalid_request",
+            "code, redirect_uri, and code_verifier are required",
+        )
+
     # --- Load and validate auth code ---
     code_data = await load_and_delete_auth_code(code)
     if code_data is None:
-        client_ip = _get_client_ip(request)
-        logger.warning(
-            "MCP OIDC: unknown or reused auth code",
-            client_ip=client_ip,
-        )
+        logger.warning("MCP OIDC: unknown or reused auth code")
         return _error_response(
             "invalid_grant",
             "Authorization code is invalid, expired, or already used",
@@ -523,29 +652,23 @@ async def token(
     if not _validate_pkce_s256(code_verifier, code_data.code_challenge):
         return _error_response("invalid_grant", "PKCE verification failed")
 
-    # --- Mint tokens ---
-    issuer = oidc_config.get_issuer_url()
-    now = int(time.time())
-    jti = secrets.token_urlsafe(16)
+    # --- Mint access token ---
+    granted_scope = strip_refresh_scope(code_data.scope)
 
-    access_token_claims = {
-        "iss": issuer,
-        "sub": str(code_data.user_id),
-        "aud": code_data.resource,
-        "exp": now + oidc_config.ACCESS_TOKEN_LIFETIME_SECONDS,
-        "iat": now,
-        "jti": jti,
-        "scope": code_data.scope,
-        "email": code_data.email,
-        "organization_id": str(code_data.organization_id),
-        "is_platform_superuser": code_data.is_platform_superuser,
-    }
-    access_token = mint_jwt(access_token_claims)
+    access_token, jti, now = _mint_access_token(
+        user_id=str(code_data.user_id),
+        organization_id=str(code_data.organization_id),
+        email=code_data.email,
+        is_platform_superuser=code_data.is_platform_superuser,
+        scope=granted_scope,
+        resource=code_data.resource,
+    )
 
-    # Store JTI for future revocation support
     await store_jti(jti)
 
-    id_token_claims = {
+    # --- Mint id token ---
+    issuer = oidc_config.get_issuer_url()
+    id_token_claims: dict[str, Any] = {
         "iss": issuer,
         "sub": str(code_data.user_id),
         "aud": auth_client_id,
@@ -559,23 +682,104 @@ async def token(
         id_token_claims["nonce"] = code_data.nonce
     id_token = mint_jwt(id_token_claims)
 
+    response_body: dict[str, Any] = {
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": oidc_config.ACCESS_TOKEN_LIFETIME_SECONDS,
+        "id_token": id_token,
+        "scope": granted_scope,
+    }
+
+    # --- Issue refresh token if offline_access was requested ---
+    if OFFLINE_ACCESS_SCOPE in granted_scope.split() and refresh_tokens_enabled():
+        metadata = RefreshTokenMetadata(
+            email=code_data.email,
+            is_platform_superuser=code_data.is_platform_superuser,
+            scope=granted_scope,
+            resource=code_data.resource,
+        )
+        async with get_async_session_bypass_rls_context_manager() as session:
+            refresh_token_value = await issue_refresh_token(
+                session,
+                user_id=code_data.user_id,
+                organization_id=code_data.organization_id,
+                client_id=auth_client_id,
+                metadata=metadata,
+            )
+        response_body["refresh_token"] = refresh_token_value
+
     logger.info(
         "MCP OIDC: issued tokens",
         user_id=str(code_data.user_id),
         organization_id=str(code_data.organization_id),
         jti=jti,
         client_id=auth_client_id,
+        with_refresh="refresh_token" in response_body,
     )
 
+    return JSONResponse(response_body, headers=_success_headers())
+
+
+async def _handle_refresh_token_grant(
+    *,
+    refresh_token: str | None,
+    auth_client_id: str,
+) -> Response:
+    """Rotate a refresh token: validate, mint a new access + refresh pair."""
+    if not refresh_token:
+        return _error_response(
+            "invalid_request", "refresh_token is required for refresh_token grant"
+        )
+    if not refresh_tokens_enabled():
+        logger.warning(
+            "MCP OIDC: refresh_token grant rejected because refresh tokens are disabled",
+            client_id=auth_client_id,
+        )
+        return _error_response(
+            "invalid_grant", "Refresh tokens are disabled on this deployment"
+        )
+
+    try:
+        async with get_async_session_bypass_rls_context_manager() as refresh_session:
+            try:
+                ctx, new_refresh_token = await rotate_refresh_token(
+                    refresh_session, token=refresh_token, client_id=auth_client_id
+                )
+                access_token, jti, _ = _mint_access_token(
+                    user_id=str(ctx.user_id),
+                    organization_id=str(ctx.organization_id),
+                    email=ctx.metadata.email,
+                    is_platform_superuser=ctx.metadata.is_platform_superuser,
+                    scope=ctx.metadata.scope,
+                    resource=ctx.metadata.resource,
+                )
+
+                await store_jti(jti)
+                await refresh_session.commit()
+            except Exception:
+                await refresh_session.rollback()
+                raise
+    except RefreshTokenError as exc:
+        return _error_response(exc.oauth_error, exc.description)
+
+    logger.info(
+        "MCP OIDC: rotated refresh token",
+        user_id=str(ctx.user_id),
+        organization_id=str(ctx.organization_id),
+        jti=jti,
+        family_id=str(ctx.family_id),
+    )
+
+    # Per OIDC spec, id_token is not re-issued on refresh — only access + refresh.
     return JSONResponse(
         {
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": oidc_config.ACCESS_TOKEN_LIFETIME_SECONDS,
-            "id_token": id_token,
-            "scope": code_data.scope,
+            "refresh_token": new_refresh_token,
+            "scope": ctx.metadata.scope,
         },
-        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        headers=_success_headers(),
     )
 
 

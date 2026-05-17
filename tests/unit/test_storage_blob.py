@@ -22,6 +22,7 @@ from tracecat.storage.blob import (
     get_storage_client,
     open_download_stream,
     upload_file,
+    upload_file_from_path,
 )
 
 
@@ -141,16 +142,47 @@ class TestS3Operations:
 
     @pytest.mark.anyio
     @patch("tracecat.storage.blob.get_storage_client")
+    async def test_upload_file_from_path_uses_bounded_transfer_config(
+        self,
+        mock_get_client,
+        tmp_path: Path,
+    ):
+        """Path uploads bound queued multipart payloads."""
+        mock_client = AsyncMock()
+        mock_get_client.return_value.__aenter__.return_value = mock_client
+
+        path = tmp_path / "site-packages.tar.gz"
+        path.write_bytes(b"content")
+
+        await upload_file_from_path(
+            path=path,
+            key="registry/site-packages.tar.gz",
+            bucket="tracecat-registry",
+            content_type="application/gzip",
+        )
+
+        mock_client.upload_file.assert_called_once()
+        kwargs = mock_client.upload_file.call_args.kwargs
+        assert kwargs["Filename"] == str(path)
+        assert kwargs["Bucket"] == "tracecat-registry"
+        assert kwargs["Key"] == "registry/site-packages.tar.gz"
+        assert kwargs["ExtraArgs"] == {"ContentType": "application/gzip"}
+        transfer_config = kwargs["Config"]
+        assert transfer_config.multipart_threshold == 8 * 1024 * 1024
+        assert transfer_config.multipart_chunksize == 8 * 1024 * 1024
+        assert transfer_config.max_request_concurrency == 4
+        assert transfer_config.max_io_queue_size == 2
+
+    @pytest.mark.anyio
+    @patch("tracecat.storage.blob.get_storage_client")
     async def test_download_file(self, mock_get_client):
         """Test file download."""
         mock_client = AsyncMock()
         mock_get_client.return_value.__aenter__.return_value = mock_client
 
         expected_content = b"test content"
-        mock_stream = AsyncMock()
-        mock_stream.read.return_value = expected_content
         mock_body = AsyncMock()
-        mock_body.__aenter__.return_value = mock_stream
+        mock_body.read.return_value = expected_content
         mock_response = {"Body": mock_body}
         mock_client.get_object.return_value = mock_response
 
@@ -520,7 +552,7 @@ class TestEdgeCases:
         mock_client.get_object.return_value = mock_response
 
         async with open_download_stream(key="k", bucket="b") as (stream, length):
-            assert stream is mock_stream
+            assert stream is mock_body
             assert length == 123
 
     @pytest.mark.anyio

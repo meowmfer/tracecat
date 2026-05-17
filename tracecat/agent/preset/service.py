@@ -4,34 +4,55 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections import Counter
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import sqlalchemy as sa
 from slugify import slugify
-from sqlalchemy import select
+from sqlalchemy import column, func, literal, select
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import selectinload
 
-from tracecat.agent.common.types import MCPHttpServerConfig
+from tracecat.agent.access.service import AgentModelAccessService
+from tracecat.agent.common.types import MCPHttpServerConfig, MCPServerConfig
+from tracecat.agent.preset.resolver import resolve_agents_config
 from tracecat.agent.preset.schemas import (
     AgentPresetCreate,
+    AgentPresetRead,
+    AgentPresetSkillBindingBase,
+    AgentPresetSkillBindingChange,
+    AgentPresetSkillBindingRead,
     AgentPresetUpdate,
     AgentPresetVersionDiff,
+    AgentPresetVersionRead,
+    AgentPresetVersionReadMinimal,
     ScalarFieldChange,
     StringListFieldChange,
     ToolApprovalFieldChange,
+    _agent_preset_capabilities,
+    build_subagent_eligibility,
+)
+from tracecat.agent.preset.types import SkillBindingSpec
+from tracecat.agent.skill.service import SkillService
+from tracecat.agent.subagents import (
+    AgentSubagentsConfig,
 )
 from tracecat.agent.types import (
     AgentConfig,
-    MCPServerConfig,
     OutputType,
 )
 from tracecat.audit.logger import audit_log
 from tracecat.auth.secrets import get_db_encryption_key
 from tracecat.authz.controls import require_scope
 from tracecat.db.models import (
+    AgentCatalog,
     AgentPreset,
+    AgentPresetSkill,
     AgentPresetVersion,
+    AgentPresetVersionSkill,
     OAuthIntegration,
+    SkillVersion,
 )
 from tracecat.dsl.common import create_default_execution_context
 from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
@@ -55,6 +76,11 @@ from tracecat.secrets.encryption import decrypt_value
 from tracecat.service import BaseWorkspaceService, requires_entitlement
 from tracecat.tiers.enums import Entitlement
 
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from tracecat.auth.types import Role
+
 
 class AgentPresetService(BaseWorkspaceService):
     """CRUD operations and helpers for agent presets."""
@@ -64,15 +90,22 @@ class AgentPresetService(BaseWorkspaceService):
         "instructions",
         "model_name",
         "model_provider",
+        "catalog_id",
         "base_url",
         "output_type",
         "actions",
         "namespaces",
         "tool_approvals",
         "mcp_integrations",
+        "agents",
         "retries",
+        "enable_thinking",
         "enable_internet_access",
     }
+
+    def __init__(self, session: AsyncSession, role: Role | None = None):
+        super().__init__(session, role=role)
+        self.skills = SkillService(session, role=self.role)
 
     @requires_entitlement(Entitlement.AGENT_ADDONS)
     async def list_presets(self) -> Sequence[AgentPreset]:
@@ -82,9 +115,136 @@ class AgentPresetService(BaseWorkspaceService):
             select(AgentPreset)
             .where(AgentPreset.workspace_id == self.workspace_id)
             .order_by(AgentPreset.created_at.desc())
+            .options(selectinload(AgentPreset.tags))
         )
         result = await self.session.execute(stmt)
         return result.scalars().all()
+
+    async def _list_skill_bindings(
+        self,
+        *,
+        binding_model: type[AgentPresetSkill] | type[AgentPresetVersionSkill],
+        owner_column: Any,
+        owner_id: uuid.UUID,
+    ) -> list[AgentPresetSkillBindingRead]:
+        """Return resolved skill bindings for a preset head or immutable version."""
+
+        stmt = (
+            select(
+                binding_model.skill_id,
+                SkillVersion.name,
+                binding_model.skill_version_id,
+                SkillVersion.version,
+            )
+            .join(SkillVersion, binding_model.skill_version_id == SkillVersion.id)
+            .where(
+                binding_model.workspace_id == self.workspace_id,
+                owner_column == owner_id,
+            )
+            .order_by(SkillVersion.name.asc(), binding_model.skill_id.asc())
+        )
+        rows = (await self.session.execute(stmt)).tuples().all()
+        return [
+            AgentPresetSkillBindingRead(
+                skill_id=skill_id,
+                skill_name=skill_name,
+                skill_version_id=skill_version_id,
+                skill_version=skill_version,
+            )
+            for skill_id, skill_name, skill_version_id, skill_version in rows
+            if skill_name is not None
+        ]
+
+    async def _list_head_skill_bindings(
+        self, preset_id: uuid.UUID
+    ) -> list[AgentPresetSkillBindingRead]:
+        """Return mutable skill bindings for a preset head."""
+
+        return await self._list_skill_bindings(
+            binding_model=AgentPresetSkill,
+            owner_column=AgentPresetSkill.preset_id,
+            owner_id=preset_id,
+        )
+
+    async def _list_version_skill_bindings(
+        self, version_id: uuid.UUID
+    ) -> list[AgentPresetSkillBindingRead]:
+        """Return exact skill version refs for an immutable preset version."""
+
+        return await self._list_skill_bindings(
+            binding_model=AgentPresetVersionSkill,
+            owner_column=AgentPresetVersionSkill.preset_version_id,
+            owner_id=version_id,
+        )
+
+    async def build_preset_read(self, preset: AgentPreset) -> AgentPresetRead:
+        """Build the response model for a preset."""
+
+        agents = AgentSubagentsConfig.model_validate(preset.agents)
+        return AgentPresetRead(
+            id=preset.id,
+            workspace_id=preset.workspace_id,
+            name=preset.name,
+            slug=preset.slug,
+            description=preset.description,
+            current_version_id=preset.current_version_id,
+            instructions=preset.instructions,
+            model_name=preset.model_name,
+            model_provider=preset.model_provider,
+            catalog_id=preset.catalog_id,
+            base_url=preset.base_url,
+            output_type=cast(OutputType | None, preset.output_type),
+            actions=preset.actions,
+            namespaces=preset.namespaces,
+            tool_approvals=preset.tool_approvals,
+            mcp_integrations=preset.mcp_integrations,
+            agents=agents,
+            retries=preset.retries,
+            enable_thinking=preset.enable_thinking,
+            enable_internet_access=preset.enable_internet_access,
+            created_at=preset.created_at,
+            updated_at=preset.updated_at,
+            skills=await self._list_head_skill_bindings(preset.id),
+        )
+
+    async def build_version_read(
+        self, version: AgentPresetVersion
+    ) -> AgentPresetVersionRead:
+        """Build the response model for an immutable preset version."""
+
+        agents = AgentSubagentsConfig.model_validate(version.agents)
+        return AgentPresetVersionRead(
+            id=version.id,
+            preset_id=version.preset_id,
+            workspace_id=version.workspace_id,
+            version=version.version,
+            instructions=version.instructions,
+            model_name=version.model_name,
+            model_provider=version.model_provider,
+            catalog_id=version.catalog_id,
+            base_url=version.base_url,
+            output_type=cast(OutputType | None, version.output_type),
+            actions=version.actions,
+            namespaces=version.namespaces,
+            tool_approvals=version.tool_approvals,
+            mcp_integrations=version.mcp_integrations,
+            agents=agents,
+            retries=version.retries,
+            enable_thinking=version.enable_thinking,
+            enable_internet_access=version.enable_internet_access,
+            capabilities=_agent_preset_capabilities(
+                agents_config=agents,
+                tool_approvals=version.tool_approvals,
+                enable_internet_access=version.enable_internet_access,
+            ),
+            subagent_eligibility=build_subagent_eligibility(
+                agents_config=agents,
+                tool_approvals=version.tool_approvals,
+            ),
+            created_at=version.created_at,
+            updated_at=version.updated_at,
+            skills=await self._list_version_skill_bindings(version.id),
+        )
 
     @require_scope("agent:create")
     @audit_log(resource_type="agent_preset", action="create")
@@ -99,44 +259,53 @@ class AgentPresetService(BaseWorkspaceService):
         if params.actions:
             await self._validate_actions(params.actions)
         if params.mcp_integrations:
-            await self._validate_mcp_integrations(params.mcp_integrations)
+            await self.validate_mcp_integrations(params.mcp_integrations)
+        if params.skills:
+            await self.skills.validate_binding_inputs(
+                params.skills,
+                for_update=True,
+            )
+        catalog_entry: AgentCatalog | None = None
+        if params.catalog_id is not None:
+            catalog_entry = await self._get_enabled_catalog_entry(params.catalog_id)
         preset = AgentPreset(
             workspace_id=self.workspace_id,
             slug=slug,
             name=params.name,
             description=params.description,
             instructions=params.instructions,
-            model_name=params.model_name,
-            model_provider=params.model_provider,
+            model_name=(
+                catalog_entry.model_name
+                if catalog_entry is not None
+                else params.model_name
+            ),
+            model_provider=(
+                catalog_entry.model_provider
+                if catalog_entry is not None
+                else params.model_provider
+            ),
+            catalog_id=params.catalog_id,
             base_url=params.base_url,
             output_type=params.output_type,
             actions=params.actions,
             namespaces=params.namespaces,
             tool_approvals=params.tool_approvals,
             mcp_integrations=params.mcp_integrations,
+            agents=AgentSubagentsConfig().model_dump(mode="json"),
+            enable_thinking=params.enable_thinking,
             enable_internet_access=params.enable_internet_access,
             retries=params.retries,
         )
         self.session.add(preset)
         await self.session.flush()
-        version = AgentPresetVersion(
-            workspace_id=self.workspace_id,
-            preset_id=preset.id,
-            version=1,
-            instructions=preset.instructions,
-            model_name=preset.model_name,
-            model_provider=preset.model_provider,
-            base_url=preset.base_url,
-            output_type=preset.output_type,
-            actions=preset.actions,
-            namespaces=preset.namespaces,
-            tool_approvals=preset.tool_approvals,
-            mcp_integrations=preset.mcp_integrations,
-            retries=preset.retries,
-            enable_internet_access=preset.enable_internet_access,
+        preset.agents = await self._resolve_preset_subagent_configs(
+            params.agents,
+            parent_preset_id=preset.id,
+            parent_slug=slug,
         )
-        self.session.add(version)
-        await self.session.flush()
+        if params.skills is not None:
+            await self._replace_head_skill_bindings(preset.id, params.skills)
+        version = await self._create_version_from_preset(preset)
         preset.current_version_id = version.id
         self.session.add(preset)
         await self.session.commit()
@@ -158,6 +327,30 @@ class AgentPresetService(BaseWorkspaceService):
                 f"{len(missing_actions)} actions were not found in the registry: {sorted(missing_actions)}"
             )
 
+    async def _get_enabled_catalog_entry(self, catalog_id: uuid.UUID) -> AgentCatalog:
+        """Return an org-visible catalog row after validating workspace access."""
+        access_service = AgentModelAccessService(session=self.session, role=self.role)
+        if not await access_service.is_catalog_enabled(
+            catalog_id,
+            workspace_id=self.workspace_id,
+        ):
+            raise TracecatValidationError(
+                f"Catalog entry {catalog_id} is not enabled for this workspace"
+            )
+        stmt = select(AgentCatalog).where(
+            AgentCatalog.id == catalog_id,
+            sa.or_(
+                AgentCatalog.organization_id.is_(None),
+                AgentCatalog.organization_id == self.organization_id,
+            ),
+        )
+        catalog_entry = (await self.session.execute(stmt)).scalar_one_or_none()
+        if catalog_entry is None:
+            raise TracecatValidationError(
+                f"Catalog entry {catalog_id} is not enabled for this workspace"
+            )
+        return catalog_entry
+
     @require_scope("agent:update")
     @audit_log(resource_type="agent_preset", action="update")
     @requires_entitlement(Entitlement.AGENT_ADDONS)
@@ -165,8 +358,12 @@ class AgentPresetService(BaseWorkspaceService):
         self, preset: AgentPreset, params: AgentPresetUpdate
     ) -> AgentPreset:
         """Update an existing preset."""
-        set_fields = params.model_dump(exclude_unset=True)
+        set_fields = params.model_dump(exclude_unset=True, exclude={"skills"})
         execution_changed = False
+        requested_skills = None
+        preset_locked = False
+        if "skills" in params.model_fields_set:
+            requested_skills = params.skills or []
 
         # Handle name first as it may be needed for slug fallback
         if "name" in set_fields:
@@ -192,10 +389,42 @@ class AgentPresetService(BaseWorkspaceService):
 
         if "mcp_integrations" in set_fields:
             if mcp_integrations := set_fields.pop("mcp_integrations"):
-                await self._validate_mcp_integrations(mcp_integrations)
+                await self.validate_mcp_integrations(mcp_integrations)
             if preset.mcp_integrations != mcp_integrations:
                 preset.mcp_integrations = mcp_integrations
                 execution_changed = True
+
+        if "agents" in set_fields:
+            agents = await self._resolve_preset_subagent_configs(
+                set_fields.pop("agents"),
+                parent_preset_id=preset.id,
+                parent_slug=preset.slug,
+            )
+            if preset.agents != agents:
+                preset.agents = agents
+                execution_changed = True
+
+        if requested_skills is not None:
+            await self._lock_preset_for_versioning(preset.id)
+            preset_locked = True
+            await self.skills.validate_binding_inputs(
+                requested_skills,
+                for_update=True,
+            )
+            current_specs = await self._get_head_skill_binding_specs(preset.id)
+            requested_specs = self._binding_specs_from_inputs(requested_skills)
+            if current_specs != requested_specs:
+                await self._replace_head_skill_bindings(preset.id, requested_skills)
+                execution_changed = True
+        effective_catalog_id = None
+        if "catalog_id" in set_fields:
+            effective_catalog_id = set_fields["catalog_id"]
+        elif "model_name" in set_fields or "model_provider" in set_fields:
+            effective_catalog_id = preset.catalog_id
+        if effective_catalog_id is not None:
+            catalog_entry = await self._get_enabled_catalog_entry(effective_catalog_id)
+            set_fields["model_name"] = catalog_entry.model_name
+            set_fields["model_provider"] = catalog_entry.model_provider
 
         # Update remaining fields
         for field, value in set_fields.items():
@@ -206,7 +435,10 @@ class AgentPresetService(BaseWorkspaceService):
 
         self.session.add(preset)
         if execution_changed:
-            version = await self._create_version_from_preset(preset)
+            version = await self._create_version_from_preset(
+                preset,
+                preset_locked=preset_locked,
+            )
             preset.current_version_id = version.id
             self.session.add(preset)
         await self.session.commit()
@@ -218,6 +450,7 @@ class AgentPresetService(BaseWorkspaceService):
     @requires_entitlement(Entitlement.AGENT_ADDONS)
     async def delete_preset(self, preset: AgentPreset) -> None:
         """Delete a preset."""
+        await self._ensure_not_referenced_as_subagent(preset)
         # Break the mutable-head pointer before deleting version rows to avoid an ORM
         # dependency cycle between AgentPreset.current_version_id and its versions.
         preset.current_version_id = None
@@ -226,30 +459,85 @@ class AgentPresetService(BaseWorkspaceService):
         await self.session.delete(preset)
         await self.session.commit()
 
-    @requires_entitlement(Entitlement.AGENT_ADDONS)
-    async def get_agent_config_by_slug(
-        self, slug: str, *, preset_version: int | None = None
-    ) -> AgentConfig:
-        """Get the agent configuration for a preset by slug."""
-        version = await self.resolve_agent_preset_version(
-            slug=slug,
-            preset_version=preset_version,
-        )
-        return await self._version_to_agent_config(version)
+    async def _ensure_not_referenced_as_subagent(self, preset: AgentPreset) -> None:
+        """Block deletion while other presets still reference this preset."""
+        head_reference_count = await self._count_head_subagent_references(preset)
+        history_reference_count = await self._count_history_subagent_references(preset)
+        if head_reference_count > 0 or history_reference_count > 0:
+            raise TracecatValidationError(
+                "Cannot delete an agent preset that is still referenced as a subagent",
+                detail={
+                    "code": "preset_in_use_as_subagent",
+                    "head_reference_count": head_reference_count,
+                    "history_reference_count": history_reference_count,
+                },
+            )
 
-    @requires_entitlement(Entitlement.AGENT_ADDONS)
-    async def get_agent_config(
-        self,
-        preset_id: uuid.UUID,
-        *,
-        preset_version_id: uuid.UUID | None = None,
-    ) -> AgentConfig:
-        """Get the agent configuration for a preset by ID."""
-        version = await self.resolve_agent_preset_version(
-            preset_id=preset_id,
-            preset_version_id=preset_version_id,
+    async def _count_head_subagent_references(self, preset: AgentPreset) -> int:
+        subagent_ref_exists = self._subagent_reference_exists(
+            AgentPreset.agents,
+            preset_id=preset.id,
+            slug=preset.slug,
         )
-        return await self._version_to_agent_config(version)
+        stmt = (
+            select(func.count())
+            .select_from(AgentPreset)
+            .where(
+                AgentPreset.workspace_id == self.workspace_id,
+                AgentPreset.id != preset.id,
+                subagent_ref_exists,
+            )
+        )
+        return (await self.session.execute(stmt)).scalar_one()
+
+    async def _count_history_subagent_references(self, preset: AgentPreset) -> int:
+        subagent_ref_exists = self._subagent_reference_exists(
+            AgentPresetVersion.agents,
+            preset_id=preset.id,
+            slug=preset.slug,
+        )
+        stmt = (
+            select(func.count())
+            .select_from(AgentPresetVersion)
+            .where(
+                AgentPresetVersion.workspace_id == self.workspace_id,
+                AgentPresetVersion.preset_id != preset.id,
+                subagent_ref_exists,
+            )
+        )
+        return (await self.session.execute(stmt)).scalar_one()
+
+    @staticmethod
+    def _subagent_reference_exists(
+        agents: sa.SQLColumnExpression[dict[str, Any]],
+        *,
+        preset_id: uuid.UUID,
+        slug: str,
+    ) -> sa.ColumnElement[bool]:
+        subagents_value = agents["subagents"]
+        subagents_array = sa.case(
+            (func.jsonb_typeof(subagents_value) == "array", subagents_value),
+            else_=literal([], type_=JSONB),
+        )
+        subagents = (
+            func.jsonb_array_elements(subagents_array)
+            .table_valued(column("value", JSONB))
+            .alias("subagent")
+        )
+        return (
+            select(literal(True))
+            .select_from(subagents)
+            .where(
+                sa.or_(
+                    subagents.c.value["preset_id"].astext == str(preset_id),
+                    sa.and_(
+                        subagents.c.value["preset_id"].astext.is_(None),
+                        subagents.c.value["preset"].astext == slug,
+                    ),
+                )
+            )
+            .exists()
+        )
 
     @requires_entitlement(Entitlement.AGENT_ADDONS)
     async def resolve_agent_preset_config(
@@ -324,7 +612,7 @@ class AgentPresetService(BaseWorkspaceService):
 
         return await self.get_current_version_for_preset(preset)
 
-    async def _validate_mcp_integrations(self, mcp_integrations: list[str]) -> None:
+    async def validate_mcp_integrations(self, mcp_integrations: list[str]) -> None:
         """Validate MCP integration IDs for the workspace."""
         if not mcp_integrations:
             return
@@ -351,6 +639,22 @@ class AgentPresetService(BaseWorkspaceService):
             raise TracecatValidationError(
                 f"{len(missing_ids)} MCP integrations were not found in this workspace: {missing_str}"
             )
+
+    async def _resolve_preset_subagent_configs(
+        self,
+        agents: AgentSubagentsConfig | dict[str, Any] | None,
+        *,
+        parent_preset_id: uuid.UUID,
+        parent_slug: str,
+    ) -> dict[str, Any]:
+        """Resolve and validate a preset's subagent configuration."""
+        resolved = await resolve_agents_config(
+            self,
+            agents=agents,
+            parent_preset_id=parent_preset_id,
+            parent_slug=parent_slug,
+        )
+        return resolved.to_agents_binding().model_dump(mode="json")
 
     def _decrypt_mcp_headers(
         self,
@@ -404,7 +708,7 @@ class AgentPresetService(BaseWorkspaceService):
 
         return custom_headers
 
-    async def _resolve_mcp_integrations(
+    async def resolve_mcp_integrations(
         self, mcp_integrations: list[str] | None
     ) -> list[MCPServerConfig] | None:
         """Resolve MCP integrations into MCP server configs."""
@@ -510,6 +814,7 @@ class AgentPresetService(BaseWorkspaceService):
                     "type": "stdio",
                     "name": mcp_integration.slug,
                     "command": mcp_integration.stdio_command,
+                    "id": str(mcp_integration.id),
                 }
                 if mcp_integration.stdio_args:
                     command_config["args"] = mcp_integration.stdio_args
@@ -668,6 +973,7 @@ class AgentPresetService(BaseWorkspaceService):
                 "name": mcp_integration.name,
                 "url": mcp_integration.server_uri,
                 "headers": headers,
+                "id": str(mcp_integration.id),
             }
             if mcp_integration.timeout is not None:
                 http_config["timeout"] = mcp_integration.timeout
@@ -679,6 +985,236 @@ class AgentPresetService(BaseWorkspaceService):
             )
 
         return mcp_servers
+
+    async def resolve_mcp_integration_refs(
+        self, mcp_integrations: list[str] | None
+    ) -> list[MCPServerConfig] | None:
+        """Resolve MCP integration IDs into ``MCPServerConfig``s without secrets.
+
+        Returns metadata only — ``headers`` and stdio ``env`` are intentionally
+        omitted. Each config carries its source ``id`` so trusted callers can
+        re-resolve secrets per use via :meth:`resolve_mcp_integration_secrets`.
+
+        Safe to serialize across Temporal boundaries.
+
+        Returns ``None`` when ``mcp_integrations`` is empty. Raises
+        ``TracecatValidationError`` when at least one integration was
+        requested but none could be resolved — mirrors the behavior of
+        :meth:`resolve_mcp_integrations`.
+        """
+        if not mcp_integrations:
+            return None
+
+        integrations_service = IntegrationService(self.session, role=self.role)
+        available = await integrations_service.list_mcp_integrations()
+        by_id = {integration.id: integration for integration in available}
+
+        refs: list[MCPServerConfig] = []
+        for mcp_id_str in mcp_integrations:
+            try:
+                mcp_integration_id = uuid.UUID(mcp_id_str)
+            except ValueError:
+                logger.warning(
+                    "Invalid MCP integration ID format, skipping: %r",
+                    mcp_id_str,
+                    extra={
+                        "workspace_id": str(self.workspace_id),
+                        "mcp_id": mcp_id_str,
+                    },
+                )
+                continue
+
+            mcp_integration = by_id.get(mcp_integration_id)
+            if mcp_integration is None:
+                logger.warning(
+                    "MCP integration not found, skipping: %r",
+                    mcp_integration_id,
+                    extra={
+                        "workspace_id": str(self.workspace_id),
+                        "mcp_integration_id": str(mcp_integration_id),
+                    },
+                )
+                continue
+
+            if mcp_integration.server_type == "stdio":
+                if not mcp_integration.stdio_command:
+                    logger.warning(
+                        "Stdio MCP integration %r has no stdio_command, skipping",
+                        mcp_integration.name,
+                        extra={
+                            "workspace_id": str(self.workspace_id),
+                            "mcp_integration_id": str(mcp_integration.id),
+                        },
+                    )
+                    continue
+                # Re-validate command policy at resolution time so rows that
+                # predate tighter rules are rejected here rather than at spawn.
+                try:
+                    validate_mcp_command_config(
+                        command=mcp_integration.stdio_command,
+                        args=mcp_integration.stdio_args,
+                        env=None,
+                        name=mcp_integration.slug,
+                    )
+                except MCPValidationError as e:
+                    logger.warning(
+                        "Stdio MCP integration %r failed command validation, skipping: %s",
+                        mcp_integration.name,
+                        str(e),
+                        extra={
+                            "workspace_id": str(self.workspace_id),
+                            "mcp_integration_id": str(mcp_integration.id),
+                        },
+                    )
+                    continue
+                stdio_ref: MCPServerConfig = {
+                    "type": "stdio",
+                    "name": mcp_integration.slug,
+                    "command": mcp_integration.stdio_command,
+                    "id": str(mcp_integration.id),
+                }
+                if mcp_integration.stdio_args:
+                    stdio_ref["args"] = mcp_integration.stdio_args
+                if mcp_integration.timeout is not None:
+                    stdio_ref["timeout"] = mcp_integration.timeout
+                refs.append(stdio_ref)
+                continue
+
+            if not mcp_integration.server_uri:
+                logger.warning(
+                    "HTTP MCP integration %r has no server_uri, skipping",
+                    mcp_integration.name,
+                    extra={
+                        "workspace_id": str(self.workspace_id),
+                        "mcp_integration_id": str(mcp_integration.id),
+                    },
+                )
+                continue
+            http_ref: MCPHttpServerConfig = {
+                "type": "http",
+                "name": mcp_integration.name,
+                "url": mcp_integration.server_uri,
+                "id": str(mcp_integration.id),
+            }
+            if mcp_integration.timeout is not None:
+                http_ref["timeout"] = mcp_integration.timeout
+            refs.append(http_ref)
+
+        if not refs:
+            raise TracecatValidationError(
+                "No matching MCP integrations found in the workspace"
+            )
+
+        return refs
+
+    async def resolve_mcp_integration_secrets(
+        self, mcp_integration_id: uuid.UUID
+    ) -> dict[str, str] | None:
+        """Resolve the secret material for a single MCP integration.
+
+        Returns the headers/env dict (depending on server type) freshly
+        decrypted, with OAuth tokens refreshed if applicable. Returns
+        ``None`` if the integration cannot be authenticated or is not found.
+
+        Call this at the trusted edge per use — never propagate the result
+        across a Temporal boundary.
+        """
+        integrations_service = IntegrationService(self.session, role=self.role)
+        available = await integrations_service.list_mcp_integrations()
+        mcp_integration = next(
+            (i for i in available if i.id == mcp_integration_id), None
+        )
+        if mcp_integration is None:
+            logger.warning(
+                "MCP integration not found",
+                extra={
+                    "workspace_id": str(self.workspace_id),
+                    "mcp_integration_id": str(mcp_integration_id),
+                },
+            )
+            return None
+
+        if mcp_integration.server_type == "stdio":
+            stdio_env = integrations_service.decrypt_stdio_env(mcp_integration)
+            if not stdio_env:
+                return None
+            try:
+                return await self._resolve_stdio_env(
+                    stdio_env=stdio_env,
+                    mcp_integration_id=mcp_integration.id,
+                    mcp_integration_slug=mcp_integration.slug,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Stdio env resolution failed for MCP integration %r: %s",
+                    mcp_integration.name,
+                    str(e),
+                    extra={
+                        "workspace_id": str(self.workspace_id),
+                        "mcp_integration_id": str(mcp_integration.id),
+                    },
+                )
+                return None
+
+        # HTTP server — resolve headers per auth type.
+        encryption_key = get_db_encryption_key()
+        headers: dict[str, str] = {}
+
+        if mcp_integration.auth_type == MCPAuthType.OAUTH2:
+            if not mcp_integration.oauth_integration_id:
+                return None
+            stmt = select(OAuthIntegration).where(
+                OAuthIntegration.id == mcp_integration.oauth_integration_id,
+                OAuthIntegration.workspace_id == self.workspace_id,
+            )
+            result = await self.session.execute(stmt)
+            oauth_integration = result.scalars().first()
+            if not oauth_integration:
+                return None
+            await integrations_service.refresh_token_if_needed(oauth_integration)
+            access_token = await integrations_service.get_access_token(
+                oauth_integration
+            )
+            if not access_token:
+                return None
+            token_type = oauth_integration.token_type or "Bearer"
+            headers["Authorization"] = f"{token_type} {access_token.get_secret_value()}"
+
+            if mcp_integration.encrypted_headers:
+                custom_headers = self._decrypt_mcp_headers(
+                    encrypted_headers=mcp_integration.encrypted_headers,
+                    encryption_key=encryption_key,
+                    mcp_integration_id=mcp_integration.id,
+                    mcp_integration_name=mcp_integration.name,
+                )
+                if custom_headers:
+                    # Drop any user-supplied Authorization header — the OAuth
+                    # one wins.
+                    for key in list(custom_headers):
+                        if key.strip().casefold() == "authorization":
+                            custom_headers.pop(key, None)
+                    headers.update(custom_headers)
+
+        elif mcp_integration.auth_type == MCPAuthType.CUSTOM:
+            if not mcp_integration.encrypted_headers:
+                return None
+            custom_headers = self._decrypt_mcp_headers(
+                encrypted_headers=mcp_integration.encrypted_headers,
+                encryption_key=encryption_key,
+                mcp_integration_id=mcp_integration.id,
+                mcp_integration_name=mcp_integration.name,
+            )
+            if not custom_headers:
+                return None
+            headers.update(custom_headers)
+
+        elif mcp_integration.auth_type == MCPAuthType.NONE:
+            pass
+
+        else:
+            return None
+
+        return headers
 
     async def _resolve_stdio_env(
         self,
@@ -783,10 +1319,20 @@ class AgentPresetService(BaseWorkspaceService):
         self,
         preset_id: uuid.UUID,
         params: CursorPaginationParams,
-    ) -> CursorPaginatedResponse[AgentPresetVersion]:
-        """List immutable versions for a preset ordered newest first."""
+    ) -> CursorPaginatedResponse[AgentPresetVersionReadMinimal]:
+        """List immutable preset version metadata ordered newest first."""
         paginator = BaseCursorPaginator(self.session)
-        stmt = select(AgentPresetVersion).where(
+        stmt = select(
+            AgentPresetVersion.id,
+            AgentPresetVersion.preset_id,
+            AgentPresetVersion.workspace_id,
+            AgentPresetVersion.version,
+            AgentPresetVersion.agents,
+            AgentPresetVersion.tool_approvals,
+            AgentPresetVersion.enable_internet_access,
+            AgentPresetVersion.created_at,
+            AgentPresetVersion.updated_at,
+        ).where(
             AgentPresetVersion.workspace_id == self.workspace_id,
             AgentPresetVersion.preset_id == preset_id,
         )
@@ -832,7 +1378,36 @@ class AgentPresetService(BaseWorkspaceService):
             )
         stmt = stmt.limit(params.limit + 1)
         result = await self.session.execute(stmt)
-        versions = result.scalars().all()
+        versions = [
+            AgentPresetVersionReadMinimal(
+                id=version_id,
+                preset_id=row_preset_id,
+                workspace_id=workspace_id,
+                version=version_number,
+                capabilities=_agent_preset_capabilities(
+                    agents_config=agents,
+                    tool_approvals=tool_approvals,
+                    enable_internet_access=enable_internet_access,
+                ),
+                subagent_eligibility=build_subagent_eligibility(
+                    agents_config=agents,
+                    tool_approvals=tool_approvals,
+                ),
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+            for (
+                version_id,
+                row_preset_id,
+                workspace_id,
+                version_number,
+                agents,
+                tool_approvals,
+                enable_internet_access,
+                created_at,
+                updated_at,
+            ) in result.tuples().all()
+        ]
         has_more = len(versions) > params.limit
         items = versions[: params.limit]
 
@@ -884,6 +1459,173 @@ class AgentPresetService(BaseWorkspaceService):
         )
         result = await self.session.execute(stmt)
         return result.scalars().first()
+
+    @staticmethod
+    def _binding_specs_from_inputs(
+        bindings: Sequence[AgentPresetSkillBindingBase],
+    ) -> list[SkillBindingSpec]:
+        """Normalize mutable head skill bindings for equality checks."""
+
+        return sorted(
+            SkillBindingSpec(binding.skill_id, binding.skill_version_id)
+            for binding in bindings
+        )
+
+    async def _get_head_skill_binding_specs(
+        self, preset_id: uuid.UUID
+    ) -> list[SkillBindingSpec]:
+        """Return the current head bindings for a preset."""
+
+        stmt = select(
+            AgentPresetSkill.skill_id,
+            AgentPresetSkill.skill_version_id,
+        ).where(
+            AgentPresetSkill.workspace_id == self.workspace_id,
+            AgentPresetSkill.preset_id == preset_id,
+        )
+        rows = (await self.session.execute(stmt)).tuples().all()
+        return sorted(
+            SkillBindingSpec(skill_id, skill_version_id)
+            for skill_id, skill_version_id in rows
+        )
+
+    async def _replace_head_skill_bindings(
+        self,
+        preset_id: uuid.UUID,
+        bindings: Sequence[AgentPresetSkillBindingBase],
+    ) -> None:
+        """Replace the mutable head skill bindings for a preset."""
+
+        await self.session.execute(
+            sa.delete(AgentPresetSkill).where(
+                AgentPresetSkill.workspace_id == self.workspace_id,
+                AgentPresetSkill.preset_id == preset_id,
+            )
+        )
+        for binding in bindings:
+            self.session.add(
+                AgentPresetSkill(
+                    workspace_id=self.workspace_id,
+                    preset_id=preset_id,
+                    skill_id=binding.skill_id,
+                    skill_version_id=binding.skill_version_id,
+                )
+            )
+        await self.session.flush()
+
+    async def _snapshot_version_skill_bindings(
+        self, preset_id: uuid.UUID, preset_version_id: uuid.UUID
+    ) -> None:
+        """Copy exact head skill versions into an immutable preset snapshot."""
+
+        stmt = select(
+            AgentPresetSkill.skill_id,
+            AgentPresetSkill.skill_version_id,
+        ).where(
+            AgentPresetSkill.workspace_id == self.workspace_id,
+            AgentPresetSkill.preset_id == preset_id,
+        )
+        rows = (await self.session.execute(stmt)).tuples().all()
+        for skill_id, skill_version_id in rows:
+            self.session.add(
+                AgentPresetVersionSkill(
+                    workspace_id=self.workspace_id,
+                    preset_version_id=preset_version_id,
+                    skill_id=skill_id,
+                    skill_version_id=skill_version_id,
+                )
+            )
+        await self.session.flush()
+
+    async def _restore_head_skill_bindings_from_version(
+        self, *, preset_id: uuid.UUID, version_id: uuid.UUID
+    ) -> None:
+        """Copy exact historical skill versions back to the mutable preset head."""
+
+        stmt = select(
+            AgentPresetVersionSkill.skill_id,
+            AgentPresetVersionSkill.skill_version_id,
+        ).where(
+            AgentPresetVersionSkill.workspace_id == self.workspace_id,
+            AgentPresetVersionSkill.preset_version_id == version_id,
+        )
+        rows = (await self.session.execute(stmt)).tuples().all()
+        await self.skills.validate_binding_inputs(
+            [
+                AgentPresetSkillBindingBase(
+                    skill_id=skill_id,
+                    skill_version_id=skill_version_id,
+                )
+                for skill_id, skill_version_id in rows
+            ],
+            for_update=True,
+        )
+        await self.session.execute(
+            sa.delete(AgentPresetSkill).where(
+                AgentPresetSkill.workspace_id == self.workspace_id,
+                AgentPresetSkill.preset_id == preset_id,
+            )
+        )
+        for skill_id, skill_version_id in rows:
+            self.session.add(
+                AgentPresetSkill(
+                    workspace_id=self.workspace_id,
+                    preset_id=preset_id,
+                    skill_id=skill_id,
+                    skill_version_id=skill_version_id,
+                )
+            )
+        await self.session.flush()
+
+    async def _compare_version_skill_bindings(
+        self, base_version_id: uuid.UUID, compare_version_id: uuid.UUID
+    ) -> list[AgentPresetSkillBindingChange]:
+        """Return a diff of exact skill version refs between preset versions."""
+
+        base_bindings = {
+            binding.skill_id: binding
+            for binding in await self._list_version_skill_bindings(base_version_id)
+        }
+        compare_bindings = {
+            binding.skill_id: binding
+            for binding in await self._list_version_skill_bindings(compare_version_id)
+        }
+        skill_changes: list[AgentPresetSkillBindingChange] = []
+        for skill_id in sorted(set(base_bindings) | set(compare_bindings)):
+            base_binding = base_bindings.get(skill_id)
+            compare_binding = compare_bindings.get(skill_id)
+            if (
+                base_binding is not None
+                and compare_binding is not None
+                and base_binding.skill_version_id == compare_binding.skill_version_id
+            ):
+                continue
+            skill_name = (
+                base_binding.skill_name
+                if base_binding is not None
+                else compare_binding.skill_name
+                if compare_binding is not None
+                else str(skill_id)
+            )
+            skill_changes.append(
+                AgentPresetSkillBindingChange(
+                    skill_id=skill_id,
+                    skill_name=skill_name,
+                    old_skill_version_id=(
+                        base_binding.skill_version_id if base_binding else None
+                    ),
+                    old_skill_version=base_binding.skill_version
+                    if base_binding
+                    else None,
+                    new_skill_version_id=(
+                        compare_binding.skill_version_id if compare_binding else None
+                    ),
+                    new_skill_version=(
+                        compare_binding.skill_version if compare_binding else None
+                    ),
+                )
+            )
+        return skill_changes
 
     async def _lock_preset_for_versioning(self, preset_id: uuid.UUID) -> None:
         """Serialize version creation for one preset using a row-level lock."""
@@ -940,7 +1682,12 @@ class AgentPresetService(BaseWorkspaceService):
                 "Preset version does not belong to the selected preset"
             )
 
+        await self._lock_preset_for_versioning(preset.id)
         self._sync_preset_head_from_version(preset, version)
+        await self._restore_head_skill_bindings_from_version(
+            preset_id=preset.id,
+            version_id=version.id,
+        )
         preset.current_version_id = version.id
         self.session.add(preset)
         await self.session.commit()
@@ -961,10 +1708,13 @@ class AgentPresetService(BaseWorkspaceService):
         for field in (
             "model_name",
             "model_provider",
+            "catalog_id",
             "base_url",
             "output_type",
             "retries",
+            "enable_thinking",
             "enable_internet_access",
+            "agents",
         ):
             old_value = getattr(base_version, field)
             new_value = getattr(compare_version, field)
@@ -1007,12 +1757,17 @@ class AgentPresetService(BaseWorkspaceService):
                     )
                 )
 
+        skill_changes = await self._compare_version_skill_bindings(
+            base_version.id,
+            compare_version.id,
+        )
         instructions_changed = base_version.instructions != compare_version.instructions
         total_changes = (
             int(instructions_changed)
             + len(scalar_changes)
             + len(list_changes)
             + len(tool_approval_changes)
+            + len(skill_changes)
         )
 
         return AgentPresetVersionDiff(
@@ -1026,19 +1781,45 @@ class AgentPresetService(BaseWorkspaceService):
             scalar_changes=scalar_changes,
             list_changes=list_changes,
             tool_approval_changes=tool_approval_changes,
+            skill_changes=skill_changes,
             total_changes=total_changes,
         )
 
     async def _version_to_agent_config(
         self, version: AgentPresetVersion
     ) -> AgentConfig:
-        mcp_servers = await self._resolve_mcp_integrations(version.mcp_integrations)
-        model_settings: dict[str, Any] = {"reasoning_effort": "medium"}
+        # Resolve refs only — no headers / stdio env. The resulting
+        # AgentConfig is safe to cross Temporal boundaries. Trusted callers
+        # (build_tool_definitions, trusted MCP server) re-resolve secrets
+        # per use via resolve_mcp_integration_secrets.
+        mcp_servers = await self.resolve_mcp_integration_refs(version.mcp_integrations)
+        model_settings: dict[str, Any] = {}
+        resolved_skills = await self.skills.get_resolved_skill_refs_for_preset_version(
+            version.id
+        )
+        duplicate_skill_names = sorted(
+            name
+            for name, count in Counter(
+                resolved_skill.skill_name for resolved_skill in resolved_skills
+            ).items()
+            if count > 1
+        )
+        if duplicate_skill_names:
+            raise TracecatValidationError(
+                "Resolved preset version contains duplicate skill names",
+                detail={
+                    "code": "duplicate_skill_names",
+                    "skill_names": duplicate_skill_names,
+                    "preset_version_id": str(version.id),
+                },
+            )
+        # Only disable parallel tool calls if tools will be present
         if version.actions or mcp_servers:
             model_settings["parallel_tool_calls"] = False
         return AgentConfig(
             model_name=version.model_name,
             model_provider=version.model_provider,
+            catalog_id=version.catalog_id,
             base_url=version.base_url,
             instructions=version.instructions,
             output_type=cast(OutputType | None, version.output_type),
@@ -1046,16 +1827,49 @@ class AgentPresetService(BaseWorkspaceService):
             namespaces=version.namespaces,
             tool_approvals=version.tool_approvals,
             mcp_servers=mcp_servers,
+            agents=AgentSubagentsConfig.model_validate(version.agents),
             retries=version.retries,
             model_settings=model_settings,
+            enable_thinking=version.enable_thinking,
             enable_internet_access=version.enable_internet_access,
+            resolved_skills=resolved_skills,
         )
 
     async def _create_version_from_preset(
-        self, preset: AgentPreset
+        self, preset: AgentPreset, *, preset_locked: bool = False
     ) -> AgentPresetVersion:
         """Create and flush a new immutable version from the preset head."""
-        await self._lock_preset_for_versioning(preset.id)
+        if not preset_locked:
+            await self._lock_preset_for_versioning(preset.id)
+        duplicate_name_stmt = (
+            select(
+                SkillVersion.name,
+                func.count(AgentPresetSkill.id).label("binding_count"),
+            )
+            .join(SkillVersion, AgentPresetSkill.skill_version_id == SkillVersion.id)
+            .where(
+                AgentPresetSkill.workspace_id == self.workspace_id,
+                AgentPresetSkill.preset_id == preset.id,
+            )
+            .group_by(SkillVersion.name)
+            .having(func.count(AgentPresetSkill.id) > 1)
+        )
+        duplicate_names = sorted(
+            name
+            for name, _count in (await self.session.execute(duplicate_name_stmt))
+            .tuples()
+            .all()
+            if name is not None
+        )
+        if duplicate_names:
+            raise TracecatValidationError(
+                "Agent preset version cannot include duplicate skill names",
+                detail={
+                    "code": "duplicate_skill_names",
+                    "skill_names": duplicate_names,
+                    "preset_id": str(preset.id),
+                },
+            )
         stmt = (
             select(AgentPresetVersion.version)
             .where(
@@ -1076,17 +1890,21 @@ class AgentPresetService(BaseWorkspaceService):
             instructions=preset.instructions,
             model_name=preset.model_name,
             model_provider=preset.model_provider,
+            catalog_id=preset.catalog_id,
             base_url=preset.base_url,
             output_type=preset.output_type,
             actions=preset.actions,
             namespaces=preset.namespaces,
             tool_approvals=preset.tool_approvals,
             mcp_integrations=preset.mcp_integrations,
+            agents=preset.agents,
             retries=preset.retries,
+            enable_thinking=preset.enable_thinking,
             enable_internet_access=preset.enable_internet_access,
         )
         self.session.add(version)
         await self.session.flush()
+        await self._snapshot_version_skill_bindings(preset.id, version.id)
         return version
 
     def _sync_preset_head_from_version(
@@ -1098,11 +1916,14 @@ class AgentPresetService(BaseWorkspaceService):
         preset.instructions = version.instructions
         preset.model_name = version.model_name
         preset.model_provider = version.model_provider
+        preset.catalog_id = version.catalog_id
         preset.base_url = version.base_url
         preset.output_type = version.output_type
         preset.actions = version.actions
         preset.namespaces = version.namespaces
         preset.tool_approvals = version.tool_approvals
         preset.mcp_integrations = version.mcp_integrations
+        preset.agents = version.agents
         preset.retries = version.retries
+        preset.enable_thinking = version.enable_thinking
         preset.enable_internet_access = version.enable_internet_access

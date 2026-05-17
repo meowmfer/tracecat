@@ -3,21 +3,28 @@
 import { zodResolver } from "@hookform/resolvers/zod"
 import {
   AlertCircle,
+  Bot,
   Box,
   Braces,
   Brackets,
+  Check,
+  ChevronsUpDown,
   CopyPlus,
+  Globe,
   Hash,
   History,
   List,
   ListOrdered,
   ListTodo,
   Loader2,
+  type LucideIcon,
   MessageCircle,
   MoreVertical,
   Percent,
   Plus,
+  Pyramid,
   Save,
+  ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   ToggleLeft,
@@ -33,12 +40,22 @@ import {
   type UseFormReturn,
   useFieldArray,
   useForm,
+  useWatch,
 } from "react-hook-form"
 import { z } from "zod"
 import type {
+  AgentCatalogRead,
+  AgentCustomProviderRead,
+  AgentPresetCapability,
   AgentPresetCreate,
   AgentPresetRead,
+  AgentPresetReadMinimal,
+  AgentPresetSubagentEligibility,
   AgentPresetUpdate,
+  AgentPresetVersionReadMinimal,
+  AttachedSubagentRef,
+  SkillReadMinimal,
+  SkillVersionRead,
 } from "@/client"
 import { AgentPresetDeleteDialog } from "@/components/agents/agent-preset-delete-dialog"
 import { AgentPresetVersionSelect } from "@/components/agents/agent-preset-version-select"
@@ -54,6 +71,15 @@ import { MultiTagCommandInput, type Suggestion } from "@/components/tags-input"
 import { SimpleEditor } from "@/components/tiptap-templates/simple/simple-editor"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import {
+  Command,
+  CommandDialog,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -75,8 +101,14 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from "@/components/ui/form"
 import { Input } from "@/components/ui/input"
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover"
 import {
   ResizableHandle,
   ResizablePanel,
@@ -94,15 +126,22 @@ import { Separator } from "@/components/ui/separator"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 import { toast } from "@/components/ui/use-toast"
 import {
   useAgentPreset,
   useAgentPresets,
+  useAgentPresetVersion,
   useAgentPresetVersions,
+  useAgentPresetVersionsByPresetIds,
   useCreateAgentPreset,
   useDeleteAgentPreset,
   useUpdateAgentPreset,
-} from "@/hooks"
+} from "@/hooks/use-agent-presets"
 import {
   useCreateChat,
   useGetChatVercel,
@@ -111,19 +150,19 @@ import {
 } from "@/hooks/use-chat"
 import { useEntitlements } from "@/hooks/use-entitlements"
 import { useFeatureFlag } from "@/hooks/use-feature-flags"
+import { useSkills, useSkillVersions } from "@/hooks/use-skills"
 import {
   type AgentPresetFormMode,
   buildDuplicateAgentPresetPayload,
-  canSubmitAgentPresetForm,
+  buildSkillCommandItemValue,
 } from "@/lib/agent-presets"
 import type { ModelInfo } from "@/lib/chat"
+import { getApiErrorDetail } from "@/lib/errors"
 import {
-  useAgentModels,
   useChatReadiness,
   useListMcpIntegrations,
-  useModelProviders,
   useRegistryActions,
-  useWorkspaceModelProvidersStatus,
+  useWorkspaceAgentModels,
 } from "@/lib/hooks"
 import { cn, slugify } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
@@ -139,8 +178,15 @@ const DATA_TYPE_OUTPUT_TYPES = [
   { label: "List of strings", value: "list[str]", icon: List },
 ] as const
 
-const NEW_PRESET_ID = "new"
 const DEFAULT_RETRIES = 3
+const SUBAGENT_ALIAS_REGEX = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/
+const POSITIVE_INTEGER_REGEX = /^[1-9]\d*$/
+const RESERVED_SUBAGENT_ALIASES = new Set([
+  "agent",
+  "general-purpose",
+  "root",
+  "task",
+])
 
 /**
  * Maps MCP integration slugs to provider IDs for icon lookup.
@@ -196,6 +242,8 @@ const agentPresetSchema = z
     slug: z.string().trim().min(1, "Slug is required"),
     description: z.string().max(1000).optional(),
     instructions: z.string().optional(),
+    source_id: z.string().optional(),
+    catalog_id: z.string().optional(),
     model_provider: z.string().trim().min(1, "Model provider is required"),
     model_name: z.string().trim().min(1, "Model name is required"),
     base_url: z.union([z.string().url(), z.literal(""), z.undefined()]),
@@ -205,6 +253,28 @@ const agentPresetSchema = z
     actions: z.array(z.string()).default([]),
     namespaces: z.array(z.string()).default([]),
     mcpIntegrations: z.array(z.string()).default([]),
+    agentsEnabled: z.boolean().default(false),
+    subagents: z
+      .array(
+        z.object({
+          preset: z.string().default(""),
+          presetId: z.string().default(""),
+          name: z.string().default(""),
+          description: z.string().max(1000).default(""),
+          presetVersion: z.string().default(""),
+          presetVersionId: z.string().default(""),
+          maxTurns: z.string().default(""),
+        })
+      )
+      .default([]),
+    skills: z
+      .array(
+        z.object({
+          skillId: z.string().trim().min(1, "Select a skill"),
+          skillVersionId: z.string().trim().min(1, "Select a version"),
+        })
+      )
+      .default([]),
     toolApprovals: z
       .array(
         z.object({
@@ -217,6 +287,7 @@ const agentPresetSchema = z
       .number({ invalid_type_error: "Retries must be a number" })
       .int()
       .min(0, "Retries must be 0 or more"),
+    enableThinking: z.boolean().default(true),
     enableInternetAccess: z.boolean().default(false),
   })
   .superRefine((data, ctx) => {
@@ -257,16 +328,111 @@ const agentPresetSchema = z
         }
       }
     }
+
+    if (data.agentsEnabled) {
+      const aliases = new Set<string>()
+      data.subagents.forEach((subagent, index) => {
+        const preset = subagent.preset.trim()
+        const alias = subagent.name.trim()
+        const effectiveAlias = alias || preset
+
+        if (!preset) {
+          ctx.addIssue({
+            path: ["subagents", index, "preset"],
+            code: z.ZodIssueCode.custom,
+            message: "Select a preset",
+          })
+        }
+        if (alias && !SUBAGENT_ALIAS_REGEX.test(alias)) {
+          ctx.addIssue({
+            path: ["subagents", index, "name"],
+            code: z.ZodIssueCode.custom,
+            message:
+              "Use lowercase letters, numbers, and hyphens; start and end with a letter or number",
+          })
+        }
+        if (effectiveAlias && RESERVED_SUBAGENT_ALIASES.has(effectiveAlias)) {
+          ctx.addIssue({
+            path: ["subagents", index, alias ? "name" : "preset"],
+            code: z.ZodIssueCode.custom,
+            message: "This alias is reserved",
+          })
+        }
+        if (effectiveAlias && aliases.has(effectiveAlias)) {
+          ctx.addIssue({
+            path: ["subagents", index, alias ? "name" : "preset"],
+            code: z.ZodIssueCode.custom,
+            message: "Subagent aliases must be unique",
+          })
+        }
+        if (effectiveAlias) {
+          aliases.add(effectiveAlias)
+        }
+        if (
+          subagent.presetVersion.trim() &&
+          !POSITIVE_INTEGER_REGEX.test(subagent.presetVersion.trim())
+        ) {
+          ctx.addIssue({
+            path: ["subagents", index, "presetVersion"],
+            code: z.ZodIssueCode.custom,
+            message: "Use a positive version number",
+          })
+        }
+        if (
+          subagent.maxTurns.trim() &&
+          !POSITIVE_INTEGER_REGEX.test(subagent.maxTurns.trim())
+        ) {
+          ctx.addIssue({
+            path: ["subagents", index, "maxTurns"],
+            code: z.ZodIssueCode.custom,
+            message: "Use a positive turn limit",
+          })
+        }
+      })
+    }
   })
 
 type AgentPresetFormValues = z.infer<typeof agentPresetSchema>
+type SubagentFormValue = AgentPresetFormValues["subagents"][number]
+type SkillBindingFormValue = AgentPresetFormValues["skills"][number]
 type ToolApprovalFormValue = AgentPresetFormValues["toolApprovals"][number]
+type PreservedAttachedSubagentRef = AttachedSubagentRef & {
+  preset_id?: string
+  preset_version_id?: string
+}
+
+const LIVE_INTERNET_ACCESS_WARNING_MESSAGE =
+  "One or more selected subagents have internet access enabled, but the parent agent does not. Enable internet access on the parent agent for those subagents to use web tools."
+
+const AGENT_PRESET_CAPABILITY_CONFIG = [
+  {
+    capability: "approvals",
+    label: "Approvals",
+    Icon: ShieldCheck,
+  },
+  {
+    capability: "subagents",
+    label: "Subagents",
+    Icon: Bot,
+  },
+  {
+    capability: "internet_access",
+    label: "Internet access",
+    Icon: Globe,
+  },
+] satisfies Array<{
+  capability: AgentPresetCapability
+  label: string
+  Icon: LucideIcon
+}>
 
 const DEFAULT_FORM_VALUES: AgentPresetFormValues = {
   name: "",
   slug: "",
   description: "",
   instructions: "",
+  source_id: "",
+  catalog_id: "",
   model_provider: "",
   model_name: "",
   base_url: "",
@@ -276,8 +442,12 @@ const DEFAULT_FORM_VALUES: AgentPresetFormValues = {
   actions: [],
   namespaces: [],
   mcpIntegrations: [],
+  agentsEnabled: false,
+  subagents: [],
+  skills: [],
   toolApprovals: [],
   retries: DEFAULT_RETRIES,
+  enableThinking: true,
   enableInternetAccess: false,
 }
 
@@ -292,15 +462,15 @@ export function AgentPresetsBuilder({
   const workspaceId = useWorkspaceId()
   const { hasEntitlement, isLoading: entitlementsLoading } = useEntitlements()
   const agentAddonsEnabled = hasEntitlement("agent_addons")
-  const activePresetId = presetId ?? NEW_PRESET_ID
+  const activePresetId = presetId
 
   const { presets, presetsIsLoading, presetsError } = useAgentPresets(
     workspaceId,
     { enabled: agentAddonsEnabled && !entitlementsLoading }
   )
   const { registryActions } = useRegistryActions()
-  const { providers } = useModelProviders()
-  const { models } = useAgentModels()
+  const { models, providers } = useWorkspaceAgentModels(workspaceId)
+  const enabledModelsLoaded = models !== undefined
 
   const { mcpIntegrations, mcpIntegrationsIsLoading } =
     useListMcpIntegrations(workspaceId)
@@ -332,7 +502,10 @@ export function AgentPresetsBuilder({
       if (!workspaceId) {
         return
       }
-      const normalizedId = nextId?.trim() ? nextId : NEW_PRESET_ID
+      const normalizedId = nextId?.trim() || activePresetId
+      if (!normalizedId) {
+        return
+      }
       if (normalizedId === activePresetId) {
         return
       }
@@ -342,9 +515,7 @@ export function AgentPresetsBuilder({
     [activePresetId, router, workspaceId]
   )
 
-  // Fetch full preset data when a preset is selected (not in create mode)
-  const selectedPresetId =
-    activePresetId === NEW_PRESET_ID ? null : activePresetId
+  const selectedPresetId = activePresetId
   const { preset: selectedPreset } = useAgentPreset(
     workspaceId,
     selectedPresetId,
@@ -354,12 +525,7 @@ export function AgentPresetsBuilder({
   )
 
   useEffect(() => {
-    if (
-      !presetId ||
-      presetId === NEW_PRESET_ID ||
-      presetsIsLoading ||
-      !presets
-    ) {
+    if (!presetId || presetsIsLoading || !presets) {
       return
     }
     const presetExists = presets.some((preset) => preset.id === presetId)
@@ -369,9 +535,16 @@ export function AgentPresetsBuilder({
     if (presets.length > 0) {
       handleSetSelectedPresetId(presets[0].id)
     } else {
-      handleSetSelectedPresetId(NEW_PRESET_ID)
+      router.replace(`/workspaces/${workspaceId}/agents`)
     }
-  }, [presets, handleSetSelectedPresetId, presetId, presetsIsLoading])
+  }, [
+    presets,
+    handleSetSelectedPresetId,
+    presetId,
+    presetsIsLoading,
+    router,
+    workspaceId,
+  ])
 
   const actionSuggestions: Suggestion[] = useMemo(() => {
     if (!registryActions) {
@@ -410,33 +583,10 @@ export function AgentPresetsBuilder({
     return entries.sort((a, b) => a.label.localeCompare(b.label))
   }, [registryActions])
 
-  const modelOptionsByProvider = useMemo(() => {
-    if (!models) {
-      return {}
-    }
-    const grouped: Record<string, { label: string; value: string }[]> = {}
-    for (const [key, config] of Object.entries(models)) {
-      const provider = config.provider
-      if (!grouped[provider]) {
-        grouped[provider] = []
-      }
-      grouped[provider]?.push({
-        label: config.name ?? key,
-        value: config.name ?? key,
-      })
-    }
-    for (const list of Object.values(grouped)) {
-      list.sort((a, b) => a.label.localeCompare(b.label))
-    }
-    return grouped
-  }, [models])
-
-  const modelProviderOptions = useMemo(() => {
-    const set = new Set<string>()
-    providers?.forEach((provider) => set.add(provider))
-    Object.keys(modelOptionsByProvider).forEach((provider) => set.add(provider))
-    return Array.from(set).sort((a, b) => a.localeCompare(b))
-  }, [modelOptionsByProvider, providers])
+  const enabledModelOptions = useMemo(
+    () => buildEnabledModelOptions(models, providers),
+    [models, providers]
+  )
 
   if (presetsIsLoading) {
     return <CenteredSpinner />
@@ -460,14 +610,15 @@ export function AgentPresetsBuilder({
   return (
     <div className="flex h-full w-full flex-col overflow-hidden">
       <AgentPresetForm
-        key={selectedPreset?.id ?? NEW_PRESET_ID}
+        key={selectedPreset?.id ?? activePresetId}
         preset={selectedPreset ?? null}
         mode={selectedPreset ? "edit" : "create"}
         workspaceId={workspaceId}
+        agentPresets={presets ?? []}
         actionSuggestions={actionSuggestions}
         namespaceSuggestions={namespaceSuggestions}
-        modelOptionsByProvider={modelOptionsByProvider}
-        modelProviderOptions={modelProviderOptions}
+        enabledModelOptions={enabledModelOptions}
+        enabledModelsLoaded={enabledModelsLoaded}
         mcpIntegrations={mcpIntegrationsForForm}
         mcpIntegrationsIsLoading={mcpIntegrationsIsLoading}
         isSaving={
@@ -522,7 +673,7 @@ export function AgentPresetsBuilder({
                 if (remaining.length > 0) {
                   handleSetSelectedPresetId(remaining[0].id)
                 } else {
-                  handleSetSelectedPresetId(NEW_PRESET_ID)
+                  router.replace(`/workspaces/${workspaceId}/agents`)
                 }
               }
             : undefined
@@ -535,14 +686,15 @@ export function AgentPresetsBuilder({
 function AgentPresetChatPane({
   preset,
   workspaceId,
+  enabledModelOptions,
+  enabledModelsLoaded,
 }: {
   preset: AgentPresetRead | null
   workspaceId: string
+  enabledModelOptions: EnabledModelOption[]
+  enabledModelsLoaded: boolean
 }) {
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null)
-
-  const { providersStatus, isLoading: providersStatusLoading } =
-    useWorkspaceModelProvidersStatus(workspaceId)
 
   const { chats, chatsLoading, chatsError, refetchChats } = useListChats(
     {
@@ -571,49 +723,57 @@ function AgentPresetChatPane({
     preset?.id,
     { enabled: Boolean(preset && workspaceId) }
   )
-  const currentVersion =
-    versions?.find((version) => version.id === preset?.current_version_id) ??
-    versions?.[0] ??
-    null
-  const selectedVersion =
-    versions?.find((version) => version.id === chat?.agent_preset_version_id) ??
-    null
-  const activeVersion = selectedVersion ?? currentVersion
-  const newChatVersion = selectedVersion ?? currentVersion
+  const selectedVersionId = chat?.agent_preset_version_id ?? null
+  const {
+    presetVersion: selectedVersionConfig,
+    presetVersionIsLoading: selectedVersionConfigIsLoading,
+  } = useAgentPresetVersion(workspaceId, preset?.id, selectedVersionId, {
+    enabled: Boolean(workspaceId && preset?.id && selectedVersionId),
+  })
+  const effectiveModelConfig = selectedVersionId
+    ? (selectedVersionConfig ?? null)
+    : preset
+  const selectedModel = useMemo(
+    () =>
+      effectiveModelConfig
+        ? findEnabledModelOption(enabledModelOptions, {
+            modelProvider: effectiveModelConfig.model_provider,
+            modelName: effectiveModelConfig.model_name,
+            baseUrl: effectiveModelConfig.base_url ?? null,
+          })
+        : null,
+    [effectiveModelConfig, enabledModelOptions]
+  )
+  const hasLegacyModelConfig = Boolean(
+    effectiveModelConfig?.model_provider && effectiveModelConfig.model_name
+  )
 
   const modelInfo: ModelInfo | null = useMemo(() => {
-    if (!preset) {
+    if (!effectiveModelConfig) {
       return null
     }
+
+    const provider =
+      selectedModel?.modelProvider ?? effectiveModelConfig.model_provider
+
     return {
-      name: activeVersion?.model_name ?? preset.model_name,
-      provider: activeVersion?.model_provider ?? preset.model_provider,
-      baseUrl: activeVersion?.base_url ?? preset.base_url ?? null,
+      name: selectedModel?.modelName ?? effectiveModelConfig.model_name,
+      provider,
+      baseUrl: selectedModel?.baseUrl ?? effectiveModelConfig.base_url ?? null,
+      iconId: selectedModel?.iconId ?? getProviderIconId(provider),
     }
-  }, [activeVersion, preset])
+  }, [effectiveModelConfig, selectedModel])
 
-  const providerReady = useMemo(() => {
-    if (!preset) {
-      return false
-    }
-    const provider = activeVersion?.model_provider ?? preset.model_provider
-    return providersStatus?.[provider] ?? false
-  }, [activeVersion, providersStatus, preset])
-
-  const newChatProviderReady = useMemo(() => {
-    if (!preset) {
-      return false
-    }
-    const provider = newChatVersion?.model_provider ?? preset.model_provider
-    return providersStatus?.[provider] ?? false
-  }, [newChatVersion, providersStatus, preset])
-
-  const canStartChat = Boolean(preset && newChatProviderReady)
+  const canStartChat = Boolean(
+    preset &&
+      effectiveModelConfig &&
+      (!enabledModelsLoaded || selectedModel !== null || hasLegacyModelConfig)
+  )
   const shouldAutoCreateChat =
     canStartChat && !activeChatId && !chatsLoading && !createChatPending
 
   const handleCreateChat = async () => {
-    if (!preset || createChatPending || !newChatProviderReady) {
+    if (!preset || createChatPending) {
       return
     }
 
@@ -622,9 +782,9 @@ function AgentPresetChatPane({
         title: `${preset.name} chat`,
         entity_type: "agent_preset",
         entity_id: preset.id,
-        tools: newChatVersion?.actions ?? preset.actions ?? undefined,
+        tools: selectedVersionConfig?.actions ?? preset.actions ?? undefined,
         agent_preset_id: preset.id,
-        agent_preset_version_id: newChatVersion?.id ?? null,
+        agent_preset_version_id: selectedVersionId,
       })
       setSelectedChatId(newChat.id)
       await refetchChats()
@@ -677,7 +837,7 @@ function AgentPresetChatPane({
       )
     }
 
-    if (providersStatusLoading) {
+    if (selectedVersionConfigIsLoading) {
       return (
         <div className="flex h-full items-center justify-center">
           <CenteredSpinner />
@@ -685,26 +845,14 @@ function AgentPresetChatPane({
       )
     }
 
-    if (!providerReady) {
+    if (enabledModelsLoaded && !selectedModel && !hasLegacyModelConfig) {
       return (
         <div className="flex h-full flex-col items-center justify-center px-4">
           <div className="flex max-w-xs flex-col items-center gap-2 text-center text-xs text-muted-foreground">
             <AlertCircle className="size-5 text-amber-500" />
             <p className="text-pretty">
-              This agent uses workspace credentials for{" "}
-              <span className="font-medium">
-                {activeVersion?.model_provider ?? preset.model_provider}
-              </span>
-              . Configure them on the{" "}
-              <Link
-                href={`/workspaces/${workspaceId}/credentials`}
-                className="font-medium text-primary hover:underline"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                credentials page
-              </Link>{" "}
-              to enable chat.
+              This preset no longer points at an enabled model. Select a new
+              model in the preset configuration before starting chat.
             </p>
           </div>
         </div>
@@ -863,16 +1011,11 @@ type AgentPresetSideTab =
   | "live-chat"
   | "assistant"
   | "configuration"
+  | "subagents"
+  | "skills"
   | "channels"
   | "structured-output"
   | "versions"
-
-type McpIntegrationOption = {
-  id: string
-  name: string
-  description?: string | null
-  providerId?: string
-}
 
 function getAgentPresetErrorTab(
   errors: FieldErrors<AgentPresetFormValues>
@@ -885,27 +1028,208 @@ function getAgentPresetErrorTab(
     return "structured-output"
   }
 
+  if (errors.skills) {
+    return "skills"
+  }
+
+  if (errors.agentsEnabled || errors.subagents) {
+    return "subagents"
+  }
+
   if (
-    errors.model_provider ||
-    errors.model_name ||
-    errors.base_url ||
-    errors.retries ||
     errors.actions ||
-    errors.namespaces ||
     errors.mcpIntegrations ||
+    errors.namespaces ||
     errors.toolApprovals ||
+    errors.retries ||
     errors.enableInternetAccess
   ) {
     return "configuration"
   }
-
+  if (
+    errors.instructions ||
+    errors.model_provider ||
+    errors.model_name ||
+    errors.base_url
+  ) {
+    return "assistant"
+  }
+  if (errors.name || errors.slug || errors.description) {
+    return "live-chat"
+  }
   return null
+}
+
+type McpIntegrationOption = {
+  id: string
+  name: string
+  description?: string | null
+  providerId?: string
+}
+
+type EnabledModelOption = {
+  catalogId: string
+  sourceId: string | null
+  modelName: string
+  modelProvider: string
+  iconId: string
+  displayName: string
+  label: string
+  metadata: string
+  sourceName: string
+  sourceType: string
+  baseUrl?: string | null
+}
+
+function getModelSelectionKey(selection: {
+  source_id?: string | null
+  model_provider?: string | null
+  model_name?: string | null
+}): string {
+  return `${selection.source_id ?? "platform"}::${selection.model_provider ?? ""}::${selection.model_name ?? ""}`
+}
+
+function buildEnabledModelOptions(
+  models: AgentCatalogRead[] | undefined,
+  providers: AgentCustomProviderRead[] | undefined
+): EnabledModelOption[] {
+  const providersById = new Map(
+    (providers ?? []).map((provider) => [provider.id, provider])
+  )
+
+  return (models ?? [])
+    .map((model) => {
+      const provider = model.custom_provider_id
+        ? (providersById.get(model.custom_provider_id) ?? null)
+        : null
+      const isCustomSource = model.custom_provider_id != null
+      const sourceName = isCustomSource
+        ? (provider?.display_name ?? "Custom")
+        : getProviderDisplayLabel(model.model_provider)
+      const sourceType = isCustomSource
+        ? "custom"
+        : model.organization_id
+          ? "organization"
+          : "platform"
+
+      return {
+        catalogId: model.id,
+        sourceId: model.custom_provider_id,
+        modelName: model.model_name,
+        modelProvider: model.model_provider,
+        iconId: getProviderIconId(model.model_provider),
+        displayName: model.model_name,
+        label: model.model_name,
+        metadata: model.model_provider,
+        sourceName,
+        sourceType,
+        baseUrl: provider?.base_url ?? null,
+      }
+    })
+    .sort((a, b) => {
+      const sourceComparison = a.sourceName.localeCompare(b.sourceName)
+      if (sourceComparison !== 0) {
+        return sourceComparison
+      }
+      return a.displayName.localeCompare(b.displayName)
+    })
+}
+
+function getProviderIconId(provider: string): string {
+  switch (provider) {
+    case "anthropic":
+      return "anthropic"
+    case "azure_ai":
+    case "azure_openai":
+      return "microsoft"
+    case "bedrock":
+      return "amazon-bedrock"
+    case "gemini":
+    case "vertex_ai":
+      return "google"
+    case "openai":
+      return "openai"
+    default:
+      return "custom"
+  }
+}
+
+function getProviderDisplayLabel(provider: string): string {
+  switch (provider) {
+    case "anthropic":
+      return "Anthropic"
+    case "azure_ai":
+      return "Azure AI"
+    case "azure_openai":
+      return "Azure OpenAI"
+    case "bedrock":
+      return "AWS Bedrock"
+    case "gemini":
+      return "Google Gemini"
+    case "openai":
+      return "OpenAI"
+    case "vertex_ai":
+      return "Google Vertex AI"
+    case "custom-model-provider":
+      return "Custom"
+    default:
+      return provider
+        .split(/[_\s-]+/)
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(" ")
+  }
+}
+
+function findEnabledModelOption(
+  options: EnabledModelOption[],
+  selection: {
+    sourceId?: string | null
+    modelProvider?: string | null
+    modelName?: string | null
+    baseUrl?: string | null
+  }
+): EnabledModelOption | null {
+  if (!selection.modelProvider || !selection.modelName) {
+    return null
+  }
+
+  const normalizedSourceId = selection.sourceId ?? null
+  const normalizedBaseUrl = normalizeOptional(selection.baseUrl)
+  return (
+    options.find(
+      (option) =>
+        option.sourceId === normalizedSourceId &&
+        option.modelProvider === selection.modelProvider &&
+        option.modelName === selection.modelName
+    ) ??
+    options.find(
+      (option) =>
+        option.modelProvider === selection.modelProvider &&
+        option.modelName === selection.modelName &&
+        normalizeOptional(option.baseUrl) === normalizedBaseUrl
+    ) ??
+    null
+  )
+}
+
+function syncFormModelSelection(
+  form: UseFormReturn<AgentPresetFormValues>,
+  option: EnabledModelOption,
+  shouldDirty: boolean
+) {
+  form.setValue("source_id", option.sourceId ?? "", { shouldDirty })
+  form.setValue("catalog_id", option.catalogId, { shouldDirty })
+  form.setValue("model_provider", option.modelProvider, { shouldDirty })
+  form.setValue("model_name", option.modelName, { shouldDirty })
+  form.setValue("base_url", option.baseUrl ?? "", { shouldDirty })
 }
 
 type AgentPresetFormProps = {
   preset: AgentPresetRead | null
   mode: AgentPresetFormMode
   workspaceId: string
+  agentPresets: AgentPresetReadMinimal[]
   builderPrompt?: string
   onCreate: (payload: AgentPresetCreate) => Promise<AgentPresetRead>
   onUpdate: (
@@ -918,8 +1242,8 @@ type AgentPresetFormProps = {
   isDeleting: boolean
   actionSuggestions: Suggestion[]
   namespaceSuggestions: Suggestion[]
-  modelProviderOptions: string[]
-  modelOptionsByProvider: Record<string, { label: string; value: string }[]>
+  enabledModelOptions: EnabledModelOption[]
+  enabledModelsLoaded: boolean
   mcpIntegrations: McpIntegrationOption[]
   mcpIntegrationsIsLoading: boolean
 }
@@ -928,6 +1252,7 @@ function AgentPresetForm({
   preset,
   mode,
   workspaceId,
+  agentPresets,
   builderPrompt,
   onCreate,
   onUpdate,
@@ -937,8 +1262,8 @@ function AgentPresetForm({
   isDeleting,
   actionSuggestions,
   namespaceSuggestions,
-  modelProviderOptions,
-  modelOptionsByProvider,
+  enabledModelOptions,
+  enabledModelsLoaded,
   mcpIntegrations,
   mcpIntegrationsIsLoading,
 }: AgentPresetFormProps) {
@@ -948,12 +1273,42 @@ function AgentPresetForm({
   const [activeTab, setActiveTab] = useState<AgentPresetSideTab>("live-chat")
   const { isFeatureEnabled: isFeatureEnabledFlag } = useFeatureFlag()
   const channelsEnabled = isFeatureEnabledFlag("agent-channels")
-
   const form = useForm<AgentPresetFormValues>({
     resolver: zodResolver(agentPresetSchema),
     mode: "onBlur",
     defaultValues: preset ? presetToFormValues(preset) : DEFAULT_FORM_VALUES,
   })
+  const watchedAgentsEnabled =
+    useWatch({ control: form.control, name: "agentsEnabled" }) ?? false
+  const watchedSubagents =
+    useWatch({ control: form.control, name: "subagents" }) ?? []
+  const agentPresetsBySlug = useMemo(
+    () => new Map(agentPresets.map((preset) => [preset.slug, preset])),
+    [agentPresets]
+  )
+  const agentPresetsById = useMemo(
+    () => new Map(agentPresets.map((preset) => [preset.id, preset])),
+    [agentPresets]
+  )
+  const selectedPinnedSubagentPresetIds = useMemo(
+    () =>
+      getPinnedSubagentPresetIds({
+        subagents: watchedSubagents,
+        presetsBySlug: agentPresetsBySlug,
+      }),
+    [agentPresetsBySlug, watchedSubagents]
+  )
+  const {
+    versionsByPresetId: subagentVersionsByPresetId,
+    versionsByPresetIdIsLoading: subagentVersionsByPresetIdIsLoading,
+  } = useAgentPresetVersionsByPresetIds(
+    workspaceId,
+    selectedPinnedSubagentPresetIds,
+    {
+      enabled:
+        watchedAgentsEnabled && selectedPinnedSubagentPresetIds.length > 0,
+    }
+  )
 
   const handleConfirmDelete = async () => {
     if (!onDelete) {
@@ -968,12 +1323,29 @@ function AgentPresetForm({
   }
 
   const {
+    fields: skillFields,
+    append: appendSkillBinding,
+    remove: removeSkillBinding,
+  } = useFieldArray({
+    control: form.control,
+    name: "skills",
+  })
+
+  const {
     fields: toolApprovalFields,
     append: appendToolApproval,
     remove: removeToolApproval,
   } = useFieldArray({
     control: form.control,
     name: "toolApprovals",
+  })
+  const {
+    fields: subagentFields,
+    append: appendSubagent,
+    remove: removeSubagent,
+  } = useFieldArray({
+    control: form.control,
+    name: "subagents",
   })
 
   useEffect(() => {
@@ -982,9 +1354,20 @@ function AgentPresetForm({
   }, [form, mode, preset])
 
   const watchedName = form.watch("name")
-  const providerValue = form.watch("model_provider")
-  const modelNameValue = form.watch("model_name")
-  const modelOptions = modelOptionsByProvider[providerValue] ?? []
+  const sourceId = form.watch("source_id")
+  const modelProvider = form.watch("model_provider")
+  const modelName = form.watch("model_name")
+  const baseUrl = form.watch("base_url")
+  const selectedModel = useMemo(
+    () =>
+      findEnabledModelOption(enabledModelOptions, {
+        sourceId,
+        modelProvider,
+        modelName,
+        baseUrl,
+      }),
+    [baseUrl, enabledModelOptions, sourceId, modelName, modelProvider]
+  )
 
   useEffect(() => {
     const nextSlug = slugify(watchedName ?? "", "-")
@@ -994,27 +1377,64 @@ function AgentPresetForm({
   }, [form, watchedName])
 
   useEffect(() => {
+    if (!enabledModelsLoaded) {
+      return
+    }
+    if (selectedModel) {
+      syncFormModelSelection(form, selectedModel, false)
+      return
+    }
+    if (preset) {
+      if (form.getValues("source_id")) {
+        form.setValue("source_id", "", { shouldDirty: false })
+      }
+      if (form.getValues("catalog_id")) {
+        form.setValue("catalog_id", "", { shouldDirty: false })
+      }
+      return
+    }
     if (
-      modelOptions.length > 0 &&
-      !modelOptions.some(
-        (option) => option.value === form.getValues("model_name")
-      )
+      form.getValues("source_id") ||
+      form.getValues("model_provider") ||
+      form.getValues("model_name") ||
+      form.getValues("base_url")
     ) {
-      form.setValue("model_name", modelOptions[0]?.value ?? "", {
-        shouldDirty: false,
-      })
+      form.setValue("source_id", "", { shouldDirty: false })
+      form.setValue("model_provider", "", { shouldDirty: false })
+      form.setValue("model_name", "", { shouldDirty: false })
+      form.setValue("base_url", "", { shouldDirty: false })
     }
-  }, [form, modelOptions])
+  }, [enabledModelsLoaded, form, preset, selectedModel])
 
-  useEffect(() => {
-    if (!channelsEnabled && activeTab === "channels") {
-      setActiveTab("live-chat")
-    }
-  }, [activeTab, channelsEnabled])
+  const effectiveTab =
+    !channelsEnabled && activeTab === "channels" ? "live-chat" : activeTab
 
   const handleSubmit = form.handleSubmit(
     async (values) => {
-      const payload = formValuesToPayload(values)
+      if (values.agentsEnabled) {
+        const eligibilityIssue = getFirstSubagentEligibilityIssue({
+          subagents: values.subagents,
+          presetsById: agentPresetsById,
+          presetsBySlug: agentPresetsBySlug,
+          versionsByPresetId: subagentVersionsByPresetId,
+        })
+        if (eligibilityIssue) {
+          form.setError(
+            `subagents.${eligibilityIssue.index}.${eligibilityIssue.field}`,
+            {
+              type: "manual",
+              message: eligibilityIssue.message,
+            }
+          )
+          setActiveTab("subagents")
+          return
+        }
+      }
+
+      const payload = formValuesToPayload(values, {
+        presetsBySlug: agentPresetsBySlug,
+        versionsByPresetId: subagentVersionsByPresetId,
+      })
       if (mode === "edit" && preset) {
         const updated = await onUpdate(preset.id, payload)
         form.reset(presetToFormValues(updated))
@@ -1031,13 +1451,13 @@ function AgentPresetForm({
     }
   )
 
-  const canSubmit = canSubmitAgentPresetForm({
-    mode,
-    isDirty: form.formState.isDirty,
-    name: watchedName ?? "",
-    modelProvider: providerValue ?? "",
-    modelName: modelNameValue ?? "",
-  })
+  const canSubmit =
+    !subagentVersionsByPresetIdIsLoading &&
+    (form.formState.isDirty ||
+      (mode === "create" &&
+        Boolean(form.watch("name")) &&
+        Boolean(form.watch("model_provider")) &&
+        Boolean(form.watch("model_name"))))
 
   const handleDeleteDialogChange = useCallback(
     (nextOpen: boolean) => {
@@ -1078,6 +1498,25 @@ function AgentPresetForm({
     })
   }, [appendToolApproval])
 
+  const handleAddSubagent = useCallback(() => {
+    appendSubagent({
+      preset: "",
+      presetId: "",
+      name: "",
+      description: "",
+      presetVersion: "",
+      presetVersionId: "",
+      maxTurns: "",
+    })
+  }, [appendSubagent])
+
+  const handleAddSkillBinding = useCallback(
+    (binding: SkillBindingFormValue) => {
+      appendSkillBinding(binding)
+    },
+    [appendSkillBinding]
+  )
+
   return (
     <Form {...form}>
       <form
@@ -1113,23 +1552,34 @@ function AgentPresetForm({
 
           <ResizablePanel defaultSize={38} minSize={26}>
             <AgentPresetRightPanel
-              activeTab={activeTab}
+              activeTab={effectiveTab}
               onTabChange={setActiveTab}
               channelsEnabled={channelsEnabled}
               preset={preset}
               workspaceId={workspaceId}
+              agentPresets={agentPresets}
+              subagentVersionsByPresetId={subagentVersionsByPresetId}
+              subagentVersionsByPresetIdIsLoading={
+                subagentVersionsByPresetIdIsLoading
+              }
               builderPrompt={builderPrompt}
               form={form}
               isSaving={isSaving}
               actionSuggestions={actionSuggestions}
               namespaceSuggestions={namespaceSuggestions}
-              modelProviderOptions={modelProviderOptions}
-              modelOptionsByProvider={modelOptionsByProvider}
+              enabledModelOptions={enabledModelOptions}
+              enabledModelsLoaded={enabledModelsLoaded}
               mcpIntegrations={mcpIntegrations}
               mcpIntegrationsIsLoading={mcpIntegrationsIsLoading}
+              skillFields={skillFields}
+              onAddSkillBinding={handleAddSkillBinding}
+              onRemoveSkillBinding={removeSkillBinding}
               toolApprovalFields={toolApprovalFields}
               onAddToolApproval={handleAddToolApproval}
               onRemoveToolApproval={removeToolApproval}
+              subagentFields={subagentFields}
+              onAddSubagent={handleAddSubagent}
+              onRemoveSubagent={removeSubagent}
             />
           </ResizablePanel>
         </ResizablePanelGroup>
@@ -1321,36 +1771,54 @@ function AgentPresetRightPanel({
   channelsEnabled,
   preset,
   workspaceId,
+  agentPresets,
+  subagentVersionsByPresetId,
+  subagentVersionsByPresetIdIsLoading,
   builderPrompt,
   form,
   isSaving,
   actionSuggestions,
   namespaceSuggestions,
-  modelProviderOptions,
-  modelOptionsByProvider,
+  enabledModelOptions,
+  enabledModelsLoaded,
   mcpIntegrations,
   mcpIntegrationsIsLoading,
+  skillFields,
+  onAddSkillBinding,
+  onRemoveSkillBinding,
   toolApprovalFields,
   onAddToolApproval,
   onRemoveToolApproval,
+  subagentFields,
+  onAddSubagent,
+  onRemoveSubagent,
 }: {
   activeTab: AgentPresetSideTab
   onTabChange: (tab: AgentPresetSideTab) => void
   channelsEnabled: boolean
   preset: AgentPresetRead | null
   workspaceId: string
+  agentPresets: AgentPresetReadMinimal[]
+  subagentVersionsByPresetId: Map<string, AgentPresetVersionReadMinimal[]>
+  subagentVersionsByPresetIdIsLoading: boolean
   builderPrompt?: string
   form: UseFormReturn<AgentPresetFormValues>
   isSaving: boolean
   actionSuggestions: Suggestion[]
   namespaceSuggestions: Suggestion[]
-  modelProviderOptions: string[]
-  modelOptionsByProvider: Record<string, { label: string; value: string }[]>
+  enabledModelOptions: EnabledModelOption[]
+  enabledModelsLoaded: boolean
   mcpIntegrations: McpIntegrationOption[]
   mcpIntegrationsIsLoading: boolean
+  skillFields: Array<{ id: string }>
+  onAddSkillBinding: (binding: SkillBindingFormValue) => void
+  onRemoveSkillBinding: (index: number) => void
   toolApprovalFields: Array<{ id: string }>
   onAddToolApproval: () => void
   onRemoveToolApproval: (index: number) => void
+  subagentFields: Array<{ id: string }>
+  onAddSubagent: () => void
+  onRemoveSubagent: (index: number) => void
 }) {
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -1360,7 +1828,7 @@ function AgentPresetRightPanel({
         className="flex h-full w-full flex-col"
       >
         <div className="w-full shrink-0">
-          <div className="overflow-x-auto">
+          <div className="no-scrollbar overflow-x-auto">
             <TabsList className="min-w-max h-9 justify-start rounded-none bg-transparent p-0">
               <TabsTrigger
                 className="flex h-full min-w-20 items-center justify-center rounded-none px-3 text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none"
@@ -1382,6 +1850,20 @@ function AgentPresetRightPanel({
               >
                 <SlidersHorizontal className="mr-2 size-4" />
                 <span>Tools</span>
+              </TabsTrigger>
+              <TabsTrigger
+                className="flex h-full min-w-20 items-center justify-center rounded-none px-3 text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                value="subagents"
+              >
+                <Bot className="mr-2 size-4" />
+                <span>Subagents</span>
+              </TabsTrigger>
+              <TabsTrigger
+                className="flex h-full min-w-20 items-center justify-center rounded-none px-3 text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+                value="skills"
+              >
+                <Pyramid className="mr-2 size-4" />
+                <span>Skills</span>
               </TabsTrigger>
               <TabsTrigger
                 className="flex h-full min-w-20 items-center justify-center rounded-none px-3 text-xs data-[state=active]:bg-transparent data-[state=active]:shadow-none"
@@ -1413,7 +1895,12 @@ function AgentPresetRightPanel({
 
         <div className="flex-1 overflow-hidden">
           <TabsContent value="live-chat" className="mt-0 h-full">
-            <AgentPresetChatPane preset={preset} workspaceId={workspaceId} />
+            <AgentPresetChatPane
+              preset={preset}
+              workspaceId={workspaceId}
+              enabledModelOptions={enabledModelOptions}
+              enabledModelsLoaded={enabledModelsLoaded}
+            />
           </TabsContent>
 
           <TabsContent value="assistant" className="mt-0 h-full">
@@ -1430,13 +1917,38 @@ function AgentPresetRightPanel({
               isSaving={isSaving}
               actionSuggestions={actionSuggestions}
               namespaceSuggestions={namespaceSuggestions}
-              modelProviderOptions={modelProviderOptions}
-              modelOptionsByProvider={modelOptionsByProvider}
+              enabledModelOptions={enabledModelOptions}
+              enabledModelsLoaded={enabledModelsLoaded}
               mcpIntegrations={mcpIntegrations}
               mcpIntegrationsIsLoading={mcpIntegrationsIsLoading}
               toolApprovalFields={toolApprovalFields}
               onAddToolApproval={onAddToolApproval}
               onRemoveToolApproval={onRemoveToolApproval}
+            />
+          </TabsContent>
+
+          <TabsContent value="subagents" className="mt-0 h-full">
+            <AgentPresetSubagentsPanel
+              form={form}
+              isSaving={isSaving}
+              parentPreset={preset}
+              agentPresets={agentPresets}
+              versionsByPresetId={subagentVersionsByPresetId}
+              versionsByPresetIdIsLoading={subagentVersionsByPresetIdIsLoading}
+              subagentFields={subagentFields}
+              onAddSubagent={onAddSubagent}
+              onRemoveSubagent={onRemoveSubagent}
+            />
+          </TabsContent>
+
+          <TabsContent value="skills" className="mt-0 h-full overflow-hidden">
+            <AgentPresetSkillsPanel
+              form={form}
+              workspaceId={workspaceId}
+              isSaving={isSaving}
+              skillFields={skillFields}
+              onAddSkillBinding={onAddSkillBinding}
+              onRemoveSkillBinding={onRemoveSkillBinding}
             />
           </TabsContent>
 
@@ -1467,8 +1979,8 @@ function AgentPresetConfigurationPanel({
   isSaving,
   actionSuggestions,
   namespaceSuggestions,
-  modelProviderOptions,
-  modelOptionsByProvider,
+  enabledModelOptions,
+  enabledModelsLoaded,
   mcpIntegrations,
   mcpIntegrationsIsLoading,
   toolApprovalFields,
@@ -1479,115 +1991,190 @@ function AgentPresetConfigurationPanel({
   isSaving: boolean
   actionSuggestions: Suggestion[]
   namespaceSuggestions: Suggestion[]
-  modelProviderOptions: string[]
-  modelOptionsByProvider: Record<string, { label: string; value: string }[]>
+  enabledModelOptions: EnabledModelOption[]
+  enabledModelsLoaded: boolean
   mcpIntegrations: McpIntegrationOption[]
   mcpIntegrationsIsLoading: boolean
   toolApprovalFields: Array<{ id: string }>
   onAddToolApproval: () => void
   onRemoveToolApproval: (index: number) => void
 }) {
-  const providerValue = form.watch("model_provider")
+  const sourceId = form.watch("source_id")
+  const modelProvider = form.watch("model_provider")
+  const modelName = form.watch("model_name")
+  const baseUrl = form.watch("base_url")
+  const thinkingEnabled = form.watch("enableThinking")
   const internetAccessEnabled = form.watch("enableInternetAccess")
-  const modelOptions = modelOptionsByProvider[providerValue] ?? []
+  const selectedModel = useMemo(
+    () =>
+      findEnabledModelOption(enabledModelOptions, {
+        sourceId,
+        modelProvider,
+        modelName,
+        baseUrl,
+      }),
+    [baseUrl, enabledModelOptions, sourceId, modelName, modelProvider]
+  )
+  const hasMissingEnabledModel =
+    enabledModelsLoaded && !selectedModel && Boolean(modelProvider || modelName)
+  const legacyModelLabel =
+    hasMissingEnabledModel && modelProvider && modelName
+      ? `${modelProvider} / ${modelName}`
+      : null
+  const [isModelPickerOpen, setIsModelPickerOpen] = useState(false)
 
   return (
     <ScrollArea className="h-full">
       <div className="flex flex-col gap-8 px-6 py-6 pb-20 text-sm">
         <section className="space-y-4">
-          <div className="grid gap-4 md:grid-cols-2">
-            <FormField
-              control={form.control}
-              name="model_provider"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Model provider</FormLabel>
-                  <FormControl>
-                    {modelProviderOptions.length > 0 ? (
-                      <Select
-                        value={field.value}
-                        onValueChange={field.onChange}
-                        disabled={isSaving}
-                      >
-                        <SelectTrigger>
-                          <SelectValue placeholder="Select provider" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {modelProviderOptions.map((provider) => (
-                            <SelectItem key={provider} value={provider}>
-                              {provider}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    ) : (
-                      <Input
-                        placeholder="openai"
-                        {...field}
-                        disabled={isSaving}
-                      />
-                    )}
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+          <div className="grid gap-4">
             <FormField
               control={form.control}
               name="model_name"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Model name</FormLabel>
-                  <FormControl>
-                    {modelOptions.length > 0 ? (
-                      <Select
-                        value={field.value}
-                        onValueChange={field.onChange}
-                        disabled={isSaving}
+                  <FormLabel>Model</FormLabel>
+                  <FormDescription>
+                    Choose from the models available in this workspace.
+                  </FormDescription>
+                  <Popover
+                    open={isModelPickerOpen}
+                    onOpenChange={setIsModelPickerOpen}
+                  >
+                    <FormControl>
+                      <PopoverTrigger asChild>
+                        <button
+                          type="button"
+                          role="combobox"
+                          aria-expanded={isModelPickerOpen}
+                          className={cn(
+                            "flex h-9 w-full items-center justify-between whitespace-nowrap rounded-md border border-input bg-transparent px-3 py-2 text-xs shadow-sm focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
+                            !selectedModel && "text-muted-foreground"
+                          )}
+                          disabled={
+                            isSaving || enabledModelOptions.length === 0
+                          }
+                        >
+                          {selectedModel ? (
+                            <span className="flex min-w-0 items-center gap-2">
+                              <ProviderIcon
+                                providerId={selectedModel.iconId}
+                                className="size-4 shrink-0 rounded-none bg-transparent p-0"
+                              />
+                              <span className="truncate">
+                                {selectedModel.displayName}
+                              </span>
+                              <span className="shrink-0 text-muted-foreground">
+                                {selectedModel.sourceName}
+                              </span>
+                            </span>
+                          ) : legacyModelLabel ? (
+                            <span className="flex min-w-0 items-center gap-2">
+                              <ProviderIcon
+                                providerId={getProviderIconId(modelProvider)}
+                                className="size-4 shrink-0 rounded-none bg-transparent p-0"
+                              />
+                              <span className="truncate">
+                                {legacyModelLabel}
+                              </span>
+                              <span className="shrink-0 text-muted-foreground">
+                                Legacy
+                              </span>
+                            </span>
+                          ) : enabledModelOptions.length ? (
+                            "Select a model"
+                          ) : (
+                            "No enabled models"
+                          )}
+                          <ChevronsUpDown className="ml-2 size-4 shrink-0 opacity-50" />
+                        </button>
+                      </PopoverTrigger>
+                    </FormControl>
+                    <PopoverContent
+                      align="start"
+                      className="w-[--radix-popover-trigger-width] p-0"
+                      sideOffset={4}
+                    >
+                      <Command
+                        filter={(value, search) => {
+                          const option = enabledModelOptions.find(
+                            (o) =>
+                              getModelSelectionKey({
+                                source_id: o.sourceId,
+                                model_provider: o.modelProvider,
+                                model_name: o.modelName,
+                              }) === value
+                          )
+                          if (!option) {
+                            return 0
+                          }
+                          const haystack =
+                            `${option.displayName} ${option.modelName} ${option.sourceName} ${option.modelProvider}`.toLowerCase()
+                          return haystack.includes(search.toLowerCase()) ? 1 : 0
+                        }}
                       >
-                        <SelectTrigger>
-                          <SelectValue placeholder="Select model" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {modelOptions.map((option) => (
-                            <SelectItem
-                              key={`${providerValue}-${option.value}`}
-                              value={option.value}
-                            >
-                              {option.label}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    ) : (
-                      <Input
-                        placeholder="gpt-4o-mini"
-                        {...field}
-                        disabled={isSaving}
-                      />
-                    )}
-                  </FormControl>
+                        <CommandInput placeholder="Search models..." />
+                        <CommandList>
+                          <CommandEmpty>
+                            No models match the search.
+                          </CommandEmpty>
+                          <CommandGroup>
+                            {enabledModelOptions.map((option) => {
+                              const optionKey = getModelSelectionKey({
+                                source_id: option.sourceId,
+                                model_provider: option.modelProvider,
+                                model_name: option.modelName,
+                              })
+                              const isSelected =
+                                optionKey ===
+                                (selectedModel
+                                  ? getModelSelectionKey({
+                                      source_id: selectedModel.sourceId,
+                                      model_provider:
+                                        selectedModel.modelProvider,
+                                      model_name: selectedModel.modelName,
+                                    })
+                                  : null)
+                              return (
+                                <CommandItem
+                                  key={optionKey}
+                                  value={optionKey}
+                                  onSelect={() => {
+                                    field.onChange(option.modelName)
+                                    syncFormModelSelection(form, option, true)
+                                    setIsModelPickerOpen(false)
+                                  }}
+                                  className="flex items-center gap-2"
+                                >
+                                  <ProviderIcon
+                                    providerId={option.iconId}
+                                    className="size-4 shrink-0 rounded-none bg-transparent p-0"
+                                  />
+                                  <span className="min-w-0 truncate">
+                                    {option.displayName}
+                                  </span>
+                                  <span className="shrink-0 text-[11px] text-muted-foreground">
+                                    {option.sourceName}
+                                  </span>
+                                  <Check
+                                    className={cn(
+                                      "ml-auto size-4 shrink-0",
+                                      isSelected ? "opacity-100" : "opacity-0"
+                                    )}
+                                  />
+                                </CommandItem>
+                              )
+                            })}
+                          </CommandGroup>
+                        </CommandList>
+                      </Command>
+                    </PopoverContent>
+                  </Popover>
                 </FormItem>
               )}
             />
           </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            <FormField
-              control={form.control}
-              name="base_url"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Custom model base URL</FormLabel>
-                  <FormControl>
-                    <Input
-                      placeholder="https://api.openai.com/v1"
-                      value={field.value ?? ""}
-                      onChange={field.onChange}
-                      disabled={isSaving}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+          <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_180px]">
             <FormField
               control={form.control}
               name="retries"
@@ -1606,23 +2193,70 @@ function AgentPresetConfigurationPanel({
               )}
             />
           </div>
-          <div className="flex items-center gap-2">
-            <Switch
-              id="enable-internet-access"
-              checked={internetAccessEnabled}
-              onCheckedChange={(checked) =>
-                form.setValue("enableInternetAccess", checked, {
-                  shouldDirty: true,
-                })
-              }
-              disabled={isSaving}
-            />
-            <label
-              htmlFor="enable-internet-access"
-              className="text-sm font-medium"
-            >
-              Enable internet access
-            </label>
+          <div className="overflow-hidden rounded-lg border">
+            <div className="flex items-start justify-between gap-4 px-4 py-3">
+              <div className="space-y-1">
+                <label
+                  htmlFor="enable-thinking"
+                  className="text-sm font-medium leading-none"
+                >
+                  Thinking
+                </label>
+                <p className="text-xs text-muted-foreground">
+                  Adds higher reasoning effort by default.
+                </p>
+              </div>
+              <Switch
+                id="enable-thinking"
+                checked={thinkingEnabled}
+                onCheckedChange={(checked) =>
+                  form.setValue("enableThinking", checked, {
+                    shouldDirty: true,
+                  })
+                }
+                disabled={isSaving}
+              />
+            </div>
+            <div className="border-t" />
+            <div className="flex items-start justify-between gap-4 px-4 py-3">
+              <div className="space-y-1">
+                <div className="flex items-center gap-1.5">
+                  <label
+                    htmlFor="enable-internet-access"
+                    className="text-sm font-medium leading-none"
+                  >
+                    Internet access
+                  </label>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        className="text-muted-foreground transition-colors hover:text-foreground"
+                      >
+                        <AlertCircle className="size-4" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      Required for in-process MCP servers.
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Allows the agent to reach the web from the sandbox when tools
+                  need it.
+                </p>
+              </div>
+              <Switch
+                id="enable-internet-access"
+                checked={internetAccessEnabled}
+                onCheckedChange={(checked) =>
+                  form.setValue("enableInternetAccess", checked, {
+                    shouldDirty: true,
+                  })
+                }
+                disabled={isSaving}
+              />
+            </div>
           </div>
         </section>
 
@@ -1810,6 +2444,797 @@ function AgentPresetConfigurationPanel({
         </section>
       </div>
     </ScrollArea>
+  )
+}
+
+function AgentPresetSubagentsPanel({
+  form,
+  isSaving,
+  parentPreset,
+  agentPresets,
+  versionsByPresetId,
+  versionsByPresetIdIsLoading,
+  subagentFields,
+  onAddSubagent,
+  onRemoveSubagent,
+}: {
+  form: UseFormReturn<AgentPresetFormValues>
+  isSaving: boolean
+  parentPreset: AgentPresetRead | null
+  agentPresets: AgentPresetReadMinimal[]
+  versionsByPresetId: Map<string, AgentPresetVersionReadMinimal[]>
+  versionsByPresetIdIsLoading: boolean
+  subagentFields: Array<{ id: string }>
+  onAddSubagent: () => void
+  onRemoveSubagent: (index: number) => void
+}) {
+  const agentsEnabled =
+    useWatch({ control: form.control, name: "agentsEnabled" }) ?? false
+  const parentInternetAccessEnabled =
+    useWatch({ control: form.control, name: "enableInternetAccess" }) ?? false
+  const selectedSubagents =
+    useWatch({ control: form.control, name: "subagents" }) ?? []
+  const presetOptions = useMemo(
+    () =>
+      agentPresets
+        .filter((preset) => preset.id !== parentPreset?.id)
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [agentPresets, parentPreset?.id]
+  )
+  const presetOptionsBySlug = useMemo(
+    () => new Map(presetOptions.map((preset) => [preset.slug, preset])),
+    [presetOptions]
+  )
+  const presetOptionsById = useMemo(
+    () => new Map(presetOptions.map((preset) => [preset.id, preset])),
+    [presetOptions]
+  )
+  const selectedInternetAccessSubagentAliases =
+    getSelectedInternetAccessSubagentAliases({
+      subagents: selectedSubagents,
+      presetsById: presetOptionsById,
+      presetsBySlug: presetOptionsBySlug,
+      versionsByPresetId,
+    })
+  const internetAccessWarningMessage = getInternetAccessWarningMessage({
+    agentsEnabled,
+    parentInternetAccessEnabled,
+    selectedInternetAccessSubagentAliases,
+  })
+
+  return (
+    <ScrollArea className="h-full">
+      <div className="flex flex-col gap-8 px-6 py-6 pb-20 text-sm">
+        <section className="space-y-4">
+          <div className="overflow-hidden rounded-lg border">
+            <div className="flex items-start justify-between gap-4 px-4 py-3">
+              <div className="space-y-1">
+                <label
+                  htmlFor="enable-subagents"
+                  className="text-sm font-medium leading-none"
+                >
+                  Agent tool
+                </label>
+                <p className="text-xs text-muted-foreground">
+                  Adds Claude's Agent tool. Dynamic subagents are enabled by
+                  default and inherit this agent's tools, MCP integrations,
+                  approvals, and sandbox policy.
+                </p>
+              </div>
+              <Switch
+                id="enable-subagents"
+                checked={agentsEnabled}
+                onCheckedChange={(checked) =>
+                  form.setValue("agentsEnabled", checked, {
+                    shouldDirty: true,
+                    shouldValidate: true,
+                  })
+                }
+                disabled={isSaving}
+              />
+            </div>
+          </div>
+        </section>
+
+        <Separator />
+
+        <section className="space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="space-y-1">
+              <p className="text-sm font-medium">Preset subagents</p>
+              <p className="text-xs text-muted-foreground">
+                Attach named preset agents that the parent can invoke with
+                explicit descriptions and turn limits.
+              </p>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={onAddSubagent}
+              disabled={
+                isSaving || !agentsEnabled || presetOptions.length === 0
+              }
+            >
+              <Plus className="mr-2 size-4" />
+              Add preset
+            </Button>
+          </div>
+
+          {internetAccessWarningMessage ? (
+            <Alert variant="warning">
+              <AlertCircle className="size-4" />
+              <AlertTitle>Internet access limited</AlertTitle>
+              <AlertDescription>
+                {internetAccessWarningMessage}
+              </AlertDescription>
+            </Alert>
+          ) : null}
+
+          {!agentsEnabled ? (
+            <p className="rounded-md border border-dashed px-3 py-4 text-xs text-muted-foreground">
+              Enable the Agent tool to allow dynamic subagents or attach preset
+              subagents.
+            </p>
+          ) : presetOptions.length === 0 ? (
+            <p className="rounded-md border border-dashed px-3 py-4 text-xs text-muted-foreground">
+              Create another agent preset first, then attach it here. Dynamic
+              subagents are already available while the Agent tool is enabled.
+            </p>
+          ) : subagentFields.length === 0 ? (
+            <p className="rounded-md border border-dashed px-3 py-4 text-xs text-muted-foreground">
+              No preset subagents attached. Dynamic subagents can still run and
+              inherit this agent's current scopes.
+            </p>
+          ) : (
+            <div className="space-y-4">
+              {subagentFields.map((item, index) => {
+                const selectedPreset = form.watch(`subagents.${index}.preset`)
+                const selectedSubagent = selectedSubagents[index] ?? {
+                  preset: selectedPreset,
+                  presetId: "",
+                  name: "",
+                  description: "",
+                  presetVersion: "",
+                  presetVersionId: "",
+                  maxTurns: "",
+                }
+                const selectedPresetIsMissing =
+                  selectedPreset.length > 0 &&
+                  !presetOptionsBySlug.has(selectedPreset)
+                const selectedPresetOption = getSubagentPreset({
+                  subagent: selectedSubagent,
+                  presetsById: presetOptionsById,
+                  presetsBySlug: presetOptionsBySlug,
+                })
+                const selectedEligibilityIssue = selectedPresetOption
+                  ? getSubagentEligibilityIssue({
+                      subagent: selectedSubagent,
+                      preset: selectedPresetOption,
+                      versionsByPresetId,
+                    })
+                  : null
+                const isCheckingSelectedVersion = Boolean(
+                  selectedPresetOption &&
+                    selectedSubagent.presetVersion.trim() &&
+                    versionsByPresetIdIsLoading &&
+                    !versionsByPresetId.has(selectedPresetOption.id)
+                )
+
+                return (
+                  <div
+                    key={item.id}
+                    className="space-y-4 rounded-lg border px-4 py-4"
+                  >
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="min-w-0 flex-1 space-y-4">
+                        <FormField
+                          control={form.control}
+                          name={`subagents.${index}.preset`}
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Preset</FormLabel>
+                              <Select
+                                value={field.value}
+                                onValueChange={(value) => {
+                                  field.onChange(value)
+                                  form.setValue(
+                                    `subagents.${index}.presetId`,
+                                    ""
+                                  )
+                                  form.setValue(
+                                    `subagents.${index}.presetVersion`,
+                                    ""
+                                  )
+                                  form.setValue(
+                                    `subagents.${index}.presetVersionId`,
+                                    ""
+                                  )
+                                }}
+                                disabled={isSaving || !agentsEnabled}
+                              >
+                                <FormControl>
+                                  <SelectTrigger>
+                                    <SelectValue placeholder="Select preset" />
+                                  </SelectTrigger>
+                                </FormControl>
+                                <SelectContent>
+                                  {selectedPresetIsMissing ? (
+                                    <SelectItem value={selectedPreset}>
+                                      {selectedPreset} unavailable
+                                    </SelectItem>
+                                  ) : null}
+                                  {presetOptions.map((preset) => {
+                                    const currentVersionEligibilityMessage =
+                                      getSubagentEligibilityMessage(
+                                        preset.current_version_subagent_eligibility
+                                      )
+                                    const capabilities =
+                                      getOrderedAgentPresetCapabilities(preset)
+                                    const capabilitiesLabel =
+                                      formatAgentPresetCapabilityLabels(
+                                        capabilities
+                                      )
+                                    const optionLabel = (
+                                      <span className="flex min-w-0 items-center gap-2">
+                                        <span className="min-w-0 truncate">
+                                          {preset.name}
+                                        </span>
+                                        <span className="min-w-0 truncate text-xs text-muted-foreground">
+                                          {preset.slug}
+                                        </span>
+                                        <AgentPresetCapabilityIcons
+                                          capabilities={capabilities}
+                                        />
+                                      </span>
+                                    )
+
+                                    if (currentVersionEligibilityMessage) {
+                                      return (
+                                        <Tooltip key={preset.id}>
+                                          <TooltipTrigger asChild>
+                                            <SelectItem value={preset.slug}>
+                                              {optionLabel}
+                                            </SelectItem>
+                                          </TooltipTrigger>
+                                          <TooltipContent
+                                            side="right"
+                                            className="max-w-xs"
+                                          >
+                                            <div className="space-y-2">
+                                              {capabilitiesLabel ? (
+                                                <div className="space-y-0.5">
+                                                  <p className="font-medium">
+                                                    Capabilities
+                                                  </p>
+                                                  <p className="text-muted-foreground">
+                                                    {capabilitiesLabel}
+                                                  </p>
+                                                </div>
+                                              ) : null}
+                                              <div className="space-y-0.5">
+                                                <p className="font-medium">
+                                                  Current version
+                                                </p>
+                                                <p className="text-muted-foreground">
+                                                  {
+                                                    currentVersionEligibilityMessage
+                                                  }
+                                                </p>
+                                                <p className="text-muted-foreground">
+                                                  Pin an eligible version to use
+                                                  this preset as a subagent.
+                                                </p>
+                                              </div>
+                                            </div>
+                                          </TooltipContent>
+                                        </Tooltip>
+                                      )
+                                    }
+
+                                    return (
+                                      <SelectItem
+                                        key={preset.id}
+                                        value={preset.slug}
+                                      >
+                                        {optionLabel}
+                                      </SelectItem>
+                                    )
+                                  })}
+                                </SelectContent>
+                              </Select>
+                              <FormDescription>
+                                The preset slug is stored in the agent binding.
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <div className="grid gap-4 md:grid-cols-2">
+                          <FormField
+                            control={form.control}
+                            name={`subagents.${index}.name`}
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>Alias</FormLabel>
+                                <FormControl>
+                                  <Input
+                                    placeholder="triage-analyst"
+                                    value={field.value ?? ""}
+                                    onChange={field.onChange}
+                                    disabled={isSaving || !agentsEnabled}
+                                  />
+                                </FormControl>
+                                <FormDescription>
+                                  Optional. Defaults to the preset slug.
+                                </FormDescription>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          <FormField
+                            control={form.control}
+                            name={`subagents.${index}.presetVersion`}
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>Version</FormLabel>
+                                <FormControl>
+                                  <Input
+                                    type="number"
+                                    min={1}
+                                    placeholder="Current"
+                                    value={field.value ?? ""}
+                                    onChange={(event) => {
+                                      field.onChange(event)
+                                      const presetId =
+                                        normalizeOptional(
+                                          selectedSubagent.presetId
+                                        ) ?? selectedPresetOption?.id
+                                      const presetVersionId =
+                                        getSelectedSubagentVersionId({
+                                          presetId,
+                                          presetVersion:
+                                            event.currentTarget.value,
+                                          versionsByPresetId,
+                                        })
+                                      form.setValue(
+                                        `subagents.${index}.presetVersionId`,
+                                        presetVersionId ?? ""
+                                      )
+                                      if (presetId && presetVersionId) {
+                                        form.setValue(
+                                          `subagents.${index}.presetId`,
+                                          presetId
+                                        )
+                                      }
+                                    }}
+                                    disabled={isSaving || !agentsEnabled}
+                                  />
+                                </FormControl>
+                                <FormDescription>
+                                  Optional. Blank uses the current version.
+                                </FormDescription>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                        </div>
+
+                        {isCheckingSelectedVersion ? (
+                          <div className="flex items-center gap-2 rounded-md border px-3 py-2 text-xs text-muted-foreground">
+                            <Loader2 className="size-3.5 animate-spin" />
+                            Checking selected version...
+                          </div>
+                        ) : null}
+
+                        {selectedEligibilityIssue ? (
+                          <Alert variant="destructive" className="text-xs">
+                            <AlertCircle className="size-4" />
+                            <AlertTitle>Cannot attach this version</AlertTitle>
+                            <AlertDescription>
+                              {selectedEligibilityIssue.message}
+                            </AlertDescription>
+                          </Alert>
+                        ) : null}
+
+                        <FormField
+                          control={form.control}
+                          name={`subagents.${index}.description`}
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Description</FormLabel>
+                              <FormControl>
+                                <Textarea
+                                  placeholder="When should the parent delegate to this subagent?"
+                                  value={field.value ?? ""}
+                                  onChange={field.onChange}
+                                  disabled={isSaving || !agentsEnabled}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                Used to decide when to call the subagent.
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name={`subagents.${index}.maxTurns`}
+                          render={({ field }) => (
+                            <FormItem className="max-w-[220px]">
+                              <FormLabel>Max turns</FormLabel>
+                              <FormControl>
+                                <Input
+                                  type="number"
+                                  min={1}
+                                  placeholder="No limit"
+                                  value={field.value ?? ""}
+                                  onChange={field.onChange}
+                                  disabled={isSaving || !agentsEnabled}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </div>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="shrink-0 text-muted-foreground"
+                        onClick={() => onRemoveSubagent(index)}
+                        disabled={isSaving}
+                        aria-label="Remove subagent"
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </section>
+      </div>
+    </ScrollArea>
+  )
+}
+
+function AgentPresetSkillsPanel({
+  form,
+  workspaceId,
+  isSaving,
+  skillFields,
+  onAddSkillBinding,
+  onRemoveSkillBinding,
+}: {
+  form: UseFormReturn<AgentPresetFormValues>
+  workspaceId: string
+  isSaving: boolean
+  skillFields: Array<{ id: string }>
+  onAddSkillBinding: (binding: SkillBindingFormValue) => void
+  onRemoveSkillBinding: (index: number) => void
+}) {
+  const [isPickerOpen, setIsPickerOpen] = useState(false)
+  const selectedSkills = form.watch("skills")
+  const { skills, skillsLoading, skillsError } = useSkills(workspaceId)
+  const attachedSkillIds = useMemo(
+    () => new Set((selectedSkills ?? []).map((binding) => binding.skillId)),
+    [selectedSkills]
+  )
+  const availableSkillsToAdd = useMemo(
+    () =>
+      (skills ?? []).filter((skill) => {
+        return !!skill.current_version_id && !attachedSkillIds.has(skill.id)
+      }),
+    [attachedSkillIds, skills]
+  )
+  const hasUnattachedSkills = useMemo(
+    () => (skills ?? []).some((skill) => !attachedSkillIds.has(skill.id)),
+    [attachedSkillIds, skills]
+  )
+
+  function handleAddSkill(skillId: string) {
+    onAddSkillBinding({
+      skillId,
+      skillVersionId: "",
+    })
+    setIsPickerOpen(false)
+  }
+
+  return (
+    <div className="h-full overflow-auto">
+      <div className="flex min-w-0 w-full flex-col gap-8 px-6 py-6 pb-20 text-sm">
+        <section className="min-w-0 w-full space-y-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="space-y-1">
+              <p className="text-sm font-medium">Attached skills</p>
+              <p className="text-xs text-muted-foreground">
+                Pin published skill versions to this preset.
+              </p>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setIsPickerOpen(true)}
+              disabled={
+                isSaving || skillsLoading || availableSkillsToAdd.length === 0
+              }
+            >
+              <Plus className="mr-2 size-4" />
+              Add skill
+            </Button>
+          </div>
+          {skillsError ? (
+            <Alert variant="destructive">
+              <AlertCircle className="size-4" />
+              <AlertTitle>Unable to load skills</AlertTitle>
+              <AlertDescription>
+                {getApiErrorDetail(skillsError) ?? "Please try again."}
+              </AlertDescription>
+            </Alert>
+          ) : skillsLoading ? (
+            <div className="flex items-center gap-2 rounded-md border px-3 py-4 text-xs text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" />
+              Loading skills...
+            </div>
+          ) : skillFields.length === 0 ? (
+            <p className="rounded-md border border-dashed px-3 py-4 text-xs text-muted-foreground">
+              No skills attached yet.
+            </p>
+          ) : (
+            <div className="min-w-0 w-full space-y-3">
+              {skillFields.map((item, index) => (
+                <AgentPresetSkillBindingRow
+                  key={item.id}
+                  form={form}
+                  workspaceId={workspaceId}
+                  index={index}
+                  isSaving={isSaving}
+                  availableSkills={skills ?? []}
+                  onRemove={onRemoveSkillBinding}
+                />
+              ))}
+            </div>
+          )}
+          {!skillsLoading &&
+          !skillsError &&
+          skillFields.length > 0 &&
+          availableSkillsToAdd.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              {hasUnattachedSkills
+                ? "Only skills with published versions can be attached."
+                : "All workspace skills are already attached to this preset."}
+            </p>
+          ) : null}
+        </section>
+      </div>
+      <CommandDialog open={isPickerOpen} onOpenChange={setIsPickerOpen}>
+        <CommandInput placeholder="Search skills..." />
+        <CommandList>
+          <CommandEmpty>No skills found.</CommandEmpty>
+          <CommandGroup heading="Workspace skills">
+            {availableSkillsToAdd.map((skill) => (
+              <CommandItem
+                key={skill.id}
+                value={buildSkillCommandItemValue(skill)}
+                onSelect={() => handleAddSkill(skill.id)}
+              >
+                <div className="flex min-w-0 flex-col gap-0.5">
+                  <span>{skill.name}</span>
+                  <span className="truncate text-xs text-muted-foreground">
+                    {skill.description?.trim() || skill.name}
+                  </span>
+                </div>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+        </CommandList>
+      </CommandDialog>
+    </div>
+  )
+}
+
+function AgentPresetSkillBindingRow({
+  form,
+  workspaceId,
+  index,
+  isSaving,
+  availableSkills,
+  onRemove,
+}: {
+  form: UseFormReturn<AgentPresetFormValues>
+  workspaceId: string
+  index: number
+  isSaving: boolean
+  availableSkills: SkillReadMinimal[]
+  onRemove: (index: number) => void
+}) {
+  const skillFieldName = `skills.${index}.skillId` as const
+  const versionFieldName = `skills.${index}.skillVersionId` as const
+  const selectedSkillId = form.watch(skillFieldName)
+  const selectedVersionId = form.watch(versionFieldName)
+  const selectedSkill = availableSkills.find(
+    (skill) => skill.id === selectedSkillId
+  )
+  const { versions, versionsLoading, versionsError } = useSkillVersions(
+    workspaceId,
+    selectedSkillId || null
+  )
+  const versionOptions = useMemo(
+    () => [...(versions ?? [])].sort((a, b) => b.version - a.version),
+    [versions]
+  )
+
+  useEffect(() => {
+    if (!selectedSkillId) {
+      if (selectedVersionId) {
+        form.setValue(versionFieldName, "", { shouldDirty: true })
+      }
+      return
+    }
+
+    if (versionsLoading || versionOptions.length === 0) {
+      return
+    }
+
+    const hasSelectedVersion = versionOptions.some(
+      (version) => version.id === selectedVersionId
+    )
+    if (hasSelectedVersion) {
+      return
+    }
+
+    const preferredVersionId =
+      selectedSkill?.current_version_id ?? versionOptions[0]?.id ?? ""
+    if (!preferredVersionId) {
+      return
+    }
+
+    form.setValue(versionFieldName, preferredVersionId, { shouldDirty: true })
+  }, [
+    form,
+    selectedSkill?.current_version_id,
+    selectedSkillId,
+    selectedVersionId,
+    versionFieldName,
+    versionOptions,
+    versionsLoading,
+  ])
+
+  const selectedVersion = versionOptions.find((v) => v.id === selectedVersionId)
+  const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false)
+  const skillHref = selectedSkillId
+    ? `/workspaces/${workspaceId}/skills/${selectedSkillId}`
+    : null
+  const displaySkillName = selectedVersion?.name?.trim() || selectedSkill?.name
+  const displaySkillDescription =
+    selectedVersion?.description?.trim() ||
+    selectedSkill?.description?.trim() ||
+    null
+  let versionPlaceholder = "Version"
+  if (versionsLoading) {
+    versionPlaceholder = "..."
+  } else if (versionOptions.length === 0) {
+    versionPlaceholder = "No versions"
+  }
+  const selectedVersionLabel = selectedVersion
+    ? `v${selectedVersion.version}`
+    : versionPlaceholder
+
+  function handleOpenSkill() {
+    if (!skillHref) {
+      return
+    }
+    window.open(skillHref, "_blank", "noopener,noreferrer")
+  }
+
+  return (
+    <div className="flex min-w-0 items-start gap-3 rounded-md border px-3 py-2.5">
+      <Pyramid className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+      <div className="min-w-0 flex-1 space-y-0.5">
+        <div className="flex min-w-0 items-center gap-2">
+          {skillHref ? (
+            <button
+              type="button"
+              className="min-w-0 truncate rounded-sm text-left text-sm font-medium underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={handleOpenSkill}
+            >
+              {displaySkillName ?? "Unknown skill"}
+            </button>
+          ) : (
+            <span className="truncate text-sm font-medium">
+              {displaySkillName ?? "Unknown skill"}
+            </span>
+          )}
+        </div>
+        {displaySkillDescription ? (
+          <div className="space-y-1">
+            <p
+              className={
+                isDescriptionExpanded
+                  ? "text-xs text-muted-foreground"
+                  : "line-clamp-2 text-xs text-muted-foreground"
+              }
+            >
+              {displaySkillDescription}
+            </p>
+            <button
+              type="button"
+              className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+              onClick={(event) => {
+                event.stopPropagation()
+                setIsDescriptionExpanded((value) => !value)
+              }}
+            >
+              {isDescriptionExpanded ? "Show less" : "Show more"}
+            </button>
+          </div>
+        ) : null}
+        {selectedSkillId && versionsError ? (
+          <p className="text-xs text-destructive">
+            {getApiErrorDetail(versionsError) ?? "Failed to load versions."}
+          </p>
+        ) : null}
+        {selectedSkillId && !versionsLoading && versionOptions.length === 0 ? (
+          <p className="text-xs text-muted-foreground">
+            No published versions yet.
+          </p>
+        ) : null}
+      </div>
+      <FormField
+        control={form.control}
+        name={versionFieldName}
+        render={({ field }) => (
+          <FormItem className="shrink-0">
+            <Select
+              value={field.value || ""}
+              onValueChange={field.onChange}
+              disabled={
+                isSaving ||
+                !selectedSkillId ||
+                versionsLoading ||
+                versionOptions.length === 0
+              }
+            >
+              <FormControl>
+                <SelectTrigger className="h-7 w-auto gap-1.5 border-none bg-muted/50 px-2 text-xs shadow-none">
+                  <span aria-hidden>{selectedVersionLabel}</span>
+                  <SelectValue
+                    className="sr-only"
+                    placeholder={versionPlaceholder}
+                  />
+                </SelectTrigger>
+              </FormControl>
+              <SelectContent>
+                {versionOptions.map((version) => (
+                  <SelectItem key={version.id} value={version.id}>
+                    {formatSkillVersionLabel(version)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <FormMessage />
+          </FormItem>
+        )}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="size-7 shrink-0 text-muted-foreground"
+        onClick={() => onRemove(index)}
+        disabled={isSaving}
+        aria-label="Remove attached skill"
+      >
+        <Trash2 className="size-3.5" />
+      </Button>
+    </div>
   )
 }
 
@@ -2088,8 +3513,8 @@ function AgentPresetBuilderChatPane({
               </EmptyMedia>
               <EmptyTitle>Builder assistant</EmptyTitle>
               <EmptyDescription>
-                Save the preset name and model provider to activate the builder
-                assistant.
+                Save the preset name and choose an enabled model to activate the
+                builder assistant.
               </EmptyDescription>
             </EmptyHeader>
           </Empty>
@@ -2176,12 +3601,35 @@ function presetToFormValues(preset: AgentPresetRead): AgentPresetFormValues {
     preset.output_type === null || preset.output_type === undefined
       ? null
       : preset.output_type
+  const agents = preset.agents
+  const agentsEnabled = agents?.enabled === true
+  const subagents = agentsEnabled
+    ? (agents.subagents ?? []).map((subagent) => ({
+        preset: subagent.preset,
+        presetId: "preset_id" in subagent ? subagent.preset_id : "",
+        name: subagent.name ?? "",
+        description: subagent.description ?? "",
+        presetVersion:
+          subagent.preset_version === null ||
+          subagent.preset_version === undefined
+            ? ""
+            : String(subagent.preset_version),
+        presetVersionId:
+          "preset_version_id" in subagent ? subagent.preset_version_id : "",
+        maxTurns:
+          subagent.max_turns === null || subagent.max_turns === undefined
+            ? ""
+            : String(subagent.max_turns),
+      }))
+    : []
 
   return {
     name: preset.name,
     slug: preset.slug,
     description: preset.description ?? "",
     instructions: preset.instructions ?? "",
+    source_id: "",
+    catalog_id: preset.catalog_id ?? "",
     model_provider: preset.model_provider,
     model_name: preset.model_name,
     base_url: preset.base_url ?? "",
@@ -2206,12 +3654,25 @@ function presetToFormValues(preset: AgentPresetRead): AgentPresetFormValues {
         )
       : [],
     mcpIntegrations: preset.mcp_integrations ?? [],
+    agentsEnabled,
+    subagents,
+    skills:
+      preset.skills?.map(
+        (binding): SkillBindingFormValue => ({
+          skillId: binding.skill_id,
+          skillVersionId: binding.skill_version_id,
+        })
+      ) ?? [],
     retries: preset.retries ?? DEFAULT_RETRIES,
+    enableThinking: preset.enable_thinking ?? true,
     enableInternetAccess: preset.enable_internet_access ?? false,
   }
 }
 
-function formValuesToPayload(values: AgentPresetFormValues): AgentPresetCreate {
+function formValuesToPayload(
+  values: AgentPresetFormValues,
+  subagentContext: SubagentResolutionContext
+): AgentPresetCreate {
   const outputType =
     values.outputTypeKind === "none"
       ? null
@@ -2231,16 +3692,92 @@ function formValuesToPayload(values: AgentPresetFormValues): AgentPresetCreate {
         : null,
     model_name: values.model_name.trim(),
     model_provider: values.model_provider.trim(),
+    catalog_id: values.catalog_id ? values.catalog_id : null,
     base_url: normalizeOptional(values.base_url),
     output_type: outputType ?? null,
     actions: values.actions.length > 0 ? values.actions : null,
     namespaces: values.namespaces.length > 0 ? values.namespaces : null,
     mcp_integrations:
       values.mcpIntegrations.length > 0 ? values.mcpIntegrations : null,
+    agents: formValuesToAgentsPayload(values, subagentContext),
+    skills: values.skills.map((binding) => ({
+      skill_id: binding.skillId,
+      skill_version_id: binding.skillVersionId,
+    })),
     tool_approvals: toToolApprovalMap(values.toolApprovals),
     retries: values.retries,
+    enable_thinking: values.enableThinking,
     enable_internet_access: values.enableInternetAccess,
   }
+}
+
+type SubagentResolutionContext = {
+  presetsBySlug: Map<string, AgentPresetReadMinimal>
+  versionsByPresetId: Map<string, AgentPresetVersionReadMinimal[]>
+}
+
+function formValuesToAgentsPayload(
+  values: AgentPresetFormValues,
+  { presetsBySlug, versionsByPresetId }: SubagentResolutionContext
+): AgentPresetCreate["agents"] {
+  if (!values.agentsEnabled) {
+    return { enabled: false }
+  }
+
+  const subagents = values.subagents
+    .map((subagent): PreservedAttachedSubagentRef | null => {
+      const preset = subagent.preset.trim()
+      if (!preset) {
+        return null
+      }
+
+      const payload: PreservedAttachedSubagentRef = { preset }
+      const name = normalizeOptional(subagent.name)
+      const description = normalizeOptional(subagent.description)
+      const presetVersion = parseOptionalPositiveInteger(subagent.presetVersion)
+      const maxTurns = parseOptionalPositiveInteger(subagent.maxTurns)
+      const presetId = normalizeOptional(subagent.presetId)
+      const resolvedPresetId = presetId ?? presetsBySlug.get(preset)?.id ?? null
+      const presetVersionId =
+        normalizeOptional(subagent.presetVersionId) ??
+        getSelectedSubagentVersionId({
+          presetId: resolvedPresetId,
+          presetVersion: subagent.presetVersion,
+          versionsByPresetId,
+        })
+
+      if (name !== null) {
+        payload.name = name
+      }
+      if (description !== null) {
+        payload.description = description
+      }
+      if (presetVersion !== null) {
+        payload.preset_version = presetVersion
+      }
+      if (maxTurns !== null) {
+        payload.max_turns = maxTurns
+      }
+      if (resolvedPresetId !== null && presetVersionId !== null) {
+        payload.preset_id = resolvedPresetId
+        payload.preset_version_id = presetVersionId
+      }
+
+      return payload
+    })
+    .filter(
+      (subagent): subagent is PreservedAttachedSubagentRef => subagent !== null
+    )
+
+  return {
+    enabled: true,
+    subagents,
+  }
+}
+
+function formatSkillVersionLabel(version: SkillVersionRead): string {
+  const name = version.name.trim()
+  return name ? `v${version.version} · ${name}` : `v${version.version}`
 }
 
 function normalizeOptional(value: string | null | undefined) {
@@ -2249,6 +3786,293 @@ function normalizeOptional(value: string | null | undefined) {
   }
   const trimmed = value.trim()
   return trimmed.length > 0 ? trimmed : null
+}
+
+function getSubagentFormAlias(subagent: SubagentFormValue): string {
+  return subagent.name.trim() || subagent.preset.trim()
+}
+
+function getPinnedSubagentPresetIds({
+  subagents,
+  presetsBySlug,
+}: {
+  subagents: SubagentFormValue[]
+  presetsBySlug: Map<string, AgentPresetReadMinimal>
+}): string[] {
+  const presetIds = new Set<string>()
+  for (const subagent of subagents) {
+    if (!subagent.presetVersion.trim()) {
+      continue
+    }
+    const presetId = normalizeOptional(subagent.presetId)
+    if (presetId) {
+      presetIds.add(presetId)
+      continue
+    }
+    const preset = presetsBySlug.get(subagent.preset.trim())
+    if (preset) {
+      presetIds.add(preset.id)
+    }
+  }
+  return [...presetIds]
+}
+
+function getFirstSubagentEligibilityIssue({
+  subagents,
+  presetsById,
+  presetsBySlug,
+  versionsByPresetId,
+}: {
+  subagents: SubagentFormValue[]
+  presetsById: Map<string, AgentPresetReadMinimal>
+  presetsBySlug: Map<string, AgentPresetReadMinimal>
+  versionsByPresetId: Map<string, AgentPresetVersionReadMinimal[]>
+}): (SubagentEligibilityIssue & { index: number }) | null {
+  for (const [index, subagent] of subagents.entries()) {
+    const preset = getSubagentPreset({
+      subagent,
+      presetsById,
+      presetsBySlug,
+    })
+    if (preset === null) {
+      continue
+    }
+    const issue = getSubagentEligibilityIssue({
+      subagent,
+      preset,
+      versionsByPresetId,
+    })
+    if (issue) {
+      return { ...issue, index }
+    }
+  }
+  return null
+}
+
+function getSubagentPreset({
+  subagent,
+  presetsById,
+  presetsBySlug,
+}: {
+  subagent: SubagentFormValue
+  presetsById: Map<string, AgentPresetReadMinimal>
+  presetsBySlug: Map<string, AgentPresetReadMinimal>
+}): AgentPresetReadMinimal | null {
+  const presetId = normalizeOptional(subagent.presetId)
+  if (presetId !== null) {
+    return presetsById.get(presetId) ?? null
+  }
+  return presetsBySlug.get(subagent.preset.trim()) ?? null
+}
+
+function getSelectedSubagentVersionId({
+  presetId,
+  presetVersion,
+  versionsByPresetId,
+}: {
+  presetId?: string | null
+  presetVersion?: string | null
+  versionsByPresetId: Map<string, AgentPresetVersionReadMinimal[]>
+}): string | null {
+  if (!presetId) {
+    return null
+  }
+
+  const version = parseOptionalPositiveInteger(presetVersion)
+  if (version === null) {
+    return null
+  }
+
+  return (
+    versionsByPresetId.get(presetId)?.find((item) => item.version === version)
+      ?.id ?? null
+  )
+}
+
+type SubagentEligibilityIssue = {
+  field: "preset" | "presetVersion"
+  message: string
+}
+
+function getSubagentEligibilityIssue({
+  subagent,
+  preset,
+  versionsByPresetId,
+}: {
+  subagent: SubagentFormValue
+  preset: AgentPresetReadMinimal
+  versionsByPresetId: Map<string, AgentPresetVersionReadMinimal[]>
+}): SubagentEligibilityIssue | null {
+  const presetVersionText = subagent.presetVersion.trim()
+  if (!presetVersionText) {
+    const message = getSubagentEligibilityMessage(
+      preset.current_version_subagent_eligibility
+    )
+    return message ? { field: "preset", message } : null
+  }
+  if (!POSITIVE_INTEGER_REGEX.test(presetVersionText)) {
+    return null
+  }
+
+  const versions = versionsByPresetId.get(preset.id)
+  if (!versions) {
+    return null
+  }
+  const presetVersion = Number.parseInt(presetVersionText, 10)
+  const version = versions.find((item) => item.version === presetVersion)
+  if (!version) {
+    return {
+      field: "presetVersion",
+      message: `Version ${presetVersion} was not found for ${preset.name}.`,
+    }
+  }
+
+  const message = getSubagentEligibilityMessage(version.subagent_eligibility)
+  return message ? { field: "presetVersion", message } : null
+}
+
+function getSubagentEligibilityMessage(
+  eligibility: AgentPresetSubagentEligibility | null | undefined
+): string | null {
+  if (!eligibility || eligibility.eligible) {
+    return null
+  }
+  return eligibility.message ?? "This version cannot be attached as a subagent."
+}
+
+function getOrderedAgentPresetCapabilities(
+  preset: AgentPresetReadMinimal
+): AgentPresetCapability[] {
+  const capabilities = new Set(preset.capabilities ?? [])
+  return AGENT_PRESET_CAPABILITY_CONFIG.filter(({ capability }) =>
+    capabilities.has(capability)
+  ).map(({ capability }) => capability)
+}
+
+function getAgentPresetCapabilityConfigs(
+  capabilities: AgentPresetCapability[]
+) {
+  const capabilitySet = new Set(capabilities)
+  return AGENT_PRESET_CAPABILITY_CONFIG.filter(({ capability }) =>
+    capabilitySet.has(capability)
+  )
+}
+
+function formatAgentPresetCapabilityLabels(
+  capabilities: AgentPresetCapability[]
+): string {
+  return getAgentPresetCapabilityConfigs(capabilities)
+    .map(({ label }) => label)
+    .join(", ")
+}
+
+function AgentPresetCapabilityIcons({
+  capabilities,
+}: {
+  capabilities: AgentPresetCapability[]
+}) {
+  const configs = getAgentPresetCapabilityConfigs(capabilities)
+  if (configs.length === 0) {
+    return null
+  }
+  const label = formatAgentPresetCapabilityLabels(capabilities)
+
+  return (
+    <span
+      className="ml-auto flex shrink-0 items-center gap-1 text-muted-foreground"
+      aria-label={label}
+      title={label}
+    >
+      {configs.map(({ capability, Icon }) => (
+        <Icon key={capability} className="size-3.5" aria-hidden="true" />
+      ))}
+    </span>
+  )
+}
+
+function getSelectedInternetAccessSubagentAliases({
+  subagents,
+  presetsById,
+  presetsBySlug,
+  versionsByPresetId,
+}: {
+  subagents: SubagentFormValue[]
+  presetsById: Map<string, AgentPresetReadMinimal>
+  presetsBySlug: Map<string, AgentPresetReadMinimal>
+  versionsByPresetId: Map<string, AgentPresetVersionReadMinimal[]>
+}): string[] {
+  const aliases: string[] = []
+
+  for (const subagent of subagents) {
+    const preset = getSubagentPreset({
+      subagent,
+      presetsById,
+      presetsBySlug,
+    })
+    if (preset === null) {
+      continue
+    }
+    const selectedVersion = getSelectedSubagentVersion({
+      subagent,
+      preset,
+      versionsByPresetId,
+    })
+    const capabilities =
+      selectedVersion?.capabilities ?? preset.capabilities ?? []
+    if (capabilities.includes("internet_access")) {
+      aliases.push(getSubagentFormAlias(subagent))
+    }
+  }
+
+  return aliases
+}
+
+function getSelectedSubagentVersion({
+  subagent,
+  preset,
+  versionsByPresetId,
+}: {
+  subagent: SubagentFormValue
+  preset: AgentPresetReadMinimal
+  versionsByPresetId: Map<string, AgentPresetVersionReadMinimal[]>
+}): AgentPresetVersionReadMinimal | null {
+  const presetVersionText = subagent.presetVersion.trim()
+  if (!POSITIVE_INTEGER_REGEX.test(presetVersionText)) {
+    return null
+  }
+  const presetVersion = Number.parseInt(presetVersionText, 10)
+  return (
+    versionsByPresetId
+      .get(preset.id)
+      ?.find((version) => version.version === presetVersion) ?? null
+  )
+}
+
+function getInternetAccessWarningMessage({
+  agentsEnabled,
+  parentInternetAccessEnabled,
+  selectedInternetAccessSubagentAliases,
+}: {
+  agentsEnabled: boolean
+  parentInternetAccessEnabled: boolean
+  selectedInternetAccessSubagentAliases: string[]
+}): string | null {
+  if (
+    !agentsEnabled ||
+    parentInternetAccessEnabled ||
+    selectedInternetAccessSubagentAliases.length === 0
+  ) {
+    return null
+  }
+  return LIVE_INTERNET_ACCESS_WARNING_MESSAGE
+}
+
+function parseOptionalPositiveInteger(value: string | null | undefined) {
+  const trimmed = value?.trim()
+  if (!trimmed) {
+    return null
+  }
+  return Number.parseInt(trimmed, 10)
 }
 
 function toToolApprovalMap(
